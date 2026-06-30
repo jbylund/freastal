@@ -18,12 +18,15 @@ def pkg_config(*args):
 
 def compiler_supports_flag(flag):
     cc = os.environ.get("CC", "cc")
+    # Include ARCHFLAGS so the probe matches the actual build (e.g. universal
+    # macOS builds use -arch arm64 -arch x86_64, which breaks -march=native).
+    archflags = os.environ.get("ARCHFLAGS", "").split()
     with tempfile.NamedTemporaryFile(suffix=".c", delete=False) as f:
         f.write(b"int main(void){return 0;}\n")
         src = f.name
     try:
         subprocess.check_call(
-            [cc, flag, "-x", "c", src, "-o", "/dev/null"],
+            [cc, *archflags, flag, "-x", "c", src, "-o", "/dev/null"],
             stderr=subprocess.DEVNULL,
         )
         return True
