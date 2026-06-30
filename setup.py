@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import sysconfig
 import tempfile
 from setuptools import Extension, setup
@@ -95,6 +96,22 @@ if not include_dirs:
 
 if not libraries:
     libraries = ["uv"]
+
+extra_link_args = []
+if sys.platform.startswith("linux") and "uv" in libraries:
+    # In the cibuildwheel manylinux environment we build libuv from source with
+    # -DCMAKE_POSITION_INDEPENDENT_CODE=ON.  cmake may install to lib or lib64
+    # and may also create libuv.so.1 alongside the .a; the linker prefers .so,
+    # producing a wheel auditwheel can't repair.  Force static linking when our
+    # PIC-compiled libuv.a is present; fall back to dynamic (e.g. apt-installed
+    # libuv1-dev) otherwise.
+    for _uv_dir in ("/usr/local/lib", "/usr/local/lib64"):
+        if os.path.exists(os.path.join(_uv_dir, "libuv.a")):
+            if _uv_dir not in library_dirs:
+                library_dirs.append(_uv_dir)
+            extra_link_args += ["-Wl,-Bstatic,-luv,-Bdynamic"]
+            libraries = [lib for lib in libraries if lib != "uv"]
+            break
 
 # Probe for UV_TCP_REUSEPORT (added in libuv 1.44, but not always present in
 # distro packages even when the version number suggests otherwise).
@@ -195,6 +212,7 @@ ext = Extension(
         "-Wextra",
         "-Wno-unused-parameter",
     ],
+    extra_link_args=extra_link_args,
 )
 
 setup(ext_modules=[ext])
