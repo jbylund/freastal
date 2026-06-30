@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import sysconfig
 import tempfile
 from setuptools import Extension, setup
@@ -95,6 +96,16 @@ if not include_dirs:
 
 if not libraries:
     libraries = ["uv"]
+
+extra_link_args = []
+if sys.platform.startswith("linux") and "uv" in libraries:
+    # Force static libuv so auditwheel doesn't need to bundle libuv.so.1.
+    # A system libuv.so.1 may exist in the manylinux container and the linker
+    # prefers it over our locally built libuv.a without this flag.
+    if "/usr/local/lib" not in library_dirs:
+        library_dirs.append("/usr/local/lib")
+    extra_link_args += ["-Wl,-Bstatic,-luv,-Bdynamic"]
+    libraries = [l for l in libraries if l != "uv"]
 
 # Probe for UV_TCP_REUSEPORT (added in libuv 1.44, but not always present in
 # distro packages even when the version number suggests otherwise).
@@ -195,6 +206,7 @@ ext = Extension(
         "-Wextra",
         "-Wno-unused-parameter",
     ],
+    extra_link_args=extra_link_args,
 )
 
 setup(ext_modules=[ext])
