@@ -99,13 +99,17 @@ if not libraries:
 
 extra_link_args = []
 if sys.platform.startswith("linux") and "uv" in libraries:
-    # Force static libuv so auditwheel doesn't need to bundle libuv.so.1.
-    # A system libuv.so.1 may exist in the manylinux container and the linker
-    # prefers it over our locally built libuv.a without this flag.
-    if "/usr/local/lib" not in library_dirs:
-        library_dirs.append("/usr/local/lib")
-    extra_link_args += ["-Wl,-Bstatic,-luv,-Bdynamic"]
-    libraries = [lib for lib in libraries if lib != "uv"]
+    # In the cibuildwheel manylinux environment we build libuv from source with
+    # -DCMAKE_POSITION_INDEPENDENT_CODE=ON and install it to /usr/local/lib.
+    # A system libuv.so.1 may also exist, and the linker prefers .so over .a,
+    # producing a wheel that auditwheel can't repair.  Force static linking only
+    # when our PIC-compiled libuv.a is present at /usr/local/lib; fall back to
+    # dynamic linking (e.g. apt-installed libuv1-dev) otherwise.
+    if os.path.exists("/usr/local/lib/libuv.a"):
+        if "/usr/local/lib" not in library_dirs:
+            library_dirs.append("/usr/local/lib")
+        extra_link_args += ["-Wl,-Bstatic,-luv,-Bdynamic"]
+        libraries = [lib for lib in libraries if lib != "uv"]
 
 # Probe for UV_TCP_REUSEPORT (added in libuv 1.44, but not always present in
 # distro packages even when the version number suggests otherwise).
