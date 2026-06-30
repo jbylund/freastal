@@ -179,19 +179,35 @@ if has_openssl:
 else:
     print("freastal: OpenSSL not found – TLS 1.3 DISABLED")
 
-ext = Extension(
-    "freastal._freastal",
-    sources=[
-        # vendored third-party
-        os.path.join(vendor_php, "picohttpparser.c"),
-        *vendor_sources,
-        # freastal
+# ---------- Precompiled vendor archive (cibuildwheel only) ----------
+# scripts/build_vendor.sh compiles picotls + picohttpparser once per arch in
+# before-all so we don't recompile ~11k lines of C for every Python version.
+_VENDOR_ARCHIVE = "/tmp/freastal_vendor.a"
+if os.path.exists(_VENDOR_ARCHIVE):
+    ext_sources = [
         os.path.join(src_dir, "server.c"),
         os.path.join(src_dir, "wsgi.c"),
         os.path.join(src_dir, "asgi.c"),
         os.path.join(src_dir, "tls.c"),
         os.path.join(src_dir, "freastalmodule.c"),
-    ],
+    ]
+    extra_objects = [_VENDOR_ARCHIVE]
+    print(f"freastal: using precompiled vendor archive {_VENDOR_ARCHIVE}")
+else:
+    ext_sources = [
+        os.path.join(vendor_php, "picohttpparser.c"),
+        *vendor_sources,
+        os.path.join(src_dir, "server.c"),
+        os.path.join(src_dir, "wsgi.c"),
+        os.path.join(src_dir, "asgi.c"),
+        os.path.join(src_dir, "tls.c"),
+        os.path.join(src_dir, "freastalmodule.c"),
+    ]
+    extra_objects = []
+
+ext = Extension(
+    "freastal._freastal",
+    sources=ext_sources,
     include_dirs=[
         src_dir,
         vendor_php,
@@ -212,6 +228,7 @@ ext = Extension(
         "-Wextra",
         "-Wno-unused-parameter",
     ],
+    extra_objects=extra_objects,
     extra_link_args=extra_link_args,
 )
 
