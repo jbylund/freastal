@@ -8,35 +8,44 @@ on:
 
 jobs:
   build-wheels:
-    name: Build wheels (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Build wheels (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-latest
+            cibw_archs: x86_64
+          - target: linux-aarch64
+            runner: ubuntu-latest
+            cibw_archs: aarch64
+          - target: macos
+            runner: macos-latest
+            cibw_archs: arm64 x86_64
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU (Linux aarch64 cross-compilation)
-        if: runner.os == 'Linux'
+      - name: Set up QEMU (aarch64)
+        if: matrix.target == 'linux-aarch64'
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
       - name: Detect macOS deployment target
-        if: runner.os == 'macOS'
+        if: matrix.target == 'macos'
         run: echo "MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion | cut -d. -f1).0" >> $GITHUB_ENV
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.21.3
         env:
-          CIBW_ARCHS_LINUX: x86_64 aarch64
-          CIBW_ARCHS_MACOS: arm64 x86_64
+          CIBW_ARCHS_LINUX: ${{ matrix.cibw_archs }}
+          CIBW_ARCHS_MACOS: ${{ matrix.cibw_archs }}
           MACOSX_DEPLOYMENT_TARGET: ${{ env.MACOSX_DEPLOYMENT_TARGET }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.target }}
           path: wheelhouse/*.whl
 
   build-sdist:
