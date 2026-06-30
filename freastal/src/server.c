@@ -403,8 +403,8 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
     struct sockaddr_in addr;
     uv_ip4_addr(host, port, &addr);
 
-    /* UV_TCP_REUSEPORT was added in libuv 1.44; fall back silently on older installs */
-#if UV_VERSION_HEX >= 0x012C00
+    /* UV_TCP_REUSEPORT availability is probed at build time by setup.py */
+#ifdef FREASTAL_REUSEPORT
     unsigned int bind_flags = reuse_port ? UV_TCP_REUSEPORT : 0;
 #else
     (void)reuse_port;

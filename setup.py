@@ -33,6 +33,25 @@ def compiler_supports_flag(flag):
         os.unlink(src)
 
 
+def probe_symbol(src_snippet, extra_include_dirs=None):
+    """Return True if src_snippet compiles without error."""
+    cc = os.environ.get("CC", "cc")
+    inc_flags = [f"-I{d}" for d in (extra_include_dirs or [])]
+    with tempfile.NamedTemporaryFile(suffix=".c", delete=False) as f:
+        f.write(src_snippet.encode())
+        src = f.name
+    try:
+        subprocess.check_call(
+            [cc, *inc_flags, "-c", src, "-o", "/dev/null"],
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    finally:
+        os.unlink(src)
+
+
 # ---------- libuv (required) ----------
 
 uv_includes = pkg_config("--cflags-only-I", "libuv")
@@ -52,9 +71,21 @@ if not include_dirs:
 if not libraries:
     libraries = ["uv"]
 
+# Probe for UV_TCP_REUSEPORT (added in libuv 1.44, but not always present in
+# distro packages even when the version number suggests otherwise).
+has_uv_reuseport = probe_symbol(
+    "#include <uv.h>\nint x = UV_TCP_REUSEPORT;\n",
+    extra_include_dirs=include_dirs,
+)
+
 # ---------- liburing (Linux-only, optional) ----------
 
 define_macros = []
+if has_uv_reuseport:
+    define_macros.append(("FREASTAL_REUSEPORT", "1"))
+    print("freastal: UV_TCP_REUSEPORT available – SO_REUSEPORT ENABLED")
+else:
+    print("freastal: UV_TCP_REUSEPORT not available – SO_REUSEPORT DISABLED")
 vendor_sources = []
 
 try:
