@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "freastal"
-version = "0.0.1"
+version = "0.0.2"
 description = "Fast libuv + picohttpparser WSGI/ASGI server (Irish: freastal — service)"
 readme = "README.md"
 license = {text = "MIT"}
