@@ -100,16 +100,18 @@ if not libraries:
 extra_link_args = []
 if sys.platform.startswith("linux") and "uv" in libraries:
     # In the cibuildwheel manylinux environment we build libuv from source with
-    # -DCMAKE_POSITION_INDEPENDENT_CODE=ON and install it to /usr/local/lib.
-    # A system libuv.so.1 may also exist, and the linker prefers .so over .a,
-    # producing a wheel that auditwheel can't repair.  Force static linking only
-    # when our PIC-compiled libuv.a is present at /usr/local/lib; fall back to
-    # dynamic linking (e.g. apt-installed libuv1-dev) otherwise.
-    if os.path.exists("/usr/local/lib/libuv.a"):
-        if "/usr/local/lib" not in library_dirs:
-            library_dirs.append("/usr/local/lib")
-        extra_link_args += ["-Wl,-Bstatic,-luv,-Bdynamic"]
-        libraries = [lib for lib in libraries if lib != "uv"]
+    # -DCMAKE_POSITION_INDEPENDENT_CODE=ON.  cmake may install to lib or lib64
+    # and may also create libuv.so.1 alongside the .a; the linker prefers .so,
+    # producing a wheel auditwheel can't repair.  Force static linking when our
+    # PIC-compiled libuv.a is present; fall back to dynamic (e.g. apt-installed
+    # libuv1-dev) otherwise.
+    for _uv_dir in ("/usr/local/lib", "/usr/local/lib64"):
+        if os.path.exists(os.path.join(_uv_dir, "libuv.a")):
+            if _uv_dir not in library_dirs:
+                library_dirs.append(_uv_dir)
+            extra_link_args += ["-Wl,-Bstatic,-luv,-Bdynamic"]
+            libraries = [lib for lib in libraries if lib != "uv"]
+            break
 
 # Probe for UV_TCP_REUSEPORT (added in libuv 1.44, but not always present in
 # distro packages even when the version number suggests otherwise).
