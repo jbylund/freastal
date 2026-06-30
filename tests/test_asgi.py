@@ -1,4 +1,5 @@
 """ASGI-specific tests."""
+
 import json
 import httpx
 

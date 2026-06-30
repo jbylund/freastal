@@ -403,8 +403,13 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
     struct sockaddr_in addr;
     uv_ip4_addr(host, port, &addr);
 
-    /* Use UV_TCP_REUSEPORT if caller requested it (libuv >= 1.44) */
+    /* UV_TCP_REUSEPORT availability is probed at build time by setup.py */
+#ifdef FREASTAL_REUSEPORT
     unsigned int bind_flags = reuse_port ? UV_TCP_REUSEPORT : 0;
+#else
+    (void)reuse_port;
+    unsigned int bind_flags = 0;
+#endif
     if (uv_tcp_bind(&g_server.handle, (const struct sockaddr *)&addr, bind_flags) != 0) {
         PyErr_Format(PyExc_OSError, "freastal: uv_tcp_bind failed on %s:%d", host, port);
         return -1;
