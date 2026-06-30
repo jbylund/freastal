@@ -55,6 +55,7 @@ before-all = [
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 
 [tool.cibuildwheel.macos]
+environment = {MACOSX_DEPLOYMENT_TARGET = "15.0"}
 before-all = [
     "brew install openssl@3",
     "curl -fsSL https://github.com/libuv/libuv/archive/refs/tags/v1.52.1.tar.gz | tar xz",
