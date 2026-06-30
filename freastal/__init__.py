@@ -7,13 +7,24 @@ import sys
 import multiprocessing
 import time
 
-from ._freastal import serve as _serve_single, serve_asgi as _serve_asgi_single, __version__
+from ._freastal import (
+    serve as _serve_single,
+    serve_asgi as _serve_asgi_single,
+    __version__,
+)
 
 __all__ = ["serve", "serve_asgi", "__version__"]
 
 
-def serve(app, host="0.0.0.0", port=8000, workers=1, reuse_port=True,
-          certfile=None, keyfile=None):
+def serve(
+    app,
+    host="0.0.0.0",
+    port=8000,
+    workers=1,
+    reuse_port=True,
+    certfile=None,
+    keyfile=None,
+):
     """Start freastal.
 
     With workers=1 (default) runs in-process.
@@ -22,8 +33,14 @@ def serve(app, host="0.0.0.0", port=8000, workers=1, reuse_port=True,
     Pass certfile and keyfile (PEM paths) to enable TLS 1.3 (requires picotls).
     """
     if workers <= 1:
-        _serve_single(app, host=host, port=port, reuse_port=reuse_port,
-                      certfile=certfile, keyfile=keyfile)
+        _serve_single(
+            app,
+            host=host,
+            port=port,
+            reuse_port=reuse_port,
+            certfile=certfile,
+            keyfile=keyfile,
+        )
         return
 
     processes = []
@@ -31,8 +48,14 @@ def serve(app, host="0.0.0.0", port=8000, workers=1, reuse_port=True,
     def _worker(worker_id):
         print(f"[freastal] worker {worker_id} pid={os.getpid()} starting", flush=True)
         try:
-            _serve_single(app, host=host, port=port, reuse_port=True,
-                          certfile=certfile, keyfile=keyfile)
+            _serve_single(
+                app,
+                host=host,
+                port=port,
+                reuse_port=True,
+                certfile=certfile,
+                keyfile=keyfile,
+            )
         except KeyboardInterrupt:
             pass
 
@@ -62,6 +85,7 @@ def serve_asgi(app, host="0.0.0.0", port=8000, workers=1, reuse_port=True):
     With workers>1 forks worker processes using SO_REUSEPORT.
     Each worker creates its own asyncio event loop.
     """
+
     def _run_single():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -74,7 +98,9 @@ def serve_asgi(app, host="0.0.0.0", port=8000, workers=1, reuse_port=True):
     processes = []
 
     def _worker(worker_id):
-        print(f"[freastal] ASGI worker {worker_id} pid={os.getpid()} starting", flush=True)
+        print(
+            f"[freastal] ASGI worker {worker_id} pid={os.getpid()} starting", flush=True
+        )
         try:
             _run_single()
         except KeyboardInterrupt:
