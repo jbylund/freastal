@@ -105,7 +105,7 @@ if sys.platform.startswith("linux") and "uv" in libraries:
     if "/usr/local/lib" not in library_dirs:
         library_dirs.append("/usr/local/lib")
     extra_link_args += ["-Wl,-Bstatic,-luv,-Bdynamic"]
-    libraries = [l for l in libraries if l != "uv"]
+    libraries = [lib for lib in libraries if lib != "uv"]
 
 # Probe for UV_TCP_REUSEPORT (added in libuv 1.44, but not always present in
 # distro packages even when the version number suggests otherwise).
