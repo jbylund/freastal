@@ -1,5 +1,6 @@
 import os
 import subprocess
+import tempfile
 from setuptools import Extension, setup
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +14,23 @@ def pkg_config(*args):
         return out.decode().split()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return []
+
+
+def compiler_supports_flag(flag):
+    cc = os.environ.get("CC", "cc")
+    with tempfile.NamedTemporaryFile(suffix=".c", delete=False) as f:
+        f.write(b"int main(void){return 0;}\n")
+        src = f.name
+    try:
+        subprocess.check_call(
+            [cc, flag, "-x", "c", src, "-o", "/dev/null"],
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    finally:
+        os.unlink(src)
 
 
 # ---------- libuv (required) ----------
@@ -115,7 +133,7 @@ ext = Extension(
     define_macros=define_macros,
     extra_compile_args=[
         "-O3",
-        "-march=native",
+        *(["-march=native"] if compiler_supports_flag("-march=native") else []),
         "-fvisibility=hidden",
         "-Wall",
         "-Wextra",
