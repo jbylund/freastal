@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sysconfig
 import tempfile
 from setuptools import Extension, setup
 
@@ -16,17 +17,38 @@ def pkg_config(*args):
         return []
 
 
+def _arch_flags():
+    """Return -arch flags that the build will use, from ARCHFLAGS env and sysconfig."""
+    seen, result = set(), []
+    sources = [
+        os.environ.get("ARCHFLAGS", "").split(),
+        (sysconfig.get_config_var("CFLAGS") or "").split(),
+    ]
+    for tokens in sources:
+        i = 0
+        while i < len(tokens):
+            if tokens[i] == "-arch" and i + 1 < len(tokens):
+                pair = ("-arch", tokens[i + 1])
+                if pair not in seen:
+                    seen.add(pair)
+                    result.extend(pair)
+                i += 2
+            else:
+                i += 1
+    return result
+
+
 def compiler_supports_flag(flag):
     cc = os.environ.get("CC", "cc")
-    # Include ARCHFLAGS so the probe matches the actual build (e.g. universal
-    # macOS builds use -arch arm64 -arch x86_64, which breaks -march=native).
-    archflags = os.environ.get("ARCHFLAGS", "").split()
+    # Mirror the -arch flags the build will use so universal macOS builds
+    # (-arch arm64 -arch x86_64) correctly reject -march=native.
+    arch_flags = _arch_flags()
     with tempfile.NamedTemporaryFile(suffix=".c", delete=False) as f:
         f.write(b"int main(void){return 0;}\n")
         src = f.name
     try:
         subprocess.check_call(
-            [cc, *archflags, flag, "-x", "c", src, "-o", "/dev/null"],
+            [cc, *arch_flags, flag, "-x", "c", src, "-o", "/dev/null"],
             stderr=subprocess.DEVNULL,
         )
         return True
