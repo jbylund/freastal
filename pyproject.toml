@@ -51,6 +51,7 @@ before-all = [
     "cmake -S libuv-1.52.1 -B libuv-1.52.1/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DLIBUV_BUILD_SHARED=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_INSTALL_PREFIX=/usr/local",
     "cmake --build libuv-1.52.1/build -j$(nproc)",
     "cmake --install libuv-1.52.1/build",
+    "bash scripts/build_vendor.sh",
 ]
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 
