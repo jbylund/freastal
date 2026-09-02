@@ -1,3 +1,4 @@
+import contextvars
 import multiprocessing
 import socket
 import time
@@ -91,6 +92,11 @@ def wsgi_url():
 # ---------------------------------------------------------------------------
 # ASGI app
 # ---------------------------------------------------------------------------
+
+
+# Request-scoped state: a set() in one request must not be visible in the
+# next one this worker handles.
+_TENANT = contextvars.ContextVar("tenant", default="clean")
 
 
 async def _asgi_app(scope, receive, send):
@@ -270,6 +276,75 @@ async def _asgi_app(scope, receive, send):
             }
         )
         await send({"type": "http.response.body", "body": body})
+        return
+
+    if path == "/ctxvar":
+        # Reports what it inherited, then dirties the var.  Two requests in a
+        # row must both report "clean".
+        inherited = _TENANT.get()
+        _TENANT.set("dirty")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": inherited.encode()})
+        return
+
+    if path == "/current-task":
+        # The eager path runs the app with no real Task; asyncio must still
+        # have a current task to report.
+        import asyncio
+
+        body = b"task" if asyncio.current_task() is not None else b"none"
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    if path == "/wait-for":
+        # On 3.12+ wait_for is asyncio.timeout underneath, which refuses to
+        # run without a current task.
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        loop.call_soon(fut.set_result, b"waited")
+        body = await asyncio.wait_for(fut, 5)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    if path == "/timeout-expires":
+        # asyncio.timeout captures current_task() on the eager step but only
+        # cancels it from a later loop callback (3.11+ only).
+        import asyncio
+
+        try:
+            async with asyncio.timeout(0.05):
+                await asyncio.get_running_loop().create_future()
+        except TimeoutError:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [[b"content-type", b"text/plain"]],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"expired"})
         return
 
     if path == "/boom":
