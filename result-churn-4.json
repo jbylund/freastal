@@ -1,0 +1,123 @@
+{
+  "a": [
+    {
+      "rps": 28124.84,
+      "requests": 30927,
+      "lat": {
+        "50": 664.0,
+        "75": 707.0,
+        "90": 760.0,
+        "99": 12780.0
+      },
+      "non2xx": 0,
+      "sockerr": "",
+      "instr_per_req": 113926.98399456785,
+      "cycles_per_req": 61500.407022989624,
+      "cpu_ns_per_req": 14820.09247583018
+    },
+    {
+      "rps": 9955.05,
+      "requests": 10042,
+      "lat": {
+        "50": 684.0,
+        "75": 801.0,
+        "90": 1530.0,
+        "99": 9140.0
+      },
+      "non2xx": 0,
+      "sockerr": "Socket errors: connect 40, read 0, write 0, timeout 0",
+      "instr_per_req": 112792.2444732125,
+      "cycles_per_req": 59076.556263692495,
+      "cpu_ns_per_req": 14280.442972847375
+    }
+  ],
+  "b": [
+    {
+      "rps": 27757.74,
+      "requests": 30595,
+      "lat": {
+        "50": 659.0,
+        "75": 713.0,
+        "90": 757.0,
+        "99": 7000.0
+      },
+      "non2xx": 0,
+      "sockerr": "",
+      "instr_per_req": 111158.01539467233,
+      "cycles_per_req": 58401.51371139075,
+      "cpu_ns_per_req": 14156.63098545514
+    },
+    {
+      "rps": 26338.04,
+      "requests": 28974,
+      "lat": {
+        "50": 677.0,
+        "75": 734.0,
+        "90": 790.0,
+        "99": 2680.0
+      },
+      "non2xx": 0,
+      "sockerr": "",
+      "instr_per_req": 111220.71222475322,
+      "cycles_per_req": 59593.51946572789,
+      "cpu_ns_per_req": 14327.466004003589
+    }
+  ],
+  "comparisons": [
+    {
+      "metric": "instructions/req",
+      "mean_delta": -1.9118873335790014,
+      "ci": [
+        -2.43047652347889,
+        -1.3932981436791125
+      ],
+      "verdict": "BETTER",
+      "deltas": [
+        -2.43047652347889,
+        -1.3932981436791125
+      ]
+    },
+    {
+      "metric": "cycles/req",
+      "mean_delta": -2.0818721057266925,
+      "ci": [
+        -5.038817564964199,
+        0.8750733535108137
+      ],
+      "verdict": "inconclusive",
+      "deltas": [
+        -5.038817564964199,
+        0.8750733535108137
+      ]
+    },
+    {
+      "metric": "throughput",
+      "mean_delta": 81.63219433216197,
+      "ci": [
+        -1.305251869877299,
+        164.56964053420126
+      ],
+      "verdict": "inconclusive",
+      "deltas": [
+        -1.305251869877299,
+        164.56964053420126
+      ]
+    }
+  ],
+  "args": {
+    "a": "wt/base2",
+    "b": "wt/i9c",
+    "label_a": "main",
+    "label_b": "mine",
+    "rounds": 2,
+    "dur": 1,
+    "warmup": 1,
+    "mode": "asgi",
+    "real_headers": false,
+    "churn": true,
+    "body": 500,
+    "conns": 40,
+    "threads": 4,
+    "json": "wt/i9c/result-churn-4.json"
+  }
+}

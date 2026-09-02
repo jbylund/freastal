@@ -51,7 +51,7 @@ typedef struct {
  *  - The three large buffers MUST be the last fields, in this order.  A
  *    client_t is 27KB, of which 26.5KB is buffer space, and it is recycled
  *    from a slab on every accept.  client_alloc() therefore clears only the
- *    scalar prefix (~768 bytes) and leaves the buffers alone: read_buf is
+ *    scalar prefix (760 bytes) and leaves the buffers alone: read_buf is
  *    bounded by read_len, resp_hdr by resp_hdr_len and headers[] by
  *    num_headers, all three of which live in the cleared prefix.  The
  *    static assertions below the struct hold that invariant.

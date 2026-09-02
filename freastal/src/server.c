@@ -38,10 +38,11 @@ client_t *client_alloc(void) {
     }
     /*
      * Only the scalar prefix is cleared -- see the static assertions in
-     * server.h.  Zeroing all 27KB cost about 195ns per accept and evicted L1
-     * and L2 wholesale, to initialise buffers whose contents are already
-     * unreachable: read_buf is bounded by read_len, resp_hdr by resp_hdr_len
-     * and headers[] by num_headers, and all three counters are in the prefix.
+     * server.h.  Zeroing all 27384 bytes cost about 260ns per accept and
+     * evicted L1 and L2 wholesale, to initialise buffers whose contents are
+     * already unreachable: read_buf is bounded by read_len, resp_hdr by
+     * resp_hdr_len and headers[] by num_headers, and all three counters are
+     * in the cleared prefix.
      */
     memset(c, 0, CLIENT_ZERO_LEN);
     return c;
