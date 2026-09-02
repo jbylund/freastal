@@ -231,85 +231,177 @@ static PyObject *build_asgi_scope(client_t *c) {
 
 /* ---- Response formatting ---- */
 
-static const char *status_reason(int s) {
+/*
+ * Complete status lines rather than bare reason phrases: the version prefix,
+ * the code and the CRLF are constant together, so the common case is one
+ * memcpy of a literal whose length sizeof() already knows (nginx keeps
+ * ngx_http_status_lines[] the same way).  NULL for codes not in the table.
+ */
+static const char *status_line(int s, int *len) {
+#define SL(lit) do { *len = (int)sizeof(lit) - 1; return (lit); } while (0)
     switch (s) {
-        case 100: return "Continue";
-        case 200: return "OK";
-        case 201: return "Created";
-        case 202: return "Accepted";
-        case 204: return "No Content";
-        case 206: return "Partial Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 304: return "Not Modified";
-        case 307: return "Temporary Redirect";
-        case 308: return "Permanent Redirect";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 409: return "Conflict";
-        case 410: return "Gone";
-        case 422: return "Unprocessable Entity";
-        case 429: return "Too Many Requests";
-        case 500: return "Internal Server Error";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        case 504: return "Gateway Timeout";
-        default:  return "Unknown";
+        case 100: SL("HTTP/1.1 100 Continue\r\n");
+        case 200: SL("HTTP/1.1 200 OK\r\n");
+        case 201: SL("HTTP/1.1 201 Created\r\n");
+        case 202: SL("HTTP/1.1 202 Accepted\r\n");
+        case 204: SL("HTTP/1.1 204 No Content\r\n");
+        case 206: SL("HTTP/1.1 206 Partial Content\r\n");
+        case 301: SL("HTTP/1.1 301 Moved Permanently\r\n");
+        case 302: SL("HTTP/1.1 302 Found\r\n");
+        case 304: SL("HTTP/1.1 304 Not Modified\r\n");
+        case 307: SL("HTTP/1.1 307 Temporary Redirect\r\n");
+        case 308: SL("HTTP/1.1 308 Permanent Redirect\r\n");
+        case 400: SL("HTTP/1.1 400 Bad Request\r\n");
+        case 401: SL("HTTP/1.1 401 Unauthorized\r\n");
+        case 403: SL("HTTP/1.1 403 Forbidden\r\n");
+        case 404: SL("HTTP/1.1 404 Not Found\r\n");
+        case 405: SL("HTTP/1.1 405 Method Not Allowed\r\n");
+        case 409: SL("HTTP/1.1 409 Conflict\r\n");
+        case 410: SL("HTTP/1.1 410 Gone\r\n");
+        case 422: SL("HTTP/1.1 422 Unprocessable Entity\r\n");
+        case 429: SL("HTTP/1.1 429 Too Many Requests\r\n");
+        case 500: SL("HTTP/1.1 500 Internal Server Error\r\n");
+        case 502: SL("HTTP/1.1 502 Bad Gateway\r\n");
+        case 503: SL("HTTP/1.1 503 Service Unavailable\r\n");
+        case 504: SL("HTTP/1.1 504 Gateway Timeout\r\n");
+        default:  return NULL;
     }
+#undef SL
 }
 
-static int format_response_asgi(client_t *c, int status,
-                                  PyObject *headers, PyObject *body) {
-    char *hdr = c->resp_hdr;
-    int   max = RESP_HDR_SIZE;
-    int   len = 0, n;
-    bool  have_cl = false, have_conn = false;
+/* Set by append_asgi_header() when the app supplied the header itself. */
+#define ASGI_HAS_CL   0x1u
+#define ASGI_HAS_CONN 0x2u
 
-    n = snprintf(hdr, (size_t)max, "HTTP/1.1 %d %s\r\n", status, status_reason(status));
-    if (n < 0 || n >= max) return -1;
-    len += n;
+/*
+ * Append one "name: value\r\n" from an ASGI (name, value) pair.  Returns the
+ * bytes written, or -1 if the pair is not the two bytes objects the spec
+ * requires or the line does not fit in `remaining`.
+ *
+ * Apps hand us lists or tuples, so both are read through the borrowed-reference
+ * macros: PySequence_GetItem costs generic protocol dispatch plus a new
+ * reference (and its later decref) for each of the two fields of every header.
+ * Any other sequence still works through the fallback, whose new references are
+ * released on every path -- the header bytes are only read while they are held.
+ */
+static int append_asgi_header(char *dst, int remaining, PyObject *pair,
+                              unsigned *flags) {
+    PyObject *owned_n = NULL, *owned_v = NULL;
+    PyObject *no, *vo;
 
-    Py_ssize_t nhdrs = PyList_GET_SIZE(headers);
-    for (Py_ssize_t i = 0; i < nhdrs; i++) {
-        PyObject   *pair = PyList_GET_ITEM(headers, i);
-        PyObject   *no   = PySequence_GetItem(pair, 0);
-        PyObject   *vo   = PySequence_GetItem(pair, 1);
-        if (!no || !vo || !PyBytes_Check(no) || !PyBytes_Check(vo)) {
-            Py_XDECREF(no); Py_XDECREF(vo); return -1;
-        }
+    if (likely(PyList_CheckExact(pair) && PyList_GET_SIZE(pair) == 2)) {
+        no = PyList_GET_ITEM(pair, 0);
+        vo = PyList_GET_ITEM(pair, 1);
+    } else if (PyTuple_CheckExact(pair) && PyTuple_GET_SIZE(pair) == 2) {
+        no = PyTuple_GET_ITEM(pair, 0);
+        vo = PyTuple_GET_ITEM(pair, 1);
+    } else {
+        no = owned_n = PySequence_GetItem(pair, 0);
+        vo = owned_v = PySequence_GetItem(pair, 1);
+    }
+
+    int written = -1;
+    if (likely(no && vo && PyBytes_Check(no) && PyBytes_Check(vo))) {
         const char *name = PyBytes_AS_STRING(no);
         Py_ssize_t  nl   = PyBytes_GET_SIZE(no);
         const char *val  = PyBytes_AS_STRING(vo);
         Py_ssize_t  vl   = PyBytes_GET_SIZE(vo);
+        Py_ssize_t  need = nl + vl + 4;          /* ": " and CRLF */
 
-        if (nl == 14 && strncasecmp(name, "content-length", 14) == 0) have_cl   = true;
-        if (nl == 10 && strncasecmp(name, "connection",     10) == 0) have_conn = true;
+        /* Length pre-check avoids scanning headers that can't possibly match */
+        if (nl == 14 && strncasecmp(name, "content-length", 14) == 0)
+            *flags |= ASGI_HAS_CL;
+        else if (nl == 10 && strncasecmp(name, "connection", 10) == 0)
+            *flags |= ASGI_HAS_CONN;
 
-        n = snprintf(hdr + len, (size_t)(max - len), "%.*s: %.*s\r\n",
-                     (int)nl, name, (int)vl, val);
-        Py_DECREF(no); Py_DECREF(vo);
-        if (n < 0 || n >= max - len) return -1;
+        if (likely(need <= (Py_ssize_t)remaining)) {
+            /* One bounds check covers the whole line.  memcpy also copies the
+             * value verbatim, where "%.*s" would stop at an embedded NUL. */
+            memcpy(dst, name, (size_t)nl);
+            dst[nl]     = ':';
+            dst[nl + 1] = ' ';
+            memcpy(dst + nl + 2, val, (size_t)vl);
+            dst[nl + vl + 2] = '\r';
+            dst[nl + vl + 3] = '\n';
+            written = (int)need;
+        }
+    }
+
+    Py_XDECREF(owned_n);
+    Py_XDECREF(owned_v);
+    return written;
+}
+
+/*
+ * Write the response header block into c->resp_hdr[].  Returns 0, or -1 if the
+ * buffer is too small -- the caller raises on -1, so a block that does not fit
+ * is rejected rather than truncated.
+ *
+ * memcpy of sized literals instead of snprintf, for the same reason as
+ * format_response_headers() in wsgi.c: no format-string parsing and no
+ * implicit strlen on each argument.
+ */
+static int format_response_asgi(client_t *c, int status,
+                                  PyObject *headers, PyObject *body) {
+    char    *hdr   = c->resp_hdr;
+    int      max   = RESP_HDR_SIZE;
+    int      len   = 0;
+    unsigned flags = 0;
+
+/* Bounds-checked memcpy into the header buffer. */
+#define HDR_APPEND(src, srclen) \
+    do { \
+        int _sl = (int)(srclen); \
+        if (_sl > max - len) return -1; \
+        memcpy(hdr + len, (src), (size_t)_sl); \
+        len += _sl; \
+    } while (0)
+
+    /* Status line */
+    int         slen;
+    const char *sline = status_line(status, &slen);
+    if (likely(sline != NULL)) {
+        HDR_APPEND(sline, slen);
+    } else {
+        /* Codes outside the table are rare enough not to be worth a fast path,
+         * and one bounds-checked snprintf reproduces the previous bytes for
+         * anything an app might pass, negative values included. */
+        int n = snprintf(hdr, (size_t)max, "HTTP/1.1 %d Unknown\r\n", status);
+        if (n < 0 || n >= max) return -1;
+        len = n;
+    }
+
+    /* Response headers from the app */
+    Py_ssize_t nhdrs = PyList_GET_SIZE(headers);
+    for (Py_ssize_t i = 0; i < nhdrs; i++) {
+        int n = append_asgi_header(hdr + len, max - len,
+                                   PyList_GET_ITEM(headers, i), &flags);
+        if (unlikely(n < 0)) return -1;
         len += n;
     }
 
-    if (!have_cl) {
+    /* Auto Content-Length */
+    if (!(flags & ASGI_HAS_CL)) {
         Py_ssize_t blen = (body && PyBytes_Check(body)) ? PyBytes_GET_SIZE(body) : 0;
-        n = snprintf(hdr + len, (size_t)(max - len), "Content-Length: %zd\r\n", blen);
-        if (n < 0 || n >= max - len) return -1;
+        HDR_APPEND("Content-Length: ", 16);
+        int n = write_uint(hdr + len, max - len, blen);
+        if (n < 0) return -1;
         len += n;
-    }
-    if (!have_conn) {
-        n = snprintf(hdr + len, (size_t)(max - len), "Connection: %s\r\n",
-                     c->keep_alive ? "keep-alive" : "close");
-        if (n < 0 || n >= max - len) return -1;
-        len += n;
+        HDR_APPEND("\r\n", 2);
     }
 
-    if (len + 2 >= max) return -1;
-    hdr[len++] = '\r'; hdr[len++] = '\n';
+    /* Auto Connection */
+    if (!(flags & ASGI_HAS_CONN)) {
+        if (c->keep_alive)
+            HDR_APPEND("Connection: keep-alive\r\n", 24);
+        else
+            HDR_APPEND("Connection: close\r\n", 19);
+    }
+
+    HDR_APPEND("\r\n", 2);
+
+#undef HDR_APPEND
+
     c->resp_hdr_len = len;
     return 0;
 }

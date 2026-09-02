@@ -148,23 +148,7 @@ static PyObject *collect_body(PyObject *iterable) {
 
 /* ---- Response formatting ---- */
 
-/* Write a non-negative integer as decimal ASCII. Returns bytes written, -1 on overflow. */
-static int write_uint(char *dst, int remaining, Py_ssize_t n) {
-    char tmp[20];
-    int  i = 0;
-    if (n == 0) {
-        tmp[i++] = '0';
-    } else {
-        size_t u = (size_t)n;
-        while (u > 0) { tmp[i++] = (char)('0' + u % 10); u /= 10; }
-        for (int lo = 0, hi = i - 1; lo < hi; lo++, hi--) {
-            char t = tmp[lo]; tmp[lo] = tmp[hi]; tmp[hi] = t;
-        }
-    }
-    if (i > remaining) return -1;
-    memcpy(dst, tmp, (size_t)i);
-    return i;
-}
+/* write_uint() is shared with the ASGI formatter; see server.h. */
 
 /*
  * Write "HTTP/1.1 <status>\r\n<headers>\r\nContent-Length: N\r\nConnection: ...\r\n\r\n"
