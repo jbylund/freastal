@@ -88,6 +88,8 @@ typedef struct client_s {
     char     peer_addr[PEER_ADDR_LEN];
     uint16_t peer_port;
     bool     keep_alive;
+    bool     in_flight;                /* a response is being produced; no second request may be parsed */
+    bool     read_armed;               /* uv_read_start() is in effect for this handle */
     PyObject *peer_addr_obj;           /* cached PyUnicode of peer_addr; reused across keep-alive requests */
 
     /* --- ASGI per-connection state (NULL in WSGI mode) --- */
