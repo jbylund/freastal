@@ -88,3 +88,97 @@ def test_pipelined_requests_that_suspend(asgi_url):
 
     assert data.count(b"HTTP/1.1 200") == n
     assert data.count(b"slept") == n
+
+
+def _read_responses(sock, count, timeout=10.0):
+    """Read from sock until `count` status lines have arrived, or we stall."""
+    sock.settimeout(timeout)
+    data = b""
+    try:
+        while data.count(b"HTTP/1.1 200") < count:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except TimeoutError:
+        pass
+    return data
+
+
+def test_request_arriving_while_a_response_is_in_flight(asgi_url):
+    """A second request that lands mid-flight must not be answered early.
+
+    Reading is left armed across dispatch, so the bytes of request 2 arrive
+    while request 1 is still suspended.  They have to sit in read_buf until
+    request 1's response has been written: answering request 2 first would
+    interleave two responses on one connection.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(asgi_url)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=10) as sock:
+        sock.sendall(b"GET /sleep/0.4 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        time.sleep(0.15)  # request 1 is now dispatched and suspended
+        sock.sendall(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        data = _read_responses(sock, 2)
+
+    assert data.count(b"HTTP/1.1 200") == 2, data
+    assert data.index(b"slept") < data.index(b"hello"), data
+
+
+def test_pipelining_past_the_read_buffer_while_suspended(asgi_url):
+    """Pipelining more than READ_BUF_SIZE while a response is outstanding.
+
+    read_buf is 16KB and cannot be drained until the suspended request
+    answers, so the server has to stop reading at the buffer boundary and
+    resume once there is room.  Every request must still be answered.
+    """
+    import socket
+    import threading
+    from urllib.parse import urlparse
+
+    parsed = urlparse(asgi_url)
+    n = 600  # 600 * 41 bytes ~= 24KB, comfortably past the 16KB read buffer
+    flood = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n" * n
+
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=20) as sock:
+        sock.sendall(b"GET /sleep/0.2 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        time.sleep(0.05)
+        # Send from a thread: the server stops reading at the buffer boundary,
+        # so a blocking sendall of 24KB must not be able to wedge the test.
+        sender = threading.Thread(target=sock.sendall, args=(flood,), daemon=True)
+        sender.start()
+        data = _read_responses(sock, n + 1, timeout=20.0)
+        sender.join(timeout=10)
+
+    assert data.count(b"HTTP/1.1 200") == n + 1, data.count(b"HTTP/1.1 200")
+    assert data.count(b"hello") == n
+    assert data.count(b"slept") == 1
+
+
+def test_peer_reset_while_a_response_is_in_flight(asgi_url):
+    """An RST arriving mid-flight must not close the handle twice.
+
+    on_read can now fire with a write outstanding.  Closing from there would
+    complete that write with UV_ECANCELED and on_write would close a second
+    time, which libuv aborts on -- taking the whole worker with it.
+    """
+    import socket
+    import struct
+    from urllib.parse import urlparse
+
+    parsed = urlparse(asgi_url)
+    for _ in range(5):
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+        # SO_LINGER with a zero timeout makes close() send RST, not FIN.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.sendall(b"GET /sleep/0.2 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        time.sleep(0.05)
+        sock.close()
+
+    # The worker must still be serving.
+    time.sleep(0.4)
+    r = httpx.get(f"{asgi_url}/hello", timeout=10)
+    assert r.status_code == 200
+    assert r.content == b"hello"

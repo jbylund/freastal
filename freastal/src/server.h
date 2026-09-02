@@ -40,12 +40,27 @@ typedef struct {
 #define LISTEN_BACKLOG  4096
 #define PEER_ADDR_LEN   64
 
+/*
+ * Per-connection state.
+ *
+ * Field order is load-bearing, in two ways:
+ *
+ *  - uv_tcp_t MUST be first so that (client_t *) casts to (uv_tcp_t *) and to
+ *    (uv_stream_t *) work, as libuv requires.
+ *
+ *  - The three large buffers MUST be the last fields, in this order.  A
+ *    client_t is 27KB, of which 26.5KB is buffer space, and it is recycled
+ *    from a slab on every accept.  client_alloc() therefore clears only the
+ *    scalar prefix (760 bytes) and leaves the buffers alone: read_buf is
+ *    bounded by read_len, resp_hdr by resp_hdr_len and headers[] by
+ *    num_headers, all three of which live in the cleared prefix.  The
+ *    static assertions below the struct hold that invariant.
+ */
 typedef struct client_s {
     uv_tcp_t         handle;                  /* MUST be first */
     struct client_s *next_free;               /* free-list link (valid only when pooled) */
 
     /* --- Read state --- */
-    char    read_buf[READ_BUF_SIZE];
     int     read_len;                         /* bytes accumulated in read_buf */
     int     last_len;                         /* read_len at previous parse attempt */
 
@@ -55,7 +70,6 @@ typedef struct client_s {
     const char       *path;
     size_t            path_len;
     int               minor_version;
-    struct phr_header headers[MAX_HEADERS];
     size_t            num_headers;
     int               headers_end;            /* byte offset of first body byte */
     size_t            content_length;
@@ -67,7 +81,6 @@ typedef struct client_s {
 
     /* --- Response write state --- */
     uv_write_t write_req;                     /* embedded; avoids one malloc per write */
-    char       resp_hdr[RESP_HDR_SIZE];
     int        resp_hdr_len;
     uv_buf_t   write_bufs[2];                 /* [headers_buf, body_buf] */
 
@@ -75,10 +88,14 @@ typedef struct client_s {
     char     peer_addr[PEER_ADDR_LEN];
     uint16_t peer_port;
     bool     keep_alive;
+    bool     in_flight;                /* a response is being produced; no second request may be parsed */
+    bool     read_armed;               /* uv_read_start() is in effect for this handle */
     PyObject *peer_addr_obj;           /* cached PyUnicode of peer_addr; reused across keep-alive requests */
 
-    /* --- ASGI task (NULL in WSGI mode) --- */
+    /* --- ASGI per-connection state (NULL in WSGI mode) --- */
     PyObject *asgi_task;
+    PyObject *asgi_client_obj;          /* cached (peer_ip, peer_port) scope tuple */
+    PyObject *asgi_capsule;             /* cached capsule holding this client_t */
 
 #ifdef FREASTAL_TLS
     char         *tls_enc;                    /* heap-alloc'd on TLS accept, NULL for plain HTTP */
@@ -87,13 +104,30 @@ typedef struct client_s {
     ptls_buffer_t tls_wbuf;  /* encrypted response buf; alive until on_write */
 #endif
 
+    /* --- Large buffers; NOT cleared by client_alloc().  Keep last. --- */
+    struct phr_header headers[MAX_HEADERS];
+    char              resp_hdr[RESP_HDR_SIZE];
+    char              read_buf[READ_BUF_SIZE];
 } client_t;
 
+/* Bytes client_alloc() clears: everything up to the first large buffer. */
+#define CLIENT_ZERO_LEN  offsetof(client_t, headers)
 
-/* Per-connection state.
- * uv_tcp_t MUST be the first field so that (client_t *) casts to (uv_tcp_t *)
- * and to (uv_stream_t *) work correctly as required by libuv.
- */
+/* The reason client_alloc() may stop at CLIENT_ZERO_LEN is that the tail is
+ * exactly headers[] + resp_hdr[] + read_buf[] and nothing else.  Reordering or
+ * appending a field would silently start leaking a previous connection's
+ * state into the next one, so make it a build error instead. */
+_Static_assert(offsetof(client_t, handle) == 0,
+               "uv_tcp_t handle must be the first field of client_t");
+_Static_assert(offsetof(client_t, headers) + MAX_HEADERS * sizeof(struct phr_header)
+                   == offsetof(client_t, resp_hdr),
+               "resp_hdr must directly follow headers[]");
+_Static_assert(offsetof(client_t, resp_hdr) + RESP_HDR_SIZE
+                   == offsetof(client_t, read_buf),
+               "read_buf must directly follow resp_hdr");
+_Static_assert(offsetof(client_t, read_buf) + READ_BUF_SIZE == sizeof(client_t),
+               "read_buf must be the last field of client_t");
+
 
 /* Pre-interned Python string keys for WSGI environ */
 typedef struct {
@@ -130,6 +164,19 @@ typedef struct {
     PyObject *empty_str;              /* "" */
 } wsgi_keys_t;
 
+/* Pre-interned Python string keys for the ASGI scope entries that change from
+ * request to request.  The constant entries never need a key object: they ride
+ * along inside the scope template. */
+typedef struct {
+    PyObject *http_version;
+    PyObject *method;
+    PyObject *path;
+    PyObject *raw_path;
+    PyObject *query_string;
+    PyObject *client;
+    PyObject *headers;
+} asgi_keys_t;
+
 /* Global server state */
 typedef struct {
     uv_loop_t  *loop;
@@ -142,7 +189,7 @@ typedef struct {
     client_t   *free_list;
     void       *slab;                 /* malloc'd slab holding pool objects */
     int         pool_cap;
-    int         pool_size;            /* active connections */
+    int         pool_used;            /* slab objects handed out at least once */
 
     wsgi_keys_t keys;
 
@@ -189,12 +236,65 @@ typedef struct {
     PyObject  *asgi_version_dict;   /* {"version": "3.0"} */
     PyObject  *asgi_server_tuple;   /* (host, port) */
 
-    /* asyncio._set_running_loop: required on Python 3.14+ where context.run()
-     * validates the C-level running-loop thread-local before stepping a Task. */
-    PyObject  *asyncio_set_running_loop;
+    /* Fully-populated scope, copied per request.  Never mutated after init. */
+    PyObject  *asgi_scope_template;
+    asgi_keys_t asgi_keys;
 } server_t;
 
 extern server_t g_server;
+
+/* Shared response-formatting helpers.  Both the WSGI and ASGI formatters
+ * emit Content-Length, so the integer writer lives here rather than being
+ * duplicated in each of them. */
+/* Two ASCII digits per entry, so decimal conversion costs one divide per two
+ * digits instead of one per digit (Alexandrescu's method, as in fmt). */
+static const char TWO_DIGITS[] =
+    "00010203040506070809" "10111213141516171819"
+    "20212223242526272829" "30313233343536373839"
+    "40414243444546474849" "50515253545556575859"
+    "60616263646566676869" "70717273747576777879"
+    "80818283848586878889" "90919293949596979899";
+
+/* Digits in the decimal form of u; zero counts as one digit. */
+static inline int uint_ndigits(uint64_t u) {
+    int d = 1;
+    for (;;) {
+        if (u < 10)    return d;
+        if (u < 100)   return d + 1;
+        if (u < 1000)  return d + 2;
+        if (u < 10000) return d + 3;
+        u /= 10000;
+        d += 4;
+    }
+}
+
+/*
+ * Write a non-negative integer as decimal ASCII.  Returns bytes written, -1 on
+ * overflow.  Sizing the field first lets the digits be filled in place, which
+ * saves both the temporary buffer and the reversing pass a per-digit loop needs.
+ */
+static inline int write_uint(char *dst, int remaining, Py_ssize_t n) {
+    uint64_t u = (uint64_t)n;
+    int      d = uint_ndigits(u);
+    if (unlikely(d > remaining)) return -1;
+
+    char *p = dst + d;
+    while (u >= 100) {
+        unsigned i = (unsigned)(u % 100) * 2;
+        u /= 100;
+        p -= 2;
+        p[0] = TWO_DIGITS[i];
+        p[1] = TWO_DIGITS[i + 1];
+    }
+    if (u >= 10) {
+        unsigned i = (unsigned)u * 2;
+        p[-2] = TWO_DIGITS[i];
+        p[-1] = TWO_DIGITS[i + 1];
+    } else {
+        p[-1] = (char)('0' + u);
+    }
+    return d;
+}
 
 /* Server lifecycle */
 int  server_init(PyObject *app, const char *host, int port, bool reuse_port,

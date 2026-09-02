@@ -1,3 +1,4 @@
+import contextvars
 import multiprocessing
 import socket
 import time
@@ -47,6 +48,17 @@ def _wsgi_app(environ, start_response):
         value = environ.get("HTTP_X_TEST", "")
         start_response("200 OK", [("Content-Type", "text/plain")])
         return [value.encode()]
+
+    if path == "/headers":
+        # "name=value" per line, names normalised back to their wire form so
+        # the same assertions work against the ASGI app.
+        lines = sorted(
+            f"{k[5:].lower().replace('_', '-')}={v}"
+            for k, v in environ.items()
+            if k.startswith("HTTP_")
+        )
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return ["\n".join(lines).encode("latin-1")]
 
     if path == "/query":
         qs = environ.get("QUERY_STRING", "")
@@ -100,6 +112,11 @@ def wsgi_url():
 # ---------------------------------------------------------------------------
 
 
+# Request-scoped state: a set() in one request must not be visible in the
+# next one this worker handles.
+_TENANT = contextvars.ContextVar("tenant", default="clean")
+
+
 async def _asgi_app(scope, receive, send):
     if scope["type"] != "http":
         return
@@ -142,6 +159,23 @@ async def _asgi_app(scope, receive, send):
             }
         )
         await send({"type": "http.response.body", "body": value.encode()})
+        return
+
+    if path == "/headers":
+        lines = sorted(
+            f"{n.decode('latin-1')}={v.decode('latin-1')}"
+            for n, v in scope.get("headers", [])
+        )
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send(
+            {"type": "http.response.body", "body": "\n".join(lines).encode("latin-1")}
+        )
         return
 
     if path == "/query":
@@ -264,8 +298,121 @@ async def _asgi_app(scope, receive, send):
         await send({"type": "http.response.body", "body": body})
         return
 
+    if path == "/ctxvar":
+        # Reports what it inherited, then dirties the var.  Two requests in a
+        # row must both report "clean".
+        inherited = _TENANT.get()
+        _TENANT.set("dirty")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": inherited.encode()})
+        return
+
+    if path == "/current-task":
+        # The eager path runs the app with no real Task; asyncio must still
+        # have a current task to report.
+        import asyncio
+
+        body = b"task" if asyncio.current_task() is not None else b"none"
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    if path == "/wait-for":
+        # On 3.12+ wait_for is asyncio.timeout underneath, which refuses to
+        # run without a current task.
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        loop.call_soon(fut.set_result, b"waited")
+        body = await asyncio.wait_for(fut, 5)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    if path == "/timeout-expires":
+        # asyncio.timeout captures current_task() on the eager step but only
+        # cancels it from a later loop callback (3.11+ only).
+        import asyncio
+
+        try:
+            async with asyncio.timeout(0.05):
+                await asyncio.get_running_loop().create_future()
+        except TimeoutError:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [[b"content-type", b"text/plain"]],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"expired"})
+        return
+
     if path == "/boom":
         raise RuntimeError("app failure")
+
+    if path == "/scope-all":
+        import json
+
+        # Snapshot the whole scope, then vandalise it the way Starlette and
+        # FastAPI do.  Hitting this repeatedly on one connection proves the
+        # scope is a fresh dict per request rather than a shared or recycled
+        # one: the snapshot must come back identical every time.
+        snapshot = {
+            "keys": sorted(scope),
+            "dict_copy_keys": sorted(dict(scope)),
+            "is_dict": type(scope) is dict,
+            "type": scope.get("type"),
+            "asgi": scope.get("asgi"),
+            "http_version": scope.get("http_version"),
+            "method": scope.get("method"),
+            "scheme": scope.get("scheme"),
+            "root_path": scope.get("root_path"),
+            "path": scope.get("path"),
+            "raw_path": scope.get("raw_path", b"").decode(),
+            "query_string": scope.get("query_string", b"").decode(),
+            "client": list(scope.get("client") or []),
+            "server": list(scope.get("server") or []),
+            "header_names": sorted(n.decode() for n, _ in scope.get("headers", [])),
+        }
+        scope["app"] = object()
+        scope["router"] = object()
+        scope["path_params"] = {}
+        scope["endpoint"] = object()
+        scope["route"] = object()
+        scope["state"] = {}
+        scope["root_path"] = "/mounted"
+        scope["path"] = "/rewritten"
+
+        data = json.dumps(snapshot).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"application/json"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": data})
+        return
 
     if path == "/scope":
         import json

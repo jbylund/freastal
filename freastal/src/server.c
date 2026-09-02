@@ -1,6 +1,7 @@
 #include "server.h"
 #include "wsgi.h"
 #include "asgi.h"
+#include "hdrcache.h"
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
@@ -8,20 +9,20 @@ server_t g_server;
 
 /* ---- Client pool ---- */
 
-/* Pre-allocate a slab so most allocs are free-list pops (no malloc) */
+/* Reserve a slab so most allocs are free-list pops (no malloc).
+ *
+ * The slab is handed out with a bump pointer rather than pre-linked into a
+ * free list: writing next_free into all 4096 objects touched a byte inside
+ * nearly every 16KB page of the 107MB reservation, which made 65MB of it
+ * resident at startup for a server that may only ever see a few connections.
+ * calloc()'s pages are zero-fill-on-demand, so leaving them untouched costs
+ * only virtual address space until a connection actually needs one. */
 static int pool_init(int cap) {
     g_server.slab = calloc(cap, sizeof(client_t));
     if (!g_server.slab) return -1;
     g_server.pool_cap = cap;
+    g_server.pool_used = 0;
     g_server.free_list = NULL;
-
-    /* Build free list in reverse so first alloc returns index 0 */
-    char *base = (char *)g_server.slab;
-    for (int i = cap - 1; i >= 0; i--) {
-        client_t *c = (client_t *)(base + i * sizeof(client_t));
-        c->next_free = g_server.free_list;
-        g_server.free_list = c;
-    }
     return 0;
 }
 
@@ -30,12 +31,24 @@ client_t *client_alloc(void) {
     if (g_server.free_list) {
         c = g_server.free_list;
         g_server.free_list = c->next_free;
+    } else if (g_server.pool_used < g_server.pool_cap) {
+        c = (client_t *)((char *)g_server.slab
+                         + (size_t)g_server.pool_used * sizeof(client_t));
+        g_server.pool_used++;
     } else {
         /* Pool exhausted – fall back to malloc */
         c = (client_t *)malloc(sizeof(client_t));
         if (!c) return NULL;
     }
-    memset(c, 0, sizeof(client_t));
+    /*
+     * Only the scalar prefix is cleared -- see the static assertions in
+     * server.h.  Zeroing all 27384 bytes cost about 260ns per accept and
+     * evicted L1 and L2 wholesale, to initialise buffers whose contents are
+     * already unreachable: read_buf is bounded by read_len, resp_hdr by
+     * resp_hdr_len and headers[] by num_headers, and all three counters are
+     * in the cleared prefix.
+     */
+    memset(c, 0, CLIENT_ZERO_LEN);
     return c;
 }
 
@@ -50,6 +63,14 @@ void client_free(client_t *c) {
     } else {
         free(c);
     }
+}
+
+/* Python objects cached for the whole connection, not just one request.
+ * The GIL must be held. */
+static void client_clear_conn_cache(client_t *c) {
+    Py_CLEAR(c->peer_addr_obj);
+    Py_CLEAR(c->asgi_client_obj);
+    Py_CLEAR(c->asgi_capsule);
 }
 
 void client_reset(client_t *c) {
@@ -167,7 +188,29 @@ int http_dispatch(client_t *c, uv_stream_t *stream) {
     size_t body_received = (size_t)(c->read_len - pret);
     if (body_received < c->content_length) return 0;
 
-    uv_read_stop(stream);
+    /*
+     * Reading stays armed across the dispatch.  Disarming it here and
+     * re-arming in on_write cost one extra kernel round trip per request on
+     * Linux, for an epoll registration change that was never needed:
+     * uv__io_stop() zeroes w->events without issuing EPOLL_CTL_DEL, so the
+     * next uv__io_poll() picks EPOLL_CTL_ADD for an fd that is still
+     * registered, takes EEXIST, and has to resubmit as EPOLL_CTL_MOD
+     * (libuv 1.52.1 src/unix/core.c and src/unix/linux.c).  Measured on
+     * Linux 7.0 aarch64 with 20k keep-alive requests: 2 io_uring_enter per
+     * request before, 1 after -- 5.01 syscalls/req down to 4.01.
+     *
+     * in_flight is what keeps the protocol correct in its place: a pipelined
+     * request that arrives now accumulates in read_buf and is dispatched by
+     * on_write, so responses cannot interleave on the wire.
+     */
+    c->in_flight = true;
+#ifdef FREASTAL_TLS
+    /* TLS records decrypt into read_buf and the plaintext size cannot be
+     * predicted from the ciphertext, so there is no read at which the
+     * encrypted path could safely stop.  Keep its existing behaviour of not
+     * reading at all while a response is outstanding. */
+    if (c->tls) { uv_read_stop(stream); c->read_armed = false; }
+#endif
     GIL_LOCK();
     if (g_server.asgi_mode)
         asgi_dispatch(c);
@@ -181,11 +224,26 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     client_t *c = (client_t *)stream;
 
     if (nread < 0) {
+        /*
+         * Reading is armed while a response is in flight, so this can now
+         * fire with a write outstanding.  Closing here would complete that
+         * write with UV_ECANCELED and on_write would then close a second
+         * time, which libuv aborts on -- so leave the close to on_write, and
+         * only make sure it takes the close branch when it runs.  The
+         * per-request Python objects belong to that response and must not be
+         * cleared underneath it either.
+         */
+        if (c->in_flight) {
+            c->keep_alive = false;
+            c->read_armed = false;
+            uv_read_stop(stream);
+            return;
+        }
         GIL_LOCK();
         Py_CLEAR(c->resp_status);
         Py_CLEAR(c->resp_pyheaders);
         Py_CLEAR(c->resp_body);
-        Py_CLEAR(c->peer_addr_obj);
+        client_clear_conn_cache(c);
         GIL_UNLOCK();
         uv_close((uv_handle_t *)&c->handle, on_close);
         return;
@@ -200,7 +258,27 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
 #endif
 
     c->read_len += (int)nread;
-    (void)http_dispatch(c, stream);
+
+    /* While a response is in flight the bytes just accumulate; on_write
+     * dispatches them once the wire is free again. */
+    if (likely(!c->in_flight) && unlikely(http_dispatch(c, stream) < 0))
+        return;                                     /* connection closed */
+
+    /*
+     * The one case that still has to disarm the read: read_buf is full and
+     * only the in-flight response can make room.  alloc_cb answers a full
+     * buffer with a zero-length uv_buf_t, which libuv reports as UV_ENOBUFS
+     * and which would kill a connection that is merely pipelining hard.
+     * on_write re-arms once client_reset() has slid the leftover down.
+     *
+     * A full buffer with nothing in flight is a different thing -- a request
+     * whose headers exceed READ_BUF_SIZE -- and still ends in UV_ENOBUFS and
+     * a closed connection, as before.
+     */
+    if (unlikely(c->read_len >= READ_BUF_SIZE) && c->in_flight) {
+        uv_read_stop(stream);
+        c->read_armed = false;
+    }
 }
 
 /*
@@ -237,7 +315,7 @@ static void on_write(uv_write_t *req, int status) {
     Py_CLEAR(c->resp_body);
     Py_CLEAR(c->asgi_task);
     if (status < 0 || !c->keep_alive)
-        Py_CLEAR(c->peer_addr_obj);
+        client_clear_conn_cache(c);
     GIL_UNLOCK();
 
     if (status < 0 || !c->keep_alive) {
@@ -245,20 +323,36 @@ static void on_write(uv_write_t *req, int status) {
         return;
     }
 
-    /* Keep-alive: reset and re-arm for the next request */
+    /* Keep-alive: reset for the next request */
     client_reset(c);
+    c->in_flight = false;
 
-    /* A pipelined request may already be buffered.  Dispatch it directly;
-     * only fall through to uv_read_start when more bytes are needed. */
-    if (c->read_len > 0 && http_dispatch(c, (uv_stream_t *)&c->handle) != 0)
+    /* A pipelined request may already be buffered.  Dispatch it directly. */
+    if (c->read_len > 0 && http_dispatch(c, (uv_stream_t *)&c->handle) < 0)
         return;
 
-    uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read);
+    /* Reading is normally still armed, so there is nothing to do here.  It is
+     * only ever off because on_read hit a full read_buf, or because this is
+     * the TLS path, and in both cases it goes back on as soon as read_buf has
+     * room and no response is outstanding. */
+    if (unlikely(!c->read_armed) && !c->in_flight) {
+        c->read_armed = true;
+        uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read);
+    }
 }
 
 static void on_close(uv_handle_t *handle) {
     client_t *c = (client_t *)handle;
-    /* Python objects already cleared before calling uv_close */
+    /* Per-request objects are cleared before uv_close, but not every teardown
+     * path goes through on_write (a malformed request and the TLS errors close
+     * directly), and the slab recycles this client_t. This is the one funnel
+     * they all share; on the ordinary paths the cache is already empty and the
+     * GIL is not taken. */
+    if (c->peer_addr_obj || c->asgi_client_obj || c->asgi_capsule) {
+        GIL_LOCK();
+        client_clear_conn_cache(c);
+        GIL_UNLOCK();
+    }
 #ifdef FREASTAL_TLS
     tls_conn_free(c);
 #endif
@@ -303,6 +397,7 @@ static void on_new_connection(uv_stream_t *server, int status) {
         c->peer_port = 0;
     }
 
+    c->read_armed = true;
     uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read);
 }
 
@@ -374,6 +469,8 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
 
     if (init_wsgi_keys() < 0) return -1;
 
+    if (hdr_cache_init() < 0) return -1;
+
     /* Cache io.BytesIO */
     PyObject *io = PyImport_ImportModule("io");
     if (!io) return -1;
@@ -393,6 +490,10 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
         Py_DECREF(empty_b);
         if (!g_server.empty_wsgi_input) return -1;
     }
+
+    /* Pre-build the environ template (needs the keys, sys.stderr and the
+     * BytesIO singleton above). */
+    if (wsgi_init_environ_template() < 0) return -1;
 
     g_server.loop = uv_default_loop();
 
