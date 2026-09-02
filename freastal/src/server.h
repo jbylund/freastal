@@ -89,6 +89,8 @@ typedef struct client_s {
 
 #ifdef FREASTAL_IOURING
     int  iouring_buf_idx;  /* registered buffer in use for current write, or -1 */
+    int  iouring_len;      /* total bytes staged in that buffer */
+    int  iouring_off;      /* bytes of it the kernel has accepted so far */
 #endif
 } client_t;
 

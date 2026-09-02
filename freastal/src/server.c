@@ -1,6 +1,7 @@
 #include "server.h"
 #include "wsgi.h"
 #include "asgi.h"
+#include <errno.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
@@ -36,6 +37,11 @@ client_t *client_alloc(void) {
         if (!c) return NULL;
     }
     memset(c, 0, sizeof(client_t));
+#ifdef FREASTAL_IOURING
+    /* 0 is a valid buffer index, so a zeroed struct must not read as "holding
+     * buffer 0" -- that would release a buffer this client never acquired. */
+    c->iouring_buf_idx = -1;
+#endif
     return c;
 }
 
@@ -74,6 +80,9 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
 static void on_write(uv_write_t *req, int status);
 static void on_close(uv_handle_t *handle);
 static void on_new_connection(uv_stream_t *server, int status);
+#ifdef FREASTAL_IOURING
+static void iou_free_buf(iouring_ctx_t *ctx, int idx);
+#endif
 #ifdef FREASTAL_TLS
 static void on_tls_hs_write(uv_write_t *req, int status);
 static void tls_hs_send(client_t *c, ptls_buffer_t *outbuf);
@@ -235,6 +244,13 @@ void write_response(client_t *c) {
 
 static void on_write(uv_write_t *req, int status) {
     client_t *c = CONTAINER_OF(req, client_t, write_req);
+#ifdef FREASTAL_IOURING
+    /* Set when on_iouring_event handed the tail of a short write to uv_write. */
+    if (c->iouring_buf_idx >= 0) {
+        iou_free_buf(&g_server.iouring, c->iouring_buf_idx);
+        c->iouring_buf_idx = -1;
+    }
+#endif
 #ifdef FREASTAL_TLS
     if (c->tls) ptls_buffer_dispose(&c->tls_wbuf);
 #endif
@@ -552,8 +568,16 @@ int iouring_write(client_t *c,
     io_uring_prep_write_fixed(sqe, (int)fd, buf, (unsigned int)total, 0, buf_idx);
     io_uring_sqe_set_data(sqe, c);  /* recover client in completion handler */
     c->iouring_buf_idx = buf_idx;
+    c->iouring_len     = (int)total;
+    c->iouring_off     = 0;
 
-    io_uring_submit(&ctx->ring);
+    if (io_uring_submit(&ctx->ring) < 0) {
+        /* Nothing reached the kernel, so no completion will ever arrive for
+         * this client.  Release the buffer and let the caller fall back. */
+        iou_free_buf(ctx, buf_idx);
+        c->iouring_buf_idx = -1;
+        return -1;
+    }
     return 0;
 }
 
@@ -566,11 +590,37 @@ static void on_iouring_event(uv_poll_t *handle, int status, int events) {
     unsigned nr = 0;  /* count consumed, not raw ring head */
 
     io_uring_for_each_cqe(&ctx->ring, head, cqe) {
-        client_t *c    = (client_t *)io_uring_cqe_get_data(cqe);
-        int write_res  = cqe->res;
-        int buf_idx    = c->iouring_buf_idx;
+        client_t *c   = (client_t *)io_uring_cqe_get_data(cqe);
+        int write_res = cqe->res;
+        nr++;
 
-        iou_free_buf(ctx, buf_idx);
+        /*
+         * write_fixed is not all-or-nothing.  The kernel may accept fewer
+         * bytes than were submitted, and returns -EAGAIN outright when the
+         * socket send buffer is full -- both are ordinary outcomes for a
+         * 12-64KB response on a busy connection.  Treating any res >= 0 as
+         * a completed write silently truncated the response body.
+         *
+         * Hand the remainder to uv_write, which already knows how to queue a
+         * short write and wait for writability.  The registered buffer stays
+         * checked out until on_write releases it.
+         */
+        if (write_res > 0)
+            c->iouring_off += write_res;
+
+        if ((write_res >= 0 || write_res == -EAGAIN) &&
+            c->iouring_off < c->iouring_len) {
+            char *buf = ctx->bufs + (size_t)c->iouring_buf_idx * IOURING_BUF_SIZE;
+            c->write_bufs[0] = uv_buf_init(
+                buf + c->iouring_off,
+                (size_t)(c->iouring_len - c->iouring_off));
+            if (uv_write(&c->write_req, (uv_stream_t *)&c->handle,
+                         c->write_bufs, 1, on_write) == 0)
+                continue;      /* on_write finishes the request */
+            write_res = -1;    /* tail could not be queued: drop the connection */
+        }
+
+        iou_free_buf(ctx, c->iouring_buf_idx);
         c->iouring_buf_idx = -1;
 
         GIL_LOCK();
@@ -586,7 +636,6 @@ static void on_iouring_event(uv_poll_t *handle, int status, int events) {
             client_reset(c);
             uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read);
         }
-        nr++;
     }
     io_uring_cq_advance(&ctx->ring, nr);
 }
