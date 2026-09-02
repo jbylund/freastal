@@ -37,7 +37,8 @@ def port():
     p = free_port()
     proc = subprocess.Popen(
         [sys.executable, "-c", f"PORT = {p}\n" + APP],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -64,7 +65,7 @@ def _split_post(port, head_part, tail_part, total_len, gap=0.02):
             + b"\r\nConnection: close\r\n\r\n"
             + head_part
         )
-        time.sleep(gap)          # force a second read() on the server
+        time.sleep(gap)  # force a second read() on the server
         if tail_part:
             s.sendall(tail_part)
         buf = b""
@@ -79,9 +80,9 @@ def _split_post(port, head_part, tail_part, total_len, gap=0.02):
 @pytest.mark.parametrize(
     "head,tail",
     [
-        (b"ab", b"cdefgh"),      # body split mid-way
-        (b"", b"abcdefgh"),      # no body bytes in the first segment at all
-        (b"abcdefg", b"h"),      # one byte arrives late
+        (b"ab", b"cdefgh"),  # body split mid-way
+        (b"", b"abcdefgh"),  # no body bytes in the first segment at all
+        (b"abcdefg", b"h"),  # one byte arrives late
     ],
 )
 def test_body_arriving_after_the_headers_is_answered(port, head, tail):
