@@ -394,6 +394,10 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
         if (!g_server.empty_wsgi_input) return -1;
     }
 
+    /* Pre-build the environ template (needs the keys, sys.stderr and the
+     * BytesIO singleton above). */
+    if (wsgi_init_environ_template() < 0) return -1;
+
     g_server.loop = uv_default_loop();
 
     uv_tcp_init(g_server.loop, &g_server.handle);
