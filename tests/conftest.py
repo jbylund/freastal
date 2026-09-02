@@ -267,6 +267,50 @@ async def _asgi_app(scope, receive, send):
     if path == "/boom":
         raise RuntimeError("app failure")
 
+    if path == "/scope-all":
+        import json
+
+        # Snapshot the whole scope, then vandalise it the way Starlette and
+        # FastAPI do.  Hitting this repeatedly on one connection proves the
+        # scope is a fresh dict per request rather than a shared or recycled
+        # one: the snapshot must come back identical every time.
+        snapshot = {
+            "keys": sorted(scope),
+            "dict_copy_keys": sorted(dict(scope)),
+            "is_dict": type(scope) is dict,
+            "type": scope.get("type"),
+            "asgi": scope.get("asgi"),
+            "http_version": scope.get("http_version"),
+            "method": scope.get("method"),
+            "scheme": scope.get("scheme"),
+            "root_path": scope.get("root_path"),
+            "path": scope.get("path"),
+            "raw_path": scope.get("raw_path", b"").decode(),
+            "query_string": scope.get("query_string", b"").decode(),
+            "client": list(scope.get("client") or []),
+            "server": list(scope.get("server") or []),
+            "header_names": sorted(n.decode() for n, _ in scope.get("headers", [])),
+        }
+        scope["app"] = object()
+        scope["router"] = object()
+        scope["path_params"] = {}
+        scope["endpoint"] = object()
+        scope["route"] = object()
+        scope["state"] = {}
+        scope["root_path"] = "/mounted"
+        scope["path"] = "/rewritten"
+
+        data = json.dumps(snapshot).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"application/json"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": data})
+        return
+
     if path == "/scope":
         import json
 

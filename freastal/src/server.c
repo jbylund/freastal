@@ -52,6 +52,14 @@ void client_free(client_t *c) {
     }
 }
 
+/* Python objects cached for the whole connection, not just one request.
+ * The GIL must be held. */
+static void client_clear_conn_cache(client_t *c) {
+    Py_CLEAR(c->peer_addr_obj);
+    Py_CLEAR(c->asgi_client_obj);
+    Py_CLEAR(c->asgi_capsule);
+}
+
 void client_reset(client_t *c) {
     /*
      * A read may have delivered more than one request.  Everything past the
@@ -185,7 +193,7 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
         Py_CLEAR(c->resp_status);
         Py_CLEAR(c->resp_pyheaders);
         Py_CLEAR(c->resp_body);
-        Py_CLEAR(c->peer_addr_obj);
+        client_clear_conn_cache(c);
         GIL_UNLOCK();
         uv_close((uv_handle_t *)&c->handle, on_close);
         return;
@@ -237,7 +245,7 @@ static void on_write(uv_write_t *req, int status) {
     Py_CLEAR(c->resp_body);
     Py_CLEAR(c->asgi_task);
     if (status < 0 || !c->keep_alive)
-        Py_CLEAR(c->peer_addr_obj);
+        client_clear_conn_cache(c);
     GIL_UNLOCK();
 
     if (status < 0 || !c->keep_alive) {
@@ -258,7 +266,16 @@ static void on_write(uv_write_t *req, int status) {
 
 static void on_close(uv_handle_t *handle) {
     client_t *c = (client_t *)handle;
-    /* Python objects already cleared before calling uv_close */
+    /* Per-request objects are cleared before uv_close, but not every teardown
+     * path goes through on_write (a malformed request and the TLS errors close
+     * directly), and the slab recycles this client_t. This is the one funnel
+     * they all share; on the ordinary paths the cache is already empty and the
+     * GIL is not taken. */
+    if (c->peer_addr_obj || c->asgi_client_obj || c->asgi_capsule) {
+        GIL_LOCK();
+        client_clear_conn_cache(c);
+        GIL_UNLOCK();
+    }
 #ifdef FREASTAL_TLS
     tls_conn_free(c);
 #endif

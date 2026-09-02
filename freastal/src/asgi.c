@@ -141,58 +141,73 @@ static void asgi_poll_cb(uv_poll_t *handle, int status, int events) {
 
 /* ---- ASGI scope builder ---- */
 
+/*
+ * Build the per-request ASGI scope.
+ *
+ * The scope is a copy of a template dict built once at startup.  PyDict_Copy()
+ * of a combined dict clones the whole key table with one memcpy and increfs the
+ * entries, so none of the twelve scope keys is allocated, hashed or interned
+ * here -- the previous PyDict_SetItemString() form did all three, twelve times
+ * per request.  What remains is one dict allocation plus an in-place value
+ * store for each entry that actually varies.
+ *
+ * The copy is a genuine, independent dict, which it has to be: Starlette adds
+ * app/router/state/endpoint/route/path_params to the scope it is handed and
+ * Litestar rewrites scope["path"], so a shared or recycled dict would bleed one
+ * request's state into the next.
+ */
 static PyObject *build_asgi_scope(client_t *c) {
-    PyObject *scope = PyDict_New();
-    if (!scope) return NULL;
+    const asgi_keys_t *k = &g_server.asgi_keys;
 
-#define SS(k, v) do { \
-    if (PyDict_SetItemString(scope, k, (v)) < 0) { Py_DECREF(scope); return NULL; } \
+    PyObject *scope = PyDict_Copy(g_server.asgi_scope_template);
+    if (unlikely(!scope)) return NULL;
+
+#define SS(key, v) do { \
+    if (unlikely(PyDict_SetItem(scope, k->key, (v)) < 0)) \
+        { Py_DECREF(scope); return NULL; } \
 } while (0)
 
-#define SSN(k, expr) do { \
+#define SSN(key, expr) do { \
     PyObject *_v = (expr); \
-    if (!_v || PyDict_SetItemString(scope, k, _v) < 0) \
+    if (unlikely(!_v) || unlikely(PyDict_SetItem(scope, k->key, _v) < 0)) \
         { Py_XDECREF(_v); Py_DECREF(scope); return NULL; } \
     Py_DECREF(_v); \
 } while (0)
 
-    SS("type",         g_server.asgi_type_http);
-    SS("asgi",         g_server.asgi_version_dict);
-    SS("root_path",    g_server.asgi_empty_str);
-    SS("scheme",       g_server.asgi_scheme_http);
-    SS("server",       g_server.asgi_server_tuple);
-    SS("http_version", c->minor_version == 1 ? g_server.asgi_http_11
-                                              : g_server.asgi_http_10);
+    /* type / asgi / root_path / scheme / server come from the template.
+     *
+     * So do the defaults for the two entries below: the template is immutable,
+     * so "1.1" and b"" are constants of this build, never a value left behind
+     * by an earlier request. */
+    if (unlikely(c->minor_version != 1))
+        SS(http_version, g_server.asgi_http_10);
 
-    SSN("method", PyUnicode_FromStringAndSize(c->method, (Py_ssize_t)c->method_len));
+    SSN(method, PyUnicode_FromStringAndSize(c->method, (Py_ssize_t)c->method_len));
 
     /* path / raw_path / query_string */
     {
         const char *qmark = (const char *)memchr(c->path, '?', c->path_len);
+        Py_ssize_t  plen  = qmark ? (Py_ssize_t)(qmark - c->path)
+                                  : (Py_ssize_t)c->path_len;
+        SSN(path,     PyUnicode_FromStringAndSize(c->path, plen));
+        SSN(raw_path, PyBytes_FromStringAndSize(c->path, plen));
         if (qmark) {
-            Py_ssize_t plen = (Py_ssize_t)(qmark - c->path);
             Py_ssize_t qlen = (Py_ssize_t)(c->path_len - (size_t)(qmark + 1 - c->path));
-            SSN("path",         PyUnicode_FromStringAndSize(c->path, plen));
-            SSN("raw_path",     PyBytes_FromStringAndSize(c->path, plen));
-            SSN("query_string", PyBytes_FromStringAndSize(qmark + 1, qlen));
-        } else {
-            SSN("path",     PyUnicode_FromStringAndSize(c->path, (Py_ssize_t)c->path_len));
-            SSN("raw_path", PyBytes_FromStringAndSize(c->path, (Py_ssize_t)c->path_len));
-            SS("query_string", g_server.asgi_empty_bytes);
+            SSN(query_string, PyBytes_FromStringAndSize(qmark + 1, qlen));
         }
     }
 
-    /* client: (peer_ip, peer_port) */
-    {
+    /* client: (peer_ip, peer_port).  Fixed for the life of the connection, so
+     * build it once and reuse it across keep-alive requests -- the same reason
+     * the WSGI path caches peer_addr_obj for REMOTE_ADDR. */
+    if (!c->asgi_client_obj) {
         PyObject *ip   = PyUnicode_FromString(c->peer_addr);
         PyObject *port = PyLong_FromLong((long)c->peer_port);
-        PyObject *tup  = (ip && port) ? PyTuple_Pack(2, ip, port) : NULL;
+        c->asgi_client_obj = (ip && port) ? PyTuple_Pack(2, ip, port) : NULL;
         Py_XDECREF(ip); Py_XDECREF(port);
-        if (!tup) { Py_DECREF(scope); return NULL; }
-        int rc = PyDict_SetItemString(scope, "client", tup);
-        Py_DECREF(tup);
-        if (rc < 0) { Py_DECREF(scope); return NULL; }
+        if (unlikely(!c->asgi_client_obj)) { Py_DECREF(scope); return NULL; }
     }
+    SS(client, c->asgi_client_obj);
 
     /* headers: list of (name_bytes_lower, value_bytes) */
     {
@@ -219,7 +234,7 @@ static PyObject *build_asgi_scope(client_t *c) {
             if (!pr) { Py_DECREF(hlist); Py_DECREF(scope); return NULL; }
             PyList_SET_ITEM(hlist, (Py_ssize_t)i, pr); /* steals ref */
         }
-        int rc = PyDict_SetItemString(scope, "headers", hlist);
+        int rc = PyDict_SetItem(scope, k->headers, hlist);
         Py_DECREF(hlist);
         if (rc < 0) { Py_DECREF(scope); return NULL; }
     }
@@ -380,10 +395,14 @@ void asgi_dispatch(client_t *c) {
     PyObject *body = PyBytes_FromStringAndSize(bp, blen);
     if (!body) { Py_DECREF(scope); PyErr_Clear(); send_500_asgi(c); return; }
 
-    /* Capsule carrying the client pointer into Python */
-    PyObject *cap = PyCapsule_New(c, "freastal.client", NULL);
-    if (!cap) {
-        Py_DECREF(scope); Py_DECREF(body); PyErr_Clear(); send_500_asgi(c); return;
+    /* Capsule carrying the client pointer into Python.  The pointer is stable
+     * for the life of the connection, so the capsule is built once and reused;
+     * a suspended task that outlives the request keeps it alive by refcount. */
+    if (!c->asgi_capsule) {
+        c->asgi_capsule = PyCapsule_New(c, "freastal.client", NULL);
+        if (!c->asgi_capsule) {
+            Py_DECREF(scope); Py_DECREF(body); PyErr_Clear(); send_500_asgi(c); return;
+        }
     }
 
     /*
@@ -399,10 +418,10 @@ void asgi_dispatch(client_t *c) {
     PyObject *task = PyObject_CallFunctionObjArgs(
         g_server.asgi_run_request,
         g_server.asgi_loop, g_server.app,
-        scope, body, cap, NULL
+        scope, body, c->asgi_capsule, NULL
     );
     set_running_loop(Py_None);
-    Py_DECREF(scope); Py_DECREF(body); Py_DECREF(cap);
+    Py_DECREF(scope); Py_DECREF(body);
 
     if (!task) {
         PyErr_Print();
@@ -494,6 +513,52 @@ int asgi_server_init(PyObject *loop) {
         !g_server.asgi_empty_str   || !g_server.asgi_empty_bytes   ||
         !g_server.asgi_version_dict|| !g_server.asgi_server_tuple)
         return -1;
+
+    /*
+     * Scope template.  Every key the scope can carry is inserted here, in the
+     * order the scope has always had them, so that the per-request copy needs
+     * no insert at all -- only value stores into slots that already exist.
+     *
+     * Py_None marks an entry the request path always overwrites; the other
+     * values are the ones a request inherits when it does not.  Twelve entries
+     * leave the copy nine free slots before CPython resizes it, which covers
+     * the six keys Starlette and FastAPI add.
+     */
+    {
+        PyObject *t = PyDict_New();
+        if (!t) return -1;
+        g_server.asgi_scope_template = t;
+
+        int rc = 0;
+        rc |= PyDict_SetItemString(t, "type",         g_server.asgi_type_http);
+        rc |= PyDict_SetItemString(t, "asgi",         g_server.asgi_version_dict);
+        rc |= PyDict_SetItemString(t, "root_path",    g_server.asgi_empty_str);
+        rc |= PyDict_SetItemString(t, "scheme",       g_server.asgi_scheme_http);
+        rc |= PyDict_SetItemString(t, "server",       g_server.asgi_server_tuple);
+        rc |= PyDict_SetItemString(t, "http_version", g_server.asgi_http_11);
+        rc |= PyDict_SetItemString(t, "method",       Py_None);
+        rc |= PyDict_SetItemString(t, "path",         Py_None);
+        rc |= PyDict_SetItemString(t, "raw_path",     Py_None);
+        rc |= PyDict_SetItemString(t, "query_string", g_server.asgi_empty_bytes);
+        rc |= PyDict_SetItemString(t, "client",       Py_None);
+        rc |= PyDict_SetItemString(t, "headers",      Py_None);
+        if (rc < 0) return -1;
+
+        /* PyDict_SetItemString interns its key, so interning the same text
+         * here hands back the very objects in the template's key table: the
+         * per-request lookups hit the pointer-equality fast path. */
+        asgi_keys_t *k = &g_server.asgi_keys;
+        k->http_version = PyUnicode_InternFromString("http_version");
+        k->method       = PyUnicode_InternFromString("method");
+        k->path         = PyUnicode_InternFromString("path");
+        k->raw_path     = PyUnicode_InternFromString("raw_path");
+        k->query_string = PyUnicode_InternFromString("query_string");
+        k->client       = PyUnicode_InternFromString("client");
+        k->headers      = PyUnicode_InternFromString("headers");
+        if (!k->http_version || !k->method || !k->path || !k->raw_path ||
+            !k->query_string || !k->client || !k->headers)
+            return -1;
+    }
 
     /* uv_check_t: step asyncio after each libuv I/O poll */
     uv_check_init(g_server.loop, &g_server.asgi_check);
