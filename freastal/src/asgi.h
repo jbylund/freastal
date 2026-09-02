@@ -25,3 +25,11 @@ void       asgi_arm_wakeups(void);
 /* Exposed to Python as _freastal.asgi_send_response(capsule, status, headers, body).
  * Called from _asgi_protocol.py::send() inside the running asyncio task. */
 PyObject  *asgi_send_response_c(PyObject *self, PyObject *args);
+
+/* Call from module init.  Publishes ASGI_CORO_DONE, the sentinel
+ * asgi_coro_step() returns when the app's coroutine has returned. */
+int        asgi_init(PyObject *m);
+
+/* Exposed to Python as _freastal.asgi_coro_step(coro[, ctx]).
+ * Called from _asgi_protocol.py to drive the app's coroutine. */
+PyObject  *asgi_coro_step_c(PyObject *self, PyObject *const *args, Py_ssize_t nargs);

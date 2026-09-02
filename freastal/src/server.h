@@ -207,10 +207,6 @@ typedef struct {
     /* Fully-populated scope, copied per request.  Never mutated after init. */
     PyObject  *asgi_scope_template;
     asgi_keys_t asgi_keys;
-
-    /* asyncio._set_running_loop: required on Python 3.14+ where context.run()
-     * validates the C-level running-loop thread-local before stepping a Task. */
-    PyObject  *asyncio_set_running_loop;
 } server_t;
 
 extern server_t g_server;

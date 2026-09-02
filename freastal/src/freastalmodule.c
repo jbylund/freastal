@@ -102,6 +102,15 @@ static PyMethodDef freastal_methods[] = {
         "asgi_send_response(capsule, status, headers, body)\n\n"
         "Internal: called from _asgi_protocol.py to send the HTTP response."
     },
+    {
+        "asgi_coro_step",
+        (PyCFunction)(void(*)(void))asgi_coro_step_c,
+        METH_FASTCALL,
+        "asgi_coro_step(coro[, context])\n\n"
+        "Internal: send(None) into an ASGI app's coroutine, running the step\n"
+        "inside `context` if one is given.  Returns what the coroutine yielded,\n"
+        "or ASGI_CORO_DONE if it returned instead of suspending."
+    },
     {NULL, NULL, 0, NULL}
 };
 
@@ -118,7 +127,7 @@ PyMODINIT_FUNC PyInit__freastal(void) {
     PyObject *m = PyModule_Create(&freastal_module);
     if (!m) return NULL;
 
-    if (wsgi_init(m) < 0) {
+    if (wsgi_init(m) < 0 || asgi_init(m) < 0) {
         Py_DECREF(m);
         return NULL;
     }

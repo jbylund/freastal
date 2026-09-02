@@ -5,43 +5,96 @@
 #include <arpa/inet.h>
 #include <string.h>
 
+/* Interned attribute names used to drive the loop's callback queue.  Private
+ * to the driver below rather than in g_server, which holds server state. */
+static PyObject *s_popleft   = NULL;  /* deque.popleft */
+static PyObject *s_run       = NULL;  /* Handle._run */
+static PyObject *s_cancelled = NULL;  /* Handle._cancelled */
+static PyObject *s_when      = NULL;  /* TimerHandle._when */
+
+/* Returned to Python in place of a yielded value when the app's coroutine has
+ * returned; see asgi_coro_step_c(). */
+static PyObject *asgi_coro_done = NULL;
+
 /* ---- libuv callbacks ---- */
 
-/*
- * asgi_check_cb – fires after each libuv I/O poll.
- *
- * Only steps asyncio when it has work to do (loop._ready non-empty).
- * This guarantees loop._run_once() always uses timeout=0 internally,
- * never blocking the libuv thread.
- */
-/* Bracket _run_once() with asyncio._set_running_loop() so Python 3.14's
- * context.run() finds the expected running-loop thread-local while stepping tasks. */
-static inline void set_running_loop(PyObject *loop) {
-    if (g_server.asyncio_set_running_loop) {
-        PyObject *r = PyObject_CallOneArg(g_server.asyncio_set_running_loop, loop);
-        Py_XDECREF(r);
-        if (PyErr_Occurred()) PyErr_Clear();
-    }
+/* len(obj) for the loop's callback queues; 0 rather than an error, since a
+ * failure here must not be allowed to wedge the event loop.  _scheduled is a
+ * plain list, so its length is a struct field read rather than a trip through
+ * the sequence protocol -- this is asked on every libuv iteration. */
+static inline Py_ssize_t asgi_pending(PyObject *obj) {
+    if (unlikely(!obj)) return 0;
+    if (likely(PyList_CheckExact(obj))) return PyList_GET_SIZE(obj);
+    Py_ssize_t n = PyObject_Size(obj);
+    if (unlikely(n < 0)) { PyErr_Clear(); return 0; }
+    return n;
 }
 
 /* One non-blocking step of the asyncio loop.  Callers must hold the GIL and
  * must only call this when the loop has work that is due now, so that
  * _run_once() computes a zero select() timeout and never blocks libuv. */
-static void asgi_step(void) {
-    set_running_loop(g_server.asgi_loop);
+static void asgi_run_once(void) {
     PyObject *ret = PyObject_CallNoArgs(g_server.asgi_run_once);
     Py_XDECREF(ret);
-    if (PyErr_Occurred()) PyErr_Clear();
-    set_running_loop(Py_None);
+    if (unlikely(PyErr_Occurred())) PyErr_Clear();
 }
 
-/* len(obj) for the loop's callback queues; 0 rather than an error, since a
- * failure here must not be allowed to wedge the event loop. */
-static Py_ssize_t asgi_pending(PyObject *obj) {
-    if (!obj) return 0;
-    Py_ssize_t n = PyObject_Size(obj);
-    if (n < 0) { PyErr_Clear(); return 0; }
-    return n;
+/*
+ * asgi_drain_ready - loop._run_once()'s tail, without the poll at its head.
+ *
+ * _run_once() calls self._selector.select(timeout) unconditionally, even when
+ * _ready is full and no I/O can possibly be pending.  On this path that
+ * syscall buys nothing: freastal watches the selector fd itself with a
+ * uv_poll_t, and asgi_poll_cb runs the real _run_once() whenever it fires, so
+ * completed async I/O is picked up there.  Running the queue from C instead
+ * costs one epoll_wait (or, on macOS, one far more expensive kqueue call) less
+ * per loop turn, and there are one or more turns per suspending request.
+ * uvloop drains its own queue from a uv_idle_t for the same reason.
+ *
+ * ntodo is snapshotted before the loop, exactly as _run_once() does, so a
+ * callback that schedules another callback has it run on the next turn rather
+ * than extending this one.  Handle._run() routes the callback's own exceptions
+ * into loop.call_exception_handler(), so the only failures that reach here are
+ * the ones _run_once() would also have let escape (SystemExit and friends);
+ * like _run_once() we end the turn and leave the rest of the queue for the
+ * next one, which asgi_arm_wakeups() has already guaranteed will happen.
+ *
+ * What is not reproduced is _run_once()'s debug-mode instrumentation
+ * (loop._current_handle and the slow-callback warning).  That is deliberate:
+ * the eager path already runs most requests without entering _run_once() at
+ * all, so a debug loop never saw them either, and paying for a loop._debug
+ * read per turn would buy fidelity the bridge does not have in the first
+ * place.
+ */
+static void asgi_drain_ready(Py_ssize_t ntodo) {
+    PyObject *ready = g_server.asgi_ready;
+
+    for (Py_ssize_t i = 0; i < ntodo; i++) {
+        PyObject *h = PyObject_CallMethodNoArgs(ready, s_popleft);
+        if (unlikely(!h)) break;
+
+        PyObject *canc = PyObject_GetAttr(h, s_cancelled);
+        if (unlikely(!canc)) { Py_DECREF(h); break; }
+        /* asyncio only ever stores a bool here; PyObject_IsTrue is the
+         * fallback so that a handle which does not is still read the way
+         * _run_once()'s `if handle._cancelled` would read it. */
+        int cancelled = Py_IsFalse(canc) ? 0
+                      : Py_IsTrue(canc)  ? 1
+                      : PyObject_IsTrue(canc);
+        Py_DECREF(canc);
+        if (unlikely(cancelled != 0)) {
+            Py_DECREF(h);
+            if (unlikely(cancelled < 0)) break;
+            continue;
+        }
+
+        PyObject *r = PyObject_CallMethodNoArgs(h, s_run);
+        Py_XDECREF(r);
+        Py_DECREF(h);
+        if (unlikely(!r)) break;
+    }
+
+    if (unlikely(PyErr_Occurred())) PyErr_Clear();
 }
 
 /*
@@ -55,6 +108,8 @@ static Py_ssize_t asgi_pending(PyObject *obj) {
 static void asgi_idle_cb(uv_idle_t *handle) { (void)handle; }
 
 static void asgi_timer_cb(uv_timer_t *handle);
+
+static void asgi_arm_wakeups_n(Py_ssize_t nready);
 
 /*
  * Line libuv's next poll up with asyncio's outstanding work.
@@ -70,7 +125,12 @@ static void asgi_timer_cb(uv_timer_t *handle);
  * so an idle server still blocks in poll rather than spinning.
  */
 void asgi_arm_wakeups(void) {
-    bool has_ready = asgi_pending(g_server.asgi_ready) > 0;
+    asgi_arm_wakeups_n(asgi_pending(g_server.asgi_ready));
+}
+
+/* As asgi_arm_wakeups(), for callers that have just measured len(_ready). */
+static void asgi_arm_wakeups_n(Py_ssize_t nready) {
+    bool has_ready = nready > 0;
     if (has_ready != g_server.asgi_idle_active) {
         if (has_ready) uv_idle_start(&g_server.asgi_idle, asgi_idle_cb);
         else           uv_idle_stop(&g_server.asgi_idle);
@@ -89,7 +149,7 @@ void asgi_arm_wakeups(void) {
     uint64_t ms = 0;
     PyObject *h = PyList_Check(g_server.asgi_scheduled)
                 ? PyList_GetItem(g_server.asgi_scheduled, 0) : NULL;  /* borrowed */
-    PyObject *when_o = h ? PyObject_GetAttrString(h, "_when") : NULL;
+    PyObject *when_o = h ? PyObject_GetAttr(h, s_when) : NULL;
     PyObject *now_o  = when_o ? PyObject_CallNoArgs(g_server.asgi_loop_time) : NULL;
     if (now_o) {
         double delay = PyFloat_AsDouble(when_o) - PyFloat_AsDouble(now_o);
@@ -109,18 +169,34 @@ static void asgi_timer_cb(uv_timer_t *handle) {
     (void)handle;
     GIL_LOCK();
     g_server.asgi_timer_active = false;
-    /* The deadline has passed, so _run_once() clamps its timeout to zero. */
-    asgi_step();
+    /* _run_once() rather than the C drain: only it moves the TimerHandles
+     * whose deadline has come off _scheduled and onto _ready.  The deadline
+     * has passed, so it clamps its own select() timeout to zero. */
+    asgi_run_once();
     asgi_arm_wakeups();
     GIL_UNLOCK();
 }
 
+/*
+ * asgi_check_cb – fires after each libuv I/O poll.
+ *
+ * Only steps asyncio when it has work to do (loop._ready non-empty), so that
+ * an idle server does no Python work per libuv iteration.
+ */
 static void asgi_check_cb(uv_check_t *handle) {
     (void)handle;
     GIL_LOCK();
-    if (asgi_pending(g_server.asgi_ready) > 0)
-        asgi_step();
-    asgi_arm_wakeups();
+    Py_ssize_t nready = asgi_pending(g_server.asgi_ready);
+    if (nready > 0) {
+        /* Without the uv_poll_t on the selector fd, _run_once()'s select() is
+         * the only thing that can notice completed async I/O, so keep paying
+         * for it there -- correctness first on platforms and event loops where
+         * the selector cannot be watched. */
+        if (likely(g_server.asgi_poll_active)) asgi_drain_ready(nready);
+        else                                   asgi_run_once();
+        nready = asgi_pending(g_server.asgi_ready);
+    }
+    asgi_arm_wakeups_n(nready);
     GIL_UNLOCK();
 }
 
@@ -136,9 +212,54 @@ static void asgi_poll_cb(uv_poll_t *handle, int status, int events) {
     (void)handle; (void)events;
     if (status < 0) return;
     GIL_LOCK();
-    asgi_step();
+    asgi_run_once();
     asgi_arm_wakeups();
     GIL_UNLOCK();
+}
+
+/* ---- Driving the app's coroutine ---- */
+
+/*
+ * asgi_coro_step(coro) / asgi_coro_step(coro, ctx)
+ *
+ * One send(None) into the app's coroutine, returning what it yielded or the
+ * ASGI_CORO_DONE sentinel if it returned instead.  With `ctx`, the step runs
+ * inside that context, as _asgi_protocol needs for the eager first step.
+ *
+ * This replaces `ctx.run(coro.send, None)` wrapped in `except StopIteration`.
+ * Both halves of that cost more than the step itself: `coro.send` binds a
+ * fresh method object per call, and StopIteration is raised, unwound and
+ * caught on every request that completes inline -- which is nearly all of
+ * them.  PyIter_Send() reports the return with PYGEN_RETURN and never touches
+ * the exception machinery, and PyContext_Enter/Exit is exactly what
+ * context.run() does around the call.
+ */
+PyObject *asgi_coro_step_c(PyObject *self, PyObject *const *args,
+                            Py_ssize_t nargs) {
+    (void)self;
+    if (unlikely(nargs < 1 || nargs > 2)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "asgi_coro_step() takes a coroutine and an optional context");
+        return NULL;
+    }
+
+    PyObject *ctx = (nargs == 2) ? args[1] : NULL;
+    if (ctx && unlikely(PyContext_Enter(ctx) < 0)) return NULL;
+
+    /* PYGEN_NEXT leaves the yielded value in `out`; PYGEN_ERROR leaves it NULL
+     * with the app's exception set, which is what this function returns. */
+    PyObject *out = NULL;
+    if (PyIter_Send(args[0], Py_None, &out) == PYGEN_RETURN) {
+        Py_XDECREF(out);  /* an ASGI app returns None, but do not assume it */
+        out = Py_NewRef(asgi_coro_done);
+    }
+
+    /* Exit even when the step raised: the exception belongs to the app, and
+     * this can only fail if the context was never entered.  Doing it after
+     * PyIter_Send matches ctx.run(), which also restores the caller's context
+     * before letting the exception out. */
+    if (ctx && unlikely(PyContext_Exit(ctx) < 0)) Py_CLEAR(out);
+    return out;
 }
 
 /* ---- ASGI scope builder ---- */
@@ -554,17 +675,16 @@ void asgi_dispatch(client_t *c) {
      * and returns None if it finished inline (the common case: the response
      * is already written by then) or an asyncio.Task if it suspended.
      *
-     * The app runs on this stack rather than inside _run_once(), so make the
-     * loop current for the call - apps and libraries expect
-     * asyncio.get_running_loop() to work.
+     * The app runs on this stack rather than inside _run_once(), but the loop
+     * is already the running loop for this thread -- asgi_server_init() made
+     * it so once and for good -- so asyncio.get_running_loop() works here as
+     * it does inside a task.
      */
-    set_running_loop(g_server.asgi_loop);
     PyObject *task = PyObject_CallFunctionObjArgs(
         g_server.asgi_run_request,
         g_server.asgi_loop, g_server.app,
         scope, body, c->asgi_capsule, NULL
     );
-    set_running_loop(Py_None);
     Py_DECREF(scope); Py_DECREF(body);
 
     if (!task) {
@@ -612,17 +732,37 @@ int asgi_server_init(PyObject *loop) {
     g_server.asgi_loop_time = PyObject_GetAttrString(loop, "time");
     if (!g_server.asgi_loop_time) return -1;
 
-    /* Cache asyncio._set_running_loop for Python 3.14+ running-loop validation */
+    /* Attribute names for the callback-queue driver, interned once. */
+    s_popleft   = PyUnicode_InternFromString("popleft");
+    s_run       = PyUnicode_InternFromString("_run");
+    s_cancelled = PyUnicode_InternFromString("_cancelled");
+    s_when      = PyUnicode_InternFromString("_when");
+    if (!s_popleft || !s_run || !s_cancelled || !s_when) return -1;
+
+    /*
+     * Make `loop` the running loop for this thread, once, permanently.
+     *
+     * This thread is about to enter uv_run() and drive that loop until the
+     * process exits, which is exactly what run_forever() would be doing, so
+     * the thread-local should say so for the whole of it.  Apps reach it
+     * through asyncio.get_running_loop(); Python 3.14 also validates it in
+     * context.run() while stepping tasks.  Setting it here rather than around
+     * every dispatch and every loop turn removes two Python calls per request
+     * and two more per turn.  server_run() releases the GIL with
+     * Py_BEGIN_ALLOW_THREADS, which keeps this thread's PyThreadState alive,
+     * so the value survives into the libuv callbacks' PyGILState_Ensure().
+     */
     {
         PyObject *amod = PyImport_ImportModule("asyncio");
-        if (amod) {
-            g_server.asyncio_set_running_loop =
-                PyObject_GetAttrString(amod, "_set_running_loop");
-            Py_DECREF(amod);
-            if (!g_server.asyncio_set_running_loop) PyErr_Clear();
-        } else {
-            PyErr_Clear();
+        PyObject *setter = amod ? PyObject_GetAttrString(amod, "_set_running_loop")
+                                : NULL;
+        Py_XDECREF(amod);
+        if (setter) {
+            PyObject *r = PyObject_CallOneArg(setter, loop);
+            Py_XDECREF(r);
+            Py_DECREF(setter);
         }
+        if (PyErr_Occurred()) PyErr_Clear();
     }
 
     /* Import Python bridge */
@@ -746,5 +886,24 @@ int asgi_server_init(PyObject *loop) {
     g_server.asgi_mode = true;
     fprintf(stderr, "[freastal] ASGI mode enabled (asyncio%s)\n",
             g_server.asgi_poll_active ? " + async I/O bridge" : "");
+    return 0;
+}
+
+/* ---- Module init ---- */
+
+/*
+ * Called from PyInit__freastal, not from asgi_server_init: _asgi_protocol
+ * imports these at module import time, which the unit tests do without ever
+ * starting a server.
+ */
+int asgi_init(PyObject *m) {
+    /* A plain object(), so that no value an app could yield can be mistaken
+     * for "the coroutine returned". */
+    asgi_coro_done = PyObject_CallNoArgs((PyObject *)&PyBaseObject_Type);
+    if (!asgi_coro_done) return -1;
+    if (PyModule_AddObject(m, "ASGI_CORO_DONE", Py_NewRef(asgi_coro_done)) < 0) {
+        Py_DECREF(asgi_coro_done);  /* the reference AddObject did not steal */
+        return -1;
+    }
     return 0;
 }

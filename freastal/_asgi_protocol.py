@@ -24,6 +24,8 @@ import sys
 # to publish a current task for code that is not running inside a Task.
 from asyncio.tasks import _enter_task, _leave_task
 
+from ._freastal import ASGI_CORO_DONE as _DONE
+from ._freastal import asgi_coro_step as _step
 from ._freastal import asgi_send_response
 
 # loop.create_task(..., context=...) is 3.11+.  Older versions have to be told
@@ -80,7 +82,13 @@ class _Request(asyncio.Task):
         t = event["type"]
         if t == "http.response.start":
             self._status = event["status"]
-            self._headers = list(event.get("headers", []))
+            h = event.get("headers", ())
+            # A list can be handed to asgi_send_response() as it stands: it
+            # only reads the pairs, and reads them before send() returns, so
+            # copying it bought nothing.  Everything else the spec allows (it
+            # asks only for an iterable) still has to be materialised - the C
+            # side indexes a list, and an iterator would be consumed anyway.
+            self._headers = h if type(h) is list else list(h)
         elif t == "http.response.body":
             asgi_send_response(
                 self._capsule,
@@ -155,11 +163,11 @@ def run_asgi_request(loop, app, scope, body, capsule):
     ctx = contextvars.copy_context()
     _enter_task(loop, req)
     try:
-        trap = ctx.run(coro.send, None)
-    except StopIteration:
-        return None
+        trap = _step(coro, ctx)
     finally:
         _leave_task(loop, req)
+    if trap is _DONE:
+        return None
 
     # The continuation must resume in the *same* context as the eager step, or
     # a ContextVar set before the app's first await would vanish across it.
@@ -211,9 +219,8 @@ async def _finish(req, coro, trap):
                     pass
             else:
                 raise RuntimeError(f"ASGI app got bad yield: {trap!r}")
-            try:
-                trap = coro.send(None)
-            except StopIteration:
+            trap = _step(coro)
+            if trap is _DONE:
                 return
     except BaseException:
         # Cancelled, or the app yielded something asyncio cannot await.
