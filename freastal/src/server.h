@@ -215,6 +215,59 @@ typedef struct {
 
 extern server_t g_server;
 
+/* Shared response-formatting helpers.  Both the WSGI and ASGI formatters
+ * emit Content-Length, so the integer writer lives here rather than being
+ * duplicated in each of them. */
+/* Two ASCII digits per entry, so decimal conversion costs one divide per two
+ * digits instead of one per digit (Alexandrescu's method, as in fmt). */
+static const char TWO_DIGITS[] =
+    "00010203040506070809" "10111213141516171819"
+    "20212223242526272829" "30313233343536373839"
+    "40414243444546474849" "50515253545556575859"
+    "60616263646566676869" "70717273747576777879"
+    "80818283848586878889" "90919293949596979899";
+
+/* Digits in the decimal form of u; zero counts as one digit. */
+static inline int uint_ndigits(uint64_t u) {
+    int d = 1;
+    for (;;) {
+        if (u < 10)    return d;
+        if (u < 100)   return d + 1;
+        if (u < 1000)  return d + 2;
+        if (u < 10000) return d + 3;
+        u /= 10000;
+        d += 4;
+    }
+}
+
+/*
+ * Write a non-negative integer as decimal ASCII.  Returns bytes written, -1 on
+ * overflow.  Sizing the field first lets the digits be filled in place, which
+ * saves both the temporary buffer and the reversing pass a per-digit loop needs.
+ */
+static inline int write_uint(char *dst, int remaining, Py_ssize_t n) {
+    uint64_t u = (uint64_t)n;
+    int      d = uint_ndigits(u);
+    if (unlikely(d > remaining)) return -1;
+
+    char *p = dst + d;
+    while (u >= 100) {
+        unsigned i = (unsigned)(u % 100) * 2;
+        u /= 100;
+        p -= 2;
+        p[0] = TWO_DIGITS[i];
+        p[1] = TWO_DIGITS[i + 1];
+    }
+    if (u >= 10) {
+        unsigned i = (unsigned)u * 2;
+        p[-2] = TWO_DIGITS[i];
+        p[-1] = TWO_DIGITS[i + 1];
+    } else {
+        p[-1] = (char)('0' + u);
+    }
+    return d;
+}
+
 /* Server lifecycle */
 int  server_init(PyObject *app, const char *host, int port, bool reuse_port,
                  const char *certfile, const char *keyfile);
