@@ -77,8 +77,10 @@ typedef struct client_s {
     bool     keep_alive;
     PyObject *peer_addr_obj;           /* cached PyUnicode of peer_addr; reused across keep-alive requests */
 
-    /* --- ASGI task (NULL in WSGI mode) --- */
+    /* --- ASGI per-connection state (NULL in WSGI mode) --- */
     PyObject *asgi_task;
+    PyObject *asgi_client_obj;          /* cached (peer_ip, peer_port) scope tuple */
+    PyObject *asgi_capsule;             /* cached capsule holding this client_t */
 
 #ifdef FREASTAL_TLS
     char         *tls_enc;                    /* heap-alloc'd on TLS accept, NULL for plain HTTP */
@@ -129,6 +131,19 @@ typedef struct {
 #endif
     PyObject *empty_str;              /* "" */
 } wsgi_keys_t;
+
+/* Pre-interned Python string keys for the ASGI scope entries that change from
+ * request to request.  The constant entries never need a key object: they ride
+ * along inside the scope template. */
+typedef struct {
+    PyObject *http_version;
+    PyObject *method;
+    PyObject *path;
+    PyObject *raw_path;
+    PyObject *query_string;
+    PyObject *client;
+    PyObject *headers;
+} asgi_keys_t;
 
 /* Global server state */
 typedef struct {
@@ -188,6 +203,10 @@ typedef struct {
     PyObject  *asgi_empty_bytes;
     PyObject  *asgi_version_dict;   /* {"version": "3.0"} */
     PyObject  *asgi_server_tuple;   /* (host, port) */
+
+    /* Fully-populated scope, copied per request.  Never mutated after init. */
+    PyObject  *asgi_scope_template;
+    asgi_keys_t asgi_keys;
 
     /* asyncio._set_running_loop: required on Python 3.14+ where context.run()
      * validates the C-level running-loop thread-local before stepping a Task. */
