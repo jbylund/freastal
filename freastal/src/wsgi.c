@@ -245,6 +245,15 @@ static int format_response_headers(client_t *c, Py_ssize_t body_len) {
 
 /* ---- WSGI environ builder ---- */
 
+/*
+ * PEP 3333 requires the str values in environ to be decoded with ISO-8859-1,
+ * not UTF-8.  Using PyUnicode_FromStringAndSize() was both wrong and fragile:
+ * a request carrying any byte above 0x7F in the path, the query string or a
+ * header value failed to decode, which left an exception set that surfaced
+ * later as a 500 for the whole request.  Latin-1 cannot fail -- every byte
+ * maps to one code point -- so the failure mode disappears along with the
+ * UTF-8 validation scan.
+ */
 static PyObject *build_environ(client_t *c) {
     wsgi_keys_t *k = &g_server.keys;
 
@@ -281,20 +290,20 @@ static PyObject *build_environ(client_t *c) {
 
     /* Per-request: REQUEST_METHOD */
     SET_NEW(REQUEST_METHOD,
-            PyUnicode_FromStringAndSize(c->method, (Py_ssize_t)c->method_len));
+            PyUnicode_DecodeLatin1(c->method, (Py_ssize_t)c->method_len, NULL));
 
     /* Per-request: PATH_INFO and QUERY_STRING (split on '?') */
     {
         const char *qmark = memchr(c->path, '?', c->path_len);
         if (qmark) {
             SET_NEW(PATH_INFO,
-                    PyUnicode_FromStringAndSize(c->path, (Py_ssize_t)(qmark - c->path)));
+                    PyUnicode_DecodeLatin1(c->path, (Py_ssize_t)(qmark - c->path), NULL));
             SET_NEW(QUERY_STRING,
-                    PyUnicode_FromStringAndSize(qmark + 1,
-                        (Py_ssize_t)(c->path + c->path_len - qmark - 1)));
+                    PyUnicode_DecodeLatin1(qmark + 1,
+                        (Py_ssize_t)(c->path + c->path_len - qmark - 1), NULL));
         } else {
             SET_NEW(PATH_INFO,
-                    PyUnicode_FromStringAndSize(c->path, (Py_ssize_t)c->path_len));
+                    PyUnicode_DecodeLatin1(c->path, (Py_ssize_t)c->path_len, NULL));
             SET(QUERY_STRING, k->empty_str);
         }
     }
@@ -339,11 +348,11 @@ static PyObject *build_environ(client_t *c) {
         size_t      hvl = c->headers[i].value_len;
 
         if (hnl == 12 && strncasecmp(hn, "content-type", 12) == 0) {
-            SET_NEW(CONTENT_TYPE, PyUnicode_FromStringAndSize(hv, (Py_ssize_t)hvl));
+            SET_NEW(CONTENT_TYPE, PyUnicode_DecodeLatin1(hv, (Py_ssize_t)hvl, NULL));
             continue;
         }
         if (hnl == 14 && strncasecmp(hn, "content-length", 14) == 0) {
-            SET_NEW(CONTENT_LENGTH, PyUnicode_FromStringAndSize(hv, (Py_ssize_t)hvl));
+            SET_NEW(CONTENT_LENGTH, PyUnicode_DecodeLatin1(hv, (Py_ssize_t)hvl, NULL));
             continue;
         }
 
@@ -362,7 +371,7 @@ static PyObject *build_environ(client_t *c) {
 
         PyObject *hdr_key = PyUnicode_FromStringAndSize(key_buf, (Py_ssize_t)(hnl + 5));
 
-        PyObject *val = PyUnicode_FromStringAndSize(hv, (Py_ssize_t)hvl);
+        PyObject *val = PyUnicode_DecodeLatin1(hv, (Py_ssize_t)hvl, NULL);
         int rc = 0;
         if (hdr_key && val) rc = PyDict_SetItem(env, hdr_key, val);
         Py_XDECREF(hdr_key); Py_XDECREF(val);
