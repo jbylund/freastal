@@ -76,18 +76,35 @@ def serve(
         p.join()
 
 
-def serve_asgi(app, host="0.0.0.0", port=8000, workers=1, reuse_port=True):
+def serve_asgi(
+    app,
+    host="0.0.0.0",
+    port=8000,
+    workers=1,
+    reuse_port=True,
+    certfile=None,
+    keyfile=None,
+):
     """Start freastal in ASGI mode.
 
     With workers=1 runs in-process.
     With workers>1 forks worker processes using SO_REUSEPORT.
     Each worker creates its own asyncio event loop.
+    Pass certfile and keyfile (PEM paths) to enable TLS 1.3 (requires picotls).
     """
 
     def _run_single():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        _serve_asgi_single(app, loop, host=host, port=port, reuse_port=reuse_port)
+        _serve_asgi_single(
+            app,
+            loop,
+            host=host,
+            port=port,
+            reuse_port=reuse_port,
+            certfile=certfile,
+            keyfile=keyfile,
+        )
 
     if workers <= 1:
         _run_single()

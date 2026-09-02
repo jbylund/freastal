@@ -43,16 +43,19 @@ static PyObject *py_serve(PyObject *self, PyObject *args, PyObject *kwargs) {
 static PyObject *py_serve_asgi(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
     static const char *kwlist[] = {
-        "app", "loop", "host", "port", "reuse_port", NULL
+        "app", "loop", "host", "port", "reuse_port", "certfile", "keyfile", NULL
     };
-    PyObject   *app     = NULL;
-    PyObject   *loop    = NULL;
-    const char *host    = "0.0.0.0";
-    int         port    = 8000;
-    int         reuse_p = 1;
+    PyObject   *app      = NULL;
+    PyObject   *loop     = NULL;
+    const char *host     = "0.0.0.0";
+    int         port     = 8000;
+    int         reuse_p  = 1;
+    const char *certfile = NULL;
+    const char *keyfile  = NULL;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|sip",
-            (char **)kwlist, &app, &loop, &host, &port, &reuse_p))
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|sipzz",
+            (char **)kwlist, &app, &loop, &host, &port, &reuse_p,
+            &certfile, &keyfile))
         return NULL;
 
     if (!PyCallable_Check(app)) {
@@ -60,7 +63,7 @@ static PyObject *py_serve_asgi(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    if (server_init(app, host, port, (bool)reuse_p, NULL, NULL) < 0) {
+    if (server_init(app, host, port, (bool)reuse_p, certfile, keyfile) < 0) {
         if (!PyErr_Occurred())
             PyErr_SetString(PyExc_RuntimeError, "freastal: server_init failed");
         return NULL;
@@ -90,8 +93,10 @@ static PyMethodDef freastal_methods[] = {
         "serve_asgi",
         (PyCFunction)(void(*)(void))py_serve_asgi,
         METH_VARARGS | METH_KEYWORDS,
-        "serve_asgi(app, loop, host='0.0.0.0', port=8000, reuse_port=True)\n\n"
+        "serve_asgi(app, loop, host='0.0.0.0', port=8000, reuse_port=True,\n"
+        "           certfile=None, keyfile=None)\n\n"
         "Run an ASGI app under the freastal server.\n"
+        "Pass certfile and keyfile (PEM paths) to enable TLS 1.3 (requires picotls).\n"
         "loop must be a running asyncio event loop.\n"
         "Blocks until the event loop exits."
     },
