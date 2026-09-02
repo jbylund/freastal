@@ -87,39 +87,8 @@ typedef struct client_s {
     ptls_buffer_t tls_wbuf;  /* encrypted response buf; alive until on_write */
 #endif
 
-#ifdef FREASTAL_IOURING
-    int  iouring_buf_idx;  /* registered buffer in use for current write, or -1 */
-#endif
 } client_t;
 
-/* ---- io_uring registered-buffer context ---- */
-/*
- * When compiled with -DFREASTAL_IOURING (liburing detected), responses whose
- * total size (headers + body) exceeds IOURING_LARGE_THRESH are copied into
- * a pre-registered kernel buffer and sent with io_uring write_fixed.
- * This avoids the per-write get_user_pages() call that dominates at 12-50KB.
- *
- * For responses below the threshold the normal uv_write path is used.
- * libuv 1.45+ also transparently uses io_uring for its internal event loop
- * on Linux, giving ~10% syscall-batching gain even on the normal path.
- */
-#ifdef FREASTAL_IOURING
-#include <liburing.h>
-
-#define IOURING_BUF_COUNT    128          /* max concurrent in-flight writes */
-#define IOURING_BUF_SIZE     (64 * 1024)  /* bytes per registered buffer (64KB) */
-#define IOURING_QUEUE_DEPTH  256
-#define IOURING_LARGE_THRESH 4096         /* engage fixed-buf path above this size */
-
-typedef struct {
-    struct io_uring  ring;
-    char            *bufs;                 /* slab: BUF_COUNT * BUF_SIZE bytes */
-    int              free_stack[IOURING_BUF_COUNT];
-    int              free_top;             /* -1 = empty */
-    uv_poll_t        poll;
-    bool             enabled;
-} iouring_ctx_t;
-#endif /* FREASTAL_IOURING */
 
 /* Per-connection state.
  * uv_tcp_t MUST be the first field so that (client_t *) casts to (uv_tcp_t *)
@@ -183,9 +152,6 @@ typedef struct {
     PyObject   *sys_stderr;           /* sys.stderr reference */
     PyObject   *empty_wsgi_input;     /* BytesIO(b"") singleton; reused for zero-body requests */
 
-#ifdef FREASTAL_IOURING
-    iouring_ctx_t iouring;
-#endif
 #ifdef FREASTAL_TLS
     tls_server_t  tls;
     bool          tls_enabled;
@@ -199,6 +165,19 @@ typedef struct {
     uv_check_t asgi_check;          /* post-I/O coroutine stepper */
     uv_poll_t  asgi_poll;           /* watches asyncio's selector fd for async I/O */
     bool       asgi_poll_active;
+
+    /* Keeping libuv awake while asyncio still has work.  libuv blocks in its
+     * poll phase whenever nothing is pending, which would stop uv_check_t from
+     * firing and strand any suspended task.  An active uv_idle_t forces
+     * uv_backend_timeout() to 0 so the next iteration happens immediately;
+     * asgi_timer wakes the loop for asyncio's next scheduled callback. */
+    uv_idle_t  asgi_idle;
+    uv_timer_t asgi_timer;
+    bool       asgi_idle_active;
+    bool       asgi_timer_active;
+    PyObject  *asgi_ready;          /* loop._ready deque (callbacks due now) */
+    PyObject  *asgi_scheduled;      /* loop._scheduled heap of TimerHandle */
+    PyObject  *asgi_loop_time;      /* loop.time bound method */
 
     /* Pre-built ASGI scope objects */
     PyObject  *asgi_type_http;
@@ -230,16 +209,11 @@ void      client_reset(client_t *c);
 /* Kick off async write of the formatted response */
 void write_response(client_t *c);
 
-#ifdef FREASTAL_IOURING
-/* Initialise the io_uring registered-buffer context (soft failure: returns 0) */
-int  iouring_init(uv_loop_t *loop, iouring_ctx_t *ctx);
-/* Submit a write_fixed for headers+body; returns 0 on success, -1 to fall back */
-int  iouring_write(client_t *c,
-                   const char *headers, size_t headers_len,
-                   const char *body,    size_t body_len);
-#endif
-
-void http_dispatch(client_t *c, uv_stream_t *stream);
+/* Parse and dispatch whatever is buffered in c->read_buf.
+ * Returns  1 if a request was dispatched (a response is now in flight),
+ *          0 if more bytes are needed (caller must ensure reading is armed),
+ *         -1 if the connection was closed. */
+int http_dispatch(client_t *c, uv_stream_t *stream);
 
 int       asgi_server_init(PyObject *loop);
 void      asgi_dispatch(client_t *c);

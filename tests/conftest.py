@@ -151,6 +151,104 @@ async def _asgi_app(scope, receive, send):
         await send({"type": "http.response.body", "body": addr.encode()})
         return
 
+    if path.startswith("/await-chain/"):
+        # Suspends once per iteration, so it only completes if libuv keeps
+        # iterating while asyncio still has queued callbacks.
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        for _ in range(int(path.rsplit("/", 1)[1])):
+            fut = loop.create_future()
+            loop.call_soon(fut.set_result, None)
+            await fut
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"chained"})
+        return
+
+    if path.startswith("/sleep/"):
+        # Only completes if libuv's poll wakes for asyncio's timer deadline.
+        import asyncio
+
+        delay = float(path.rsplit("/", 1)[1])
+        await asyncio.sleep(delay)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"slept"})
+        return
+
+    if path == "/await-io":
+        # Suspends on real socket readiness, resumed via asyncio's selector.
+        import asyncio
+        import socket as _socket
+
+        loop = asyncio.get_running_loop()
+        a, b = _socket.socketpair()
+        a.setblocking(False)
+        b.setblocking(False)
+        try:
+            loop.call_later(0.01, b.send, b"pong")
+            data = await loop.sock_recv(a, 4)
+        finally:
+            a.close()
+            b.close()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": data})
+        return
+
+    if path == "/running-loop":
+        # The eager fast path runs the app outside loop._run_once(), so this
+        # asserts freastal still makes the loop current for the call.
+        import asyncio
+
+        name = type(asyncio.get_running_loop()).__name__.encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": name})
+        return
+
+    if path == "/await-soon":
+        # Suspends once, on a future resolved from the loop's ready queue.
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        loop.call_soon(fut.set_result, b"resumed")
+        body = await fut
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    if path == "/boom":
+        raise RuntimeError("app failure")
+
     if path == "/scope":
         import json
 

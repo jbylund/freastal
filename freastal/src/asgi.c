@@ -22,19 +22,103 @@ static inline void set_running_loop(PyObject *loop) {
     }
 }
 
+/* One non-blocking step of the asyncio loop.  Callers must hold the GIL and
+ * must only call this when the loop has work that is due now, so that
+ * _run_once() computes a zero select() timeout and never blocks libuv. */
+static void asgi_step(void) {
+    set_running_loop(g_server.asgi_loop);
+    PyObject *ret = PyObject_CallNoArgs(g_server.asgi_run_once);
+    Py_XDECREF(ret);
+    if (PyErr_Occurred()) PyErr_Clear();
+    set_running_loop(Py_None);
+}
+
+/* len(obj) for the loop's callback queues; 0 rather than an error, since a
+ * failure here must not be allowed to wedge the event loop. */
+static Py_ssize_t asgi_pending(PyObject *obj) {
+    if (!obj) return 0;
+    Py_ssize_t n = PyObject_Size(obj);
+    if (n < 0) { PyErr_Clear(); return 0; }
+    return n;
+}
+
+/*
+ * asgi_idle_cb – deliberately empty.
+ *
+ * The handle exists for its side effect: while an idle handle is active libuv
+ * performs a zero-timeout poll instead of blocking for I/O, which is what
+ * guarantees another loop iteration (and so another asgi_check_cb) while
+ * asyncio still has callbacks to run.
+ */
+static void asgi_idle_cb(uv_idle_t *handle) { (void)handle; }
+
+static void asgi_timer_cb(uv_timer_t *handle);
+
+/*
+ * Line libuv's next poll up with asyncio's outstanding work.
+ *
+ * Without this, libuv blocks in its poll phase as soon as no socket is
+ * readable.  uv_check_t only fires once per iteration, so the loop would stop
+ * stepping asyncio entirely and any suspended ASGI task would hang until
+ * unrelated traffic happened to wake the loop.
+ *
+ * Callbacks due now are covered by the idle handle (zero-timeout poll, so the
+ * next iteration is immediate); scheduled callbacks get a uv_timer_t armed for
+ * asyncio's earliest deadline.  Both are dropped as soon as the loop drains,
+ * so an idle server still blocks in poll rather than spinning.
+ */
+void asgi_arm_wakeups(void) {
+    bool has_ready = asgi_pending(g_server.asgi_ready) > 0;
+    if (has_ready != g_server.asgi_idle_active) {
+        if (has_ready) uv_idle_start(&g_server.asgi_idle, asgi_idle_cb);
+        else           uv_idle_stop(&g_server.asgi_idle);
+        g_server.asgi_idle_active = has_ready;
+    }
+
+    if (asgi_pending(g_server.asgi_scheduled) == 0) {
+        if (g_server.asgi_timer_active) {
+            uv_timer_stop(&g_server.asgi_timer);
+            g_server.asgi_timer_active = false;
+        }
+        return;
+    }
+
+    /* _scheduled is a heap of TimerHandle, so [0] is the earliest deadline. */
+    uint64_t ms = 0;
+    PyObject *h = PyList_Check(g_server.asgi_scheduled)
+                ? PyList_GetItem(g_server.asgi_scheduled, 0) : NULL;  /* borrowed */
+    PyObject *when_o = h ? PyObject_GetAttrString(h, "_when") : NULL;
+    PyObject *now_o  = when_o ? PyObject_CallNoArgs(g_server.asgi_loop_time) : NULL;
+    if (now_o) {
+        double delay = PyFloat_AsDouble(when_o) - PyFloat_AsDouble(now_o);
+        /* Round up: waking early would leave the deadline in the future, and
+         * _run_once() would then pass a positive timeout to select(). */
+        if (delay > 0) ms = (uint64_t)(delay * 1000.0) + 1;
+    }
+    Py_XDECREF(when_o);
+    Py_XDECREF(now_o);
+    if (PyErr_Occurred()) PyErr_Clear();
+
+    uv_timer_start(&g_server.asgi_timer, asgi_timer_cb, ms, 0);
+    g_server.asgi_timer_active = true;
+}
+
+static void asgi_timer_cb(uv_timer_t *handle) {
+    (void)handle;
+    GIL_LOCK();
+    g_server.asgi_timer_active = false;
+    /* The deadline has passed, so _run_once() clamps its timeout to zero. */
+    asgi_step();
+    asgi_arm_wakeups();
+    GIL_UNLOCK();
+}
+
 static void asgi_check_cb(uv_check_t *handle) {
     (void)handle;
     GIL_LOCK();
-    PyObject *ready = PyObject_GetAttrString(g_server.asgi_loop, "_ready");
-    bool has_work = (ready != NULL && PyObject_IsTrue(ready) > 0);
-    Py_XDECREF(ready);
-    if (has_work) {
-        set_running_loop(g_server.asgi_loop);
-        PyObject *ret = PyObject_CallNoArgs(g_server.asgi_run_once);
-        Py_XDECREF(ret);
-        if (PyErr_Occurred()) PyErr_Clear();
-        set_running_loop(Py_None);
-    }
+    if (asgi_pending(g_server.asgi_ready) > 0)
+        asgi_step();
+    asgi_arm_wakeups();
     GIL_UNLOCK();
 }
 
@@ -50,11 +134,8 @@ static void asgi_poll_cb(uv_poll_t *handle, int status, int events) {
     (void)handle; (void)events;
     if (status < 0) return;
     GIL_LOCK();
-    set_running_loop(g_server.asgi_loop);
-    PyObject *ret = PyObject_CallNoArgs(g_server.asgi_run_once);
-    Py_XDECREF(ret);
-    if (PyErr_Occurred()) PyErr_Clear();
-    set_running_loop(Py_None);
+    asgi_step();
+    asgi_arm_wakeups();
     GIL_UNLOCK();
 }
 
@@ -305,16 +386,50 @@ void asgi_dispatch(client_t *c) {
         Py_DECREF(scope); Py_DECREF(body); PyErr_Clear(); send_500_asgi(c); return;
     }
 
-    /* run_asgi_request(loop, app, scope, body, capsule) → asyncio.Task */
+    /*
+     * run_asgi_request(loop, app, scope, body, capsule) runs the app eagerly
+     * and returns None if it finished inline (the common case: the response
+     * is already written by then) or an asyncio.Task if it suspended.
+     *
+     * The app runs on this stack rather than inside _run_once(), so make the
+     * loop current for the call - apps and libraries expect
+     * asyncio.get_running_loop() to work.
+     */
+    set_running_loop(g_server.asgi_loop);
     PyObject *task = PyObject_CallFunctionObjArgs(
         g_server.asgi_run_request,
         g_server.asgi_loop, g_server.app,
         scope, body, cap, NULL
     );
+    set_running_loop(Py_None);
     Py_DECREF(scope); Py_DECREF(body); Py_DECREF(cap);
 
-    if (!task) { PyErr_Print(); send_500_asgi(c); return; }
-    c->asgi_task = task; /* ref held until on_write clears it */
+    if (!task) {
+        PyErr_Print();
+        /* If the app raised after sending, the response is already on the
+         * wire and a second one would corrupt the stream. */
+        if (c->resp_hdr_len == 0) send_500_asgi(c);
+        return;
+    }
+
+    if (task == Py_None) {
+        Py_DECREF(task);
+        /* Finished inline. A well-behaved app has already called send(); one
+         * that returned without sending would leave the connection hanging,
+         * so answer it rather than waiting for the peer to time out. */
+        if (c->resp_hdr_len == 0) send_500_asgi(c);
+        return;
+    }
+
+    c->asgi_task = task; /* suspended; ref held until on_write clears it */
+
+    /* The task sits on loop._ready, but this is not necessarily the I/O phase:
+     * a pipelined request is dispatched from a write completion, which libuv
+     * runs *before* it computes the poll timeout.  Re-arm so the loop cannot
+     * block before asgi_check_cb gets to step the task.  Apps that finish
+     * inline need no arming -- their uv_write already puts the stream on
+     * libuv's pending queue, which forces the same zero timeout. */
+    asgi_arm_wakeups();
 }
 
 /* ---- Server init ---- */
@@ -325,6 +440,14 @@ int asgi_server_init(PyObject *loop) {
 
     g_server.asgi_run_once = PyObject_GetAttrString(loop, "_run_once");
     if (!g_server.asgi_run_once) return -1;
+
+    /* Cached once: asyncio mutates these in place and never rebinds them. */
+    g_server.asgi_ready = PyObject_GetAttrString(loop, "_ready");
+    if (!g_server.asgi_ready) return -1;
+    g_server.asgi_scheduled = PyObject_GetAttrString(loop, "_scheduled");
+    if (!g_server.asgi_scheduled) return -1;
+    g_server.asgi_loop_time = PyObject_GetAttrString(loop, "time");
+    if (!g_server.asgi_loop_time) return -1;
 
     /* Cache asyncio._set_running_loop for Python 3.14+ running-loop validation */
     {
@@ -376,6 +499,13 @@ int asgi_server_init(PyObject *loop) {
     uv_check_init(g_server.loop, &g_server.asgi_check);
     uv_check_start(&g_server.asgi_check, asgi_check_cb);
     uv_unref((uv_handle_t *)&g_server.asgi_check);
+
+    /* Started and stopped on demand by asgi_arm_wakeups(); unref'd so neither
+     * keeps the loop alive on its own. */
+    uv_idle_init(g_server.loop, &g_server.asgi_idle);
+    uv_unref((uv_handle_t *)&g_server.asgi_idle);
+    uv_timer_init(g_server.loop, &g_server.asgi_timer);
+    uv_unref((uv_handle_t *)&g_server.asgi_timer);
 
     /*
      * uv_poll_t on asyncio's selector fd: fires when external async I/O
