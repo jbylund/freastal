@@ -25,6 +25,8 @@ testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py310"
+# Format Python sources only; README examples are hand-wrapped for readability.
+extend-exclude = ["*.md"]
 
 [tool.cibuildwheel]
 # Build for CPython 3.10+ only; skip PyPy and 32-bit
