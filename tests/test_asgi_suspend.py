@@ -54,3 +54,37 @@ def test_keep_alive_mixes_sync_and_suspending_requests(asgi_url):
             assert client.get("/await-chain/5").content == b"chained"
             assert client.get("/sleep/0.01").content == b"slept"
             assert client.get("/await-io").content == b"pong"
+
+
+def test_pipelined_requests_that_suspend(asgi_url):
+    """Pipelined requests whose handlers suspend must all be answered.
+
+    This is the interaction between HTTP pipelining and the asyncio wakeups:
+    a pipelined request is dispatched from a write completion, which libuv
+    runs in its pending phase -- before it computes the poll timeout. An app
+    that finishes inline is safe (its uv_write puts the stream on libuv's
+    pending queue, forcing a zero timeout), but one that suspends leaves only
+    a Task on loop._ready with nothing to force the next iteration.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(asgi_url)
+    n = 3
+    req = b"GET /sleep/0.01 HTTP/1.1\r\nHost: localhost\r\n\r\n" * n
+
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.sendall(req)
+        sock.settimeout(3.0)
+        data = b""
+        try:
+            while data.count(b"HTTP/1.1 200") < n:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        except socket.timeout:
+            pass
+
+    assert data.count(b"HTTP/1.1 200") == n
+    assert data.count(b"slept") == n

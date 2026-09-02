@@ -67,7 +67,7 @@ static void asgi_timer_cb(uv_timer_t *handle);
  * asyncio's earliest deadline.  Both are dropped as soon as the loop drains,
  * so an idle server still blocks in poll rather than spinning.
  */
-static void asgi_arm_wakeups(void) {
+void asgi_arm_wakeups(void) {
     bool has_ready = asgi_pending(g_server.asgi_ready) > 0;
     if (has_ready != g_server.asgi_idle_active) {
         if (has_ready) uv_idle_start(&g_server.asgi_idle, asgi_idle_cb);
@@ -422,6 +422,14 @@ void asgi_dispatch(client_t *c) {
     }
 
     c->asgi_task = task; /* suspended; ref held until on_write clears it */
+
+    /* The task sits on loop._ready, but this is not necessarily the I/O phase:
+     * a pipelined request is dispatched from a write completion, which libuv
+     * runs *before* it computes the poll timeout.  Re-arm so the loop cannot
+     * block before asgi_check_cb gets to step the task.  Apps that finish
+     * inline need no arming -- their uv_write already puts the stream on
+     * libuv's pending queue, which forces the same zero timeout. */
+    asgi_arm_wakeups();
 }
 
 /* ---- Server init ---- */

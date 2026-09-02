@@ -53,7 +53,19 @@ void client_free(client_t *c) {
 }
 
 void client_reset(client_t *c) {
-    c->read_len = 0;
+    /*
+     * A read may have delivered more than one request.  Everything past the
+     * request we just answered belongs to the next one, so slide it to the
+     * front of the buffer rather than dropping it.  consumed == 0 means no
+     * request was ever parsed, in which case there is nothing to keep.
+     */
+    int consumed = c->headers_end + (int)c->content_length;
+    int leftover = (consumed > 0 && c->read_len > consumed)
+                       ? c->read_len - consumed : 0;
+    if (leftover > 0)
+        memmove(c->read_buf, c->read_buf + consumed, (size_t)leftover);
+
+    c->read_len = leftover;
     c->last_len = 0;
     c->method = NULL;
     c->method_len = 0;
@@ -107,7 +119,7 @@ static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
     buf->len  = (size_t)remaining;
 }
 
-void http_dispatch(client_t *c, uv_stream_t *stream) {
+int http_dispatch(client_t *c, uv_stream_t *stream) {
     c->num_headers = MAX_HEADERS;
     int pret = phr_parse_request(
         c->read_buf, (size_t)c->read_len,
@@ -118,7 +130,7 @@ void http_dispatch(client_t *c, uv_stream_t *stream) {
         (size_t)c->last_len
     );
 
-    if (pret == -2) { c->last_len = c->read_len; return; }
+    if (pret == -2) { c->last_len = c->read_len; return 0; }
 
     if (pret < 0) {
         static const char bad_req[] =
@@ -126,7 +138,7 @@ void http_dispatch(client_t *c, uv_stream_t *stream) {
         uv_buf_t b = uv_buf_init((char *)bad_req, sizeof(bad_req) - 1);
         uv_write(&c->write_req, stream, &b, 1, NULL);
         uv_close((uv_handle_t *)&c->handle, on_close);
-        return;
+        return -1;
     }
 
     c->headers_end = pret;
@@ -153,7 +165,7 @@ void http_dispatch(client_t *c, uv_stream_t *stream) {
     }
 
     size_t body_received = (size_t)(c->read_len - pret);
-    if (body_received < c->content_length) { c->last_len = c->read_len; return; }
+    if (body_received < c->content_length) { c->last_len = c->read_len; return 0; }
 
     uv_read_stop(stream);
     GIL_LOCK();
@@ -162,6 +174,7 @@ void http_dispatch(client_t *c, uv_stream_t *stream) {
     else
         wsgi_call_application(c);
     GIL_UNLOCK();
+    return 1;
 }
 
 static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
@@ -187,7 +200,7 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
 #endif
 
     c->read_len += (int)nread;
-    http_dispatch(c, stream);
+    (void)http_dispatch(c, stream);
 }
 
 /*
@@ -234,6 +247,12 @@ static void on_write(uv_write_t *req, int status) {
 
     /* Keep-alive: reset and re-arm for the next request */
     client_reset(c);
+
+    /* A pipelined request may already be buffered.  Dispatch it directly;
+     * only fall through to uv_read_start when more bytes are needed. */
+    if (c->read_len > 0 && http_dispatch(c, (uv_stream_t *)&c->handle) != 0)
+        return;
+
     uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read);
 }
 

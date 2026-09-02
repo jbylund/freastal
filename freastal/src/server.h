@@ -209,7 +209,11 @@ void      client_reset(client_t *c);
 /* Kick off async write of the formatted response */
 void write_response(client_t *c);
 
-void http_dispatch(client_t *c, uv_stream_t *stream);
+/* Parse and dispatch whatever is buffered in c->read_buf.
+ * Returns  1 if a request was dispatched (a response is now in flight),
+ *          0 if more bytes are needed (caller must ensure reading is armed),
+ *         -1 if the connection was closed. */
+int http_dispatch(client_t *c, uv_stream_t *stream);
 
 int       asgi_server_init(PyObject *loop);
 void      asgi_dispatch(client_t *c);

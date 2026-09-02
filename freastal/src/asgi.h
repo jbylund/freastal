@@ -19,6 +19,9 @@ int        asgi_server_init(PyObject *loop);
  * GIL must be held by caller. */
 void       asgi_dispatch(client_t *c);
 
+/* Line libuv's next poll up with asyncio's outstanding work. */
+void       asgi_arm_wakeups(void);
+
 /* Exposed to Python as _freastal.asgi_send_response(capsule, status, headers, body).
  * Called from _asgi_protocol.py::send() inside the running asyncio task. */
 PyObject  *asgi_send_response_c(PyObject *self, PyObject *args);
