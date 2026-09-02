@@ -58,6 +58,24 @@ def _wsgi_app(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/plain")])
         return [addr.encode()]
 
+    if path.startswith("/echo-path"):
+        # PEP 3333 environ values are latin-1; hand the raw bytes back so a
+        # test can assert on them exactly.
+        start_response("200 OK", [("Content-Type", "application/octet-stream")])
+        return [path.encode("latin-1")]
+
+    if path == "/echo-header":
+        start_response("200 OK", [("Content-Type", "application/octet-stream")])
+        return [environ.get("HTTP_X_TEST", "").encode("latin-1")]
+
+    if path == "/echo-query":
+        start_response("200 OK", [("Content-Type", "application/octet-stream")])
+        return [environ.get("QUERY_STRING", "").encode("latin-1")]
+
+    if path == "/echo-ctype":
+        start_response("200 OK", [("Content-Type", "application/octet-stream")])
+        return [environ.get("CONTENT_TYPE", "").encode("latin-1")]
+
     start_response("404 Not Found", [("Content-Type", "text/plain")])
     return [b"not found"]
 
