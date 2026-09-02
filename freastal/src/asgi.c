@@ -1,5 +1,6 @@
 #include "server.h"
 #include "asgi.h"
+#include "hdrcache.h"
 #include <arpa/inet.h>
 #include <string.h>
 
@@ -219,16 +220,25 @@ static PyObject *build_asgi_scope(client_t *c) {
             const char *hv  = c->headers[i].value;
             size_t      hvl = c->headers[i].value_len;
 
-            /* lowercase name in a stack buffer */
-            char lower[256];
-            size_t cpy = hnl < sizeof(lower) ? hnl : sizeof(lower) - 1;
-            for (size_t j = 0; j < cpy; j++) {
-                unsigned char ch = (unsigned char)hn[j];
-                lower[j] = (char)(ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
+            /* Name: a pre-built object for the names that recur on every
+             * request, otherwise lowercased straight into a fresh bytes
+             * object -- no intermediate C buffer, and no length cap. */
+            const hdr_cache_entry *e = hdr_cache_lookup(hn, hnl);
+            PyObject *nb;
+            if (likely(e != NULL)) {
+                nb = e->asgi_name;
+                Py_INCREF(nb);
+            } else {
+                nb = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)hnl);
+                if (nb) {
+                    char *dst = PyBytes_AS_STRING(nb);
+                    for (size_t j = 0; j < hnl; j++) {
+                        unsigned char ch = (unsigned char)hn[j];
+                        dst[j] = (char)(ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
+                    }
+                }
             }
-
-            PyObject *nb = PyBytes_FromStringAndSize(lower, (Py_ssize_t)cpy);
-            PyObject *vb = PyBytes_FromStringAndSize(hv,    (Py_ssize_t)hvl);
+            PyObject *vb = PyBytes_FromStringAndSize(hv, (Py_ssize_t)hvl);
             PyObject *pr = (nb && vb) ? PyTuple_Pack(2, nb, vb) : NULL;
             Py_XDECREF(nb); Py_XDECREF(vb);
             if (!pr) { Py_DECREF(hlist); Py_DECREF(scope); return NULL; }
