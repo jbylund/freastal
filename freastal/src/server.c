@@ -1,6 +1,7 @@
 #include "server.h"
 #include "wsgi.h"
 #include "asgi.h"
+#include "hdrcache.h"
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
@@ -373,6 +374,8 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
     if (pool_init(4096) < 0) return -1;
 
     if (init_wsgi_keys() < 0) return -1;
+
+    if (hdr_cache_init() < 0) return -1;
 
     /* Cache io.BytesIO */
     PyObject *io = PyImport_ImportModule("io");
