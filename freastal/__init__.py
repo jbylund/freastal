@@ -1,19 +1,17 @@
 """freastal – libuv + picohttpparser WSGI/ASGI server."""
 
 import asyncio
+import multiprocessing
 import os
 import signal
 import sys
-import multiprocessing
 import time
 
-from ._freastal import (
-    serve as _serve_single,
-    serve_asgi as _serve_asgi_single,
-    __version__,
-)
+from ._freastal import __version__
+from ._freastal import serve as _serve_single
+from ._freastal import serve_asgi as _serve_asgi_single
 
-__all__ = ["serve", "serve_asgi", "__version__"]
+__all__ = ["__version__", "serve", "serve_asgi"]
 
 
 def serve(
