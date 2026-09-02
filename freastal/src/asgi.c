@@ -22,12 +22,44 @@ static inline void set_running_loop(PyObject *loop) {
     }
 }
 
-static void asgi_check_cb(uv_check_t *handle) {
-    (void)handle;
-    GIL_LOCK();
+/* True when the asyncio loop has callbacks queued.  GIL must be held. */
+static bool asgi_has_ready(void) {
     PyObject *ready = PyObject_GetAttrString(g_server.asgi_loop, "_ready");
     bool has_work = (ready != NULL && PyObject_IsTrue(ready) > 0);
     Py_XDECREF(ready);
+    if (PyErr_Occurred()) PyErr_Clear();
+    return has_work;
+}
+
+/* Presence in loop->idle_handles is the whole point; the callback does nothing. */
+static void asgi_idle_cb(uv_idle_t *handle) { (void)handle; }
+
+/*
+ * asgi_prepare_cb - runs immediately before uv_backend_timeout() is computed.
+ *
+ * A coroutine can be queued from outside the I/O phase: dispatching a
+ * pipelined request happens in a write completion, which libuv runs in the
+ * pending phase.  uv__io_poll() would then block before asgi_check_cb ever
+ * got to step asyncio, stalling the response until unrelated I/O woke the
+ * loop.  An active idle handle forces uv_backend_timeout() to return 0, so
+ * the poll returns at once and the check callback runs this iteration.
+ */
+static void asgi_prepare_cb(uv_prepare_t *handle) {
+    (void)handle;
+    GIL_LOCK();
+    bool has_work = asgi_has_ready();
+    GIL_UNLOCK();
+
+    if (has_work)
+        uv_idle_start(&g_server.asgi_idle, asgi_idle_cb);
+    else
+        uv_idle_stop(&g_server.asgi_idle);
+}
+
+static void asgi_check_cb(uv_check_t *handle) {
+    (void)handle;
+    GIL_LOCK();
+    bool has_work = asgi_has_ready();
     if (has_work) {
         set_running_loop(g_server.asgi_loop);
         PyObject *ret = PyObject_CallNoArgs(g_server.asgi_run_once);
@@ -376,6 +408,14 @@ int asgi_server_init(PyObject *loop) {
     uv_check_init(g_server.loop, &g_server.asgi_check);
     uv_check_start(&g_server.asgi_check, asgi_check_cb);
     uv_unref((uv_handle_t *)&g_server.asgi_check);
+
+    /* uv_prepare_t + uv_idle_t: never block the poll while a coroutine is
+     * already queued (see asgi_prepare_cb). */
+    uv_idle_init(g_server.loop, &g_server.asgi_idle);
+    uv_unref((uv_handle_t *)&g_server.asgi_idle);
+    uv_prepare_init(g_server.loop, &g_server.asgi_prepare);
+    uv_prepare_start(&g_server.asgi_prepare, asgi_prepare_cb);
+    uv_unref((uv_handle_t *)&g_server.asgi_prepare);
 
     /*
      * uv_poll_t on asyncio's selector fd: fires when external async I/O

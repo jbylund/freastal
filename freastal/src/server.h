@@ -198,6 +198,8 @@ typedef struct {
     PyObject  *asgi_run_request;    /* _asgi_protocol.run_asgi_request */
     uv_check_t asgi_check;          /* post-I/O coroutine stepper */
     uv_poll_t  asgi_poll;           /* watches asyncio's selector fd for async I/O */
+    uv_prepare_t asgi_prepare;      /* keeps the poll non-blocking while work is queued */
+    uv_idle_t  asgi_idle;           /* held active by asgi_prepare; forces a 0 poll timeout */
     bool       asgi_poll_active;
 
     /* Pre-built ASGI scope objects */
@@ -239,7 +241,11 @@ int  iouring_write(client_t *c,
                    const char *body,    size_t body_len);
 #endif
 
-void http_dispatch(client_t *c, uv_stream_t *stream);
+/* Parse and dispatch whatever is buffered in c->read_buf.
+ * Returns  1 if a request was dispatched (a response is now in flight),
+ *          0 if more bytes are needed (caller must ensure reading is armed),
+ *         -1 if the connection was closed. */
+int http_dispatch(client_t *c, uv_stream_t *stream);
 
 int       asgi_server_init(PyObject *loop);
 void      asgi_dispatch(client_t *c);
