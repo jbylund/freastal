@@ -48,6 +48,17 @@ def _wsgi_app(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/plain")])
         return [value.encode()]
 
+    if path == "/headers":
+        # "name=value" per line, names normalised back to their wire form so
+        # the same assertions work against the ASGI app.
+        lines = sorted(
+            f"{k[5:].lower().replace('_', '-')}={v}"
+            for k, v in environ.items()
+            if k.startswith("HTTP_")
+        )
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return ["\n".join(lines).encode("latin-1")]
+
     if path == "/query":
         qs = environ.get("QUERY_STRING", "")
         start_response("200 OK", [("Content-Type", "text/plain")])
@@ -124,6 +135,21 @@ async def _asgi_app(scope, receive, send):
             }
         )
         await send({"type": "http.response.body", "body": value.encode()})
+        return
+
+    if path == "/headers":
+        lines = sorted(
+            f"{n.decode('latin-1')}={v.decode('latin-1')}"
+            for n, v in scope.get("headers", [])
+        )
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": "\n".join(lines).encode("latin-1")})
         return
 
     if path == "/query":

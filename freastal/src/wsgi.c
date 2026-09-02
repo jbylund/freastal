@@ -1,4 +1,5 @@
 #include "wsgi.h"
+#include "hdrcache.h"
 #include <string.h>
 
 /* ---- StartResponse Python type ---- */
@@ -229,6 +230,34 @@ static int format_response_headers(client_t *c, Py_ssize_t body_len) {
 
 /* ---- WSGI environ builder ---- */
 
+/*
+ * Build the environ key for a header name that is not in the cache:
+ * "HTTP_" followed by the name uppercased with '-' turned into '_'.
+ *
+ * The bytes go straight into the str object, which skips the intermediate C
+ * buffer and the UTF-8 validation scan PyUnicode_FromStringAndSize() would
+ * run.  PyUnicode_New(n, 127) promises the object holds nothing above 127, so
+ * the width has to be settled before anything is written; picohttpparser's
+ * token map already rejects those bytes in a name, and PEP 3333 wants latin-1
+ * for a name that somehow carries them.
+ */
+static PyObject *wsgi_header_key(const char *name, size_t len) {
+    unsigned char bits = 0;
+    for (size_t j = 0; j < len; j++) bits |= (unsigned char)name[j];
+
+    PyObject *key = PyUnicode_New((Py_ssize_t)(len + 5), (bits & 0x80) ? 255 : 127);
+    if (!key) return NULL;
+
+    Py_UCS1 *dst = (Py_UCS1 *)PyUnicode_DATA(key);
+    memcpy(dst, "HTTP_", 5);
+    for (size_t j = 0; j < len; j++) {
+        unsigned char ch = (unsigned char)name[j];
+        dst[5 + j] = (Py_UCS1)(ch >= 'a' && ch <= 'z' ? ch - 32
+                                                      : (ch == '-' ? '_' : ch));
+    }
+    return key;
+}
+
 static PyObject *build_environ(client_t *c) {
     wsgi_keys_t *k = &g_server.keys;
 
@@ -331,20 +360,17 @@ static PyObject *build_environ(client_t *c) {
             continue;
         }
 
-        /* General header → HTTP_UPPER_CASE_WITH_UNDERSCORES */
-        char key_buf[256];
-        if (hnl + 5 >= sizeof(key_buf)) continue; /* skip absurdly long names */
-        key_buf[0] = 'H'; key_buf[1] = 'T'; key_buf[2] = 'T';
-        key_buf[3] = 'P'; key_buf[4] = '_';
-        for (size_t j = 0; j < hnl; j++) {
-            unsigned char ch = (unsigned char)hn[j];
-            key_buf[5 + j] = (char)(ch >= 'a' && ch <= 'z'
-                                        ? ch - 32
-                                        : (ch == '-' ? '_' : ch));
+        /* General header → HTTP_UPPER_CASE_WITH_UNDERSCORES.  The cache also
+         * holds content-type/content-length, but those are answered above and
+         * never reach here. */
+        const hdr_cache_entry *e = hdr_cache_lookup(hn, hnl);
+        PyObject *hdr_key;
+        if (likely(e != NULL)) {
+            hdr_key = e->wsgi_key;
+            Py_INCREF(hdr_key);
+        } else {
+            hdr_key = wsgi_header_key(hn, hnl);
         }
-        key_buf[5 + hnl] = '\0';
-
-        PyObject *hdr_key = PyUnicode_FromStringAndSize(key_buf, (Py_ssize_t)(hnl + 5));
 
         PyObject *val = PyUnicode_FromStringAndSize(hv, (Py_ssize_t)hvl);
         int rc = 0;

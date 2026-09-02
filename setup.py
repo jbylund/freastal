@@ -170,6 +170,7 @@ if os.path.exists(_VENDOR_ARCHIVE):
     ext_sources = [
         os.path.join(src_dir, "server.c"),
         os.path.join(src_dir, "wsgi.c"),
+        os.path.join(src_dir, "hdrcache.c"),
         os.path.join(src_dir, "asgi.c"),
         os.path.join(src_dir, "tls.c"),
         os.path.join(src_dir, "freastalmodule.c"),
@@ -182,6 +183,7 @@ else:
         *vendor_sources,
         os.path.join(src_dir, "server.c"),
         os.path.join(src_dir, "wsgi.c"),
+        os.path.join(src_dir, "hdrcache.c"),
         os.path.join(src_dir, "asgi.c"),
         os.path.join(src_dir, "tls.c"),
         os.path.join(src_dir, "freastalmodule.c"),
