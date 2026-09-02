@@ -1,4 +1,5 @@
 #include "wsgi.h"
+#include "hdrvalid.h"
 #include <string.h>
 
 /* ---- StartResponse Python type ---- */
@@ -43,6 +44,70 @@ static PyObject *StartResponse_call(StartResponse *self, PyObject *args, PyObjec
     if (!PyList_Check(headers)) {
         PyErr_SetString(PyExc_TypeError, "response_headers must be a list");
         return NULL;
+    }
+
+    /*
+     * Validate before storing, so a rejected response never reaches the
+     * formatter.  start_response is allowed to raise, and the caller turns an
+     * exception here into a 500 - which is the right answer for an app that
+     * would otherwise have injected a header or crashed the worker.
+     */
+    {
+        Py_ssize_t  slen;
+        const char *sstr = PyUnicode_AsUTF8AndSize(status, &slen);
+        if (!sstr) return NULL;
+        if (!freastal_status_ok(sstr, slen)) {
+            PyErr_SetString(PyExc_ValueError,
+                "start_response: status must be '<3 digits> <reason>' and "
+                "must not contain control characters");
+            return NULL;
+        }
+    }
+
+    Py_ssize_t nhdrs = PyList_GET_SIZE(headers);
+    for (Py_ssize_t i = 0; i < nhdrs; i++) {
+        PyObject *pair = PyList_GET_ITEM(headers, i);
+        PyObject *no, *vo;
+
+        /* format_response_headers() indexes the pair with PyTuple_GET_ITEM,
+         * which on a non-tuple is undefined behaviour rather than an error, so
+         * the shape has to be settled here.  Lists are accepted as well as
+         * tuples: PEP 3333 asks for tuples, but apps do pass lists and the old
+         * behaviour for those was a crash. */
+        if (PyTuple_CheckExact(pair) && PyTuple_GET_SIZE(pair) == 2) {
+            no = PyTuple_GET_ITEM(pair, 0);
+            vo = PyTuple_GET_ITEM(pair, 1);
+        } else if (PyList_CheckExact(pair) && PyList_GET_SIZE(pair) == 2) {
+            no = PyList_GET_ITEM(pair, 0);
+            vo = PyList_GET_ITEM(pair, 1);
+        } else {
+            PyErr_Format(PyExc_TypeError,
+                "start_response: header %zd must be a 2-item tuple", i);
+            return NULL;
+        }
+
+        if (!PyUnicode_Check(no) || !PyUnicode_Check(vo)) {
+            PyErr_Format(PyExc_TypeError,
+                "start_response: header %zd name and value must both be str", i);
+            return NULL;
+        }
+
+        Py_ssize_t  nl, vl;
+        const char *nm = PyUnicode_AsUTF8AndSize(no, &nl);
+        const char *vv = PyUnicode_AsUTF8AndSize(vo, &vl);
+        if (!nm || !vv) return NULL;
+
+        if (!freastal_hdr_name_ok(nm, nl)) {
+            PyErr_Format(PyExc_ValueError,
+                "start_response: invalid header name %R", no);
+            return NULL;
+        }
+        if (!freastal_hdr_value_ok(vv, vl)) {
+            PyErr_Format(PyExc_ValueError,
+                "start_response: header %R has a value containing a control "
+                "character", no);
+            return NULL;
+        }
     }
 
     client_t *c = self->client;
@@ -202,8 +267,14 @@ static int format_response_headers(client_t *c, Py_ssize_t body_len) {
     for (Py_ssize_t i = 0; i < nhdrs; i++) {
         PyObject   *pair = PyList_GET_ITEM(c->resp_pyheaders, i);
         Py_ssize_t  name_len, value_len;
-        const char *name  = PyUnicode_AsUTF8AndSize(PyTuple_GET_ITEM(pair, 0), &name_len);
-        const char *value = PyUnicode_AsUTF8AndSize(PyTuple_GET_ITEM(pair, 1), &value_len);
+        /* Shape and contents were both settled by StartResponse_call, which
+         * accepts a 2-item tuple or list; index whichever it was. */
+        PyObject   *no = PyTuple_CheckExact(pair) ? PyTuple_GET_ITEM(pair, 0)
+                                                  : PyList_GET_ITEM(pair, 0);
+        PyObject   *vo = PyTuple_CheckExact(pair) ? PyTuple_GET_ITEM(pair, 1)
+                                                  : PyList_GET_ITEM(pair, 1);
+        const char *name  = PyUnicode_AsUTF8AndSize(no, &name_len);
+        const char *value = PyUnicode_AsUTF8AndSize(vo, &value_len);
         if (!name || !value) return -1;
 
         /* Length pre-check avoids scanning headers that can't possibly match */
