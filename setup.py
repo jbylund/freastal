@@ -60,6 +60,29 @@ def compiler_supports_flag(flag):
         os.unlink(src)
 
 
+def _native_arch_flags():
+    """Return ["-march=native"] only when this build is not going to be shipped.
+
+    -march=native tunes the binary for the CPU doing the compiling, which is
+    wrong for anything distributed: a wheel built on a GitHub runner would use
+    whatever instruction set that runner happened to have, and dies with SIGILL
+    on an older target CPU.  It is also meaningless under QEMU, which is how
+    the aarch64 wheels are built.
+
+    So it is opt-in for local builds via FREASTAL_NATIVE=1, and additionally
+    refused whenever cibuildwheel is driving the build, so that setting it in a
+    CI environment cannot accidentally poison a published wheel.
+    """
+    if os.environ.get("CIBUILDWHEEL") == "1":
+        return []
+    if os.environ.get("FREASTAL_NATIVE") != "1":
+        return []
+    if not compiler_supports_flag("-march=native"):
+        return []
+    print("freastal: FREASTAL_NATIVE=1 – building for THIS CPU only, not portable")
+    return ["-march=native"]
+
+
 def probe_symbol(src_snippet, extra_include_dirs=None):
     """Return True if src_snippet compiles without error."""
     cc = os.environ.get("CC", "cc")
@@ -207,7 +230,7 @@ ext = Extension(
     define_macros=define_macros,
     extra_compile_args=[
         "-O3",
-        *(["-march=native"] if compiler_supports_flag("-march=native") else []),
+        *_native_arch_flags(),
         "-fvisibility=hidden",
         "-Wall",
         "-Wextra",
