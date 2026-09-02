@@ -83,7 +83,7 @@ def test_pipelined_requests_that_suspend(asgi_url):
                 if not chunk:
                     break
                 data += chunk
-        except socket.timeout:
+        except TimeoutError:
             pass
 
     assert data.count(b"HTTP/1.1 200") == n

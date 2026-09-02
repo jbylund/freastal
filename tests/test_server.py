@@ -65,7 +65,7 @@ def _read_until(sock, needle, count, timeout=2.0):
             if not chunk:
                 break
             data += chunk
-    except socket.timeout:
+    except TimeoutError:
         pass
     return data
 
