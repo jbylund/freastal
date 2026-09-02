@@ -9,20 +9,20 @@ server_t g_server;
 
 /* ---- Client pool ---- */
 
-/* Pre-allocate a slab so most allocs are free-list pops (no malloc) */
+/* Reserve a slab so most allocs are free-list pops (no malloc).
+ *
+ * The slab is handed out with a bump pointer rather than pre-linked into a
+ * free list: writing next_free into all 4096 objects touched a byte inside
+ * nearly every 16KB page of the 107MB reservation, which made 65MB of it
+ * resident at startup for a server that may only ever see a few connections.
+ * calloc()'s pages are zero-fill-on-demand, so leaving them untouched costs
+ * only virtual address space until a connection actually needs one. */
 static int pool_init(int cap) {
     g_server.slab = calloc(cap, sizeof(client_t));
     if (!g_server.slab) return -1;
     g_server.pool_cap = cap;
+    g_server.pool_used = 0;
     g_server.free_list = NULL;
-
-    /* Build free list in reverse so first alloc returns index 0 */
-    char *base = (char *)g_server.slab;
-    for (int i = cap - 1; i >= 0; i--) {
-        client_t *c = (client_t *)(base + i * sizeof(client_t));
-        c->next_free = g_server.free_list;
-        g_server.free_list = c;
-    }
     return 0;
 }
 
@@ -31,6 +31,10 @@ client_t *client_alloc(void) {
     if (g_server.free_list) {
         c = g_server.free_list;
         g_server.free_list = c->next_free;
+    } else if (g_server.pool_used < g_server.pool_cap) {
+        c = (client_t *)((char *)g_server.slab
+                         + (size_t)g_server.pool_used * sizeof(client_t));
+        g_server.pool_used++;
     } else {
         /* Pool exhausted – fall back to malloc */
         c = (client_t *)malloc(sizeof(client_t));

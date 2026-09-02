@@ -189,7 +189,7 @@ typedef struct {
     client_t   *free_list;
     void       *slab;                 /* malloc'd slab holding pool objects */
     int         pool_cap;
-    int         pool_size;            /* active connections */
+    int         pool_used;            /* slab objects handed out at least once */
 
     wsgi_keys_t keys;
 
