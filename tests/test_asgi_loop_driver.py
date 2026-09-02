@@ -11,10 +11,10 @@ import multiprocessing
 import socket
 
 import pytest
-
-import freastal
 from conftest import _free_port, _wait_for_port
 from freastal._freastal import ASGI_CORO_DONE, asgi_coro_step
+
+import freastal
 
 _fired = []
 

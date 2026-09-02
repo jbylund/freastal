@@ -173,7 +173,9 @@ async def _asgi_app(scope, receive, send):
                 "headers": [[b"content-type", b"text/plain"]],
             }
         )
-        await send({"type": "http.response.body", "body": "\n".join(lines).encode("latin-1")})
+        await send(
+            {"type": "http.response.body", "body": "\n".join(lines).encode("latin-1")}
+        )
         return
 
     if path == "/query":

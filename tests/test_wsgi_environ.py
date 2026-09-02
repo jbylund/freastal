@@ -113,7 +113,7 @@ def _fetch(port, path="/", headers=None, method="GET", body=None):
         conn.request(method, path, body=body, headers=headers or {})
         resp = conn.getresponse()
         assert resp.status == 200
-        return eval(resp.read().decode())  # noqa: S307 - our own repr()
+        return eval(resp.read().decode())
     finally:
         conn.close()
 

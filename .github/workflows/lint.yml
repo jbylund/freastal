@@ -13,6 +13,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # Pinned: an unpinned ruff changes its formatting expectations on every
+      # release, which repeatedly turned lint red on unrelated PRs.
+      - run: pip install ruff==0.16.5
       - run: ruff format --check .
       - run: ruff check .

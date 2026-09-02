@@ -9,9 +9,9 @@ import multiprocessing
 import socket
 
 import pytest
+from conftest import _free_port, _wait_for_port
 
 import freastal
-from conftest import _free_port, _wait_for_port
 
 # The reason phrases freastal emits, mirroring status_line() in asgi.c.
 REASONS = {

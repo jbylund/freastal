@@ -86,7 +86,8 @@ freastal.serve(APPS[KIND], host="127.0.0.1", port=PORT, workers=1, reuse_port=Fa
 def _spawn(port, kind):
     proc = subprocess.Popen(
         [sys.executable, "-c", f"PORT = {port}\nKIND = {kind!r}\n" + APP],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -127,7 +128,9 @@ def _get(port, path):
     return buf
 
 
-@pytest.fixture(scope="module", params=["function", "instance", "bound-method", "partial"])
+@pytest.fixture(
+    scope="module", params=["function", "instance", "bound-method", "partial"]
+)
 def app_port(request):
     port = free_port()
     proc = _spawn(port, request.param)

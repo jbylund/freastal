@@ -153,6 +153,8 @@ def test_pipelined_requests_get_independent_scopes(asgi_url):
     assert second["query_string"] == ""
     assert first["keys"] == second["keys"] == SCOPE_KEYS
     assert first["client"] == second["client"]
+
+
 def test_contextvars_do_not_leak_between_requests(asgi_url):
     """A ContextVar set while handling one request must not reach the next.
 

@@ -70,12 +70,12 @@ def test_cached_names_are_lowercased_whatever_the_wire_case(server_url):
 @pytest.mark.parametrize(
     "name",
     [
-        "hosx",           # same length and prefix as "host"
-        "xost",           # same length as "host", different first byte
-        "user-agenz",     # same length as "user-agent"
-        "connectiom",     # same length as "connection"
-        "hosts",          # a cached name plus a byte
-        "hos",            # a cached name minus a byte
+        "hosx",  # same length and prefix as "host"
+        "xost",  # same length as "host", different first byte
+        "user-agenz",  # same length as "user-agent"
+        "connectiom",  # same length as "connection"
+        "hosts",  # a cached name plus a byte
+        "hos",  # a cached name minus a byte
     ],
 )
 def test_near_miss_names_do_not_borrow_a_cached_object(server_url, name):

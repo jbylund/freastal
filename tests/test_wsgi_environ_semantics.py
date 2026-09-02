@@ -72,7 +72,8 @@ freastal.serve(app, host="127.0.0.1", port=PORT, workers=1, reuse_port=False)
 def _spawn(port):
     proc = subprocess.Popen(
         [sys.executable, "-c", f"PORT = {port}\n" + APP],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -150,10 +151,21 @@ def test_environ_is_a_fresh_plain_dict_untouched_by_the_previous_request(port):
 def test_required_pep3333_keys_are_present(port):
     env = json.loads(_bodies(port, [_get(port, b"/dump")])[0])
     for key in (
-        "REQUEST_METHOD", "SCRIPT_NAME", "PATH_INFO", "QUERY_STRING",
-        "SERVER_NAME", "SERVER_PORT", "SERVER_PROTOCOL", "SERVER_SOFTWARE",
-        "REMOTE_ADDR", "wsgi.version", "wsgi.url_scheme", "wsgi.input",
-        "wsgi.errors", "wsgi.multithread", "wsgi.multiprocess",
+        "REQUEST_METHOD",
+        "SCRIPT_NAME",
+        "PATH_INFO",
+        "QUERY_STRING",
+        "SERVER_NAME",
+        "SERVER_PORT",
+        "SERVER_PROTOCOL",
+        "SERVER_SOFTWARE",
+        "REMOTE_ADDR",
+        "wsgi.version",
+        "wsgi.url_scheme",
+        "wsgi.input",
+        "wsgi.errors",
+        "wsgi.multithread",
+        "wsgi.multiprocess",
         "wsgi.run_once",
     ):
         assert key in env["keys"], key

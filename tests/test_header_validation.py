@@ -99,7 +99,8 @@ freastal.serve_asgi(app, host="127.0.0.1", port=PORT, workers=1, reuse_port=Fals
 def _spawn(src, port):
     proc = subprocess.Popen(
         [sys.executable, "-c", f"PORT = {port}\n" + src],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -148,13 +149,25 @@ def asgi_port():
 
 
 REJECTED_WSGI = [
-    "/value-crlf", "/name-crlf", "/value-lf", "/value-nul",
-    "/name-space", "/name-colon", "/name-empty", "/value-ctl",
-    "/status-crlf", "/status-short",
+    "/value-crlf",
+    "/name-crlf",
+    "/value-lf",
+    "/value-nul",
+    "/name-space",
+    "/name-colon",
+    "/name-empty",
+    "/value-ctl",
+    "/status-crlf",
+    "/status-short",
 ]
 REJECTED_ASGI = [
-    "/value-crlf", "/name-crlf", "/value-lf", "/value-nul",
-    "/name-space", "/name-empty", "/value-ctl",
+    "/value-crlf",
+    "/name-crlf",
+    "/value-lf",
+    "/value-nul",
+    "/name-space",
+    "/name-empty",
+    "/value-ctl",
 ]
 
 
