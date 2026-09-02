@@ -25,9 +25,13 @@ static inline void set_running_loop(PyObject *loop) {
 static void asgi_check_cb(uv_check_t *handle) {
     (void)handle;
     GIL_LOCK();
-    PyObject *ready = PyObject_GetAttrString(g_server.asgi_loop, "_ready");
-    bool has_work = (ready != NULL && PyObject_IsTrue(ready) > 0);
-    Py_XDECREF(ready);
+    /* g_server.asgi_ready is the loop's _ready deque, resolved once at init.
+     * Reading its length is a slot call on a borrowed reference — no attribute
+     * lookup, no refcount traffic, no exception state to clear.  asgi_ready is
+     * NULL only for loops with no _ready at all (uvloop), which this callback
+     * never stepped anyway. */
+    PyObject *ready = g_server.asgi_ready;
+    bool has_work = (ready != NULL && PyObject_Size(ready) > 0);
     if (has_work) {
         set_running_loop(g_server.asgi_loop);
         PyObject *ret = PyObject_CallNoArgs(g_server.asgi_run_once);
@@ -325,6 +329,24 @@ int asgi_server_init(PyObject *loop) {
 
     g_server.asgi_run_once = PyObject_GetAttrString(loop, "_run_once");
     if (!g_server.asgi_run_once) return -1;
+
+    /*
+     * Cache loop._ready so asgi_check_cb() can test it without an attribute
+     * lookup on every libuv iteration.  asyncio.BaseEventLoop creates the deque
+     * in __init__ and only ever mutates it (append/popleft/clear) — it is never
+     * rebound — so a single resolve is valid for the life of the loop.  This is
+     * the same assumption the cached _run_once bound method above already makes.
+     *
+     * Verify the object actually has a length here, so the per-tick
+     * PyObject_Size() can never fail and leave an exception set.  A loop with no
+     * usable _ready (uvloop) leaves this NULL and the check callback idles,
+     * which is what it did before as well.
+     */
+    g_server.asgi_ready = PyObject_GetAttrString(loop, "_ready");
+    if (!g_server.asgi_ready || PyObject_Size(g_server.asgi_ready) < 0) {
+        Py_CLEAR(g_server.asgi_ready);
+        PyErr_Clear();
+    }
 
     /* Cache asyncio._set_running_loop for Python 3.14+ running-loop validation */
     {

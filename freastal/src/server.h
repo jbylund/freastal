@@ -195,6 +195,7 @@ typedef struct {
     bool       asgi_mode;
     PyObject  *asgi_loop;           /* asyncio event loop */
     PyObject  *asgi_run_once;       /* loop._run_once method */
+    PyObject  *asgi_ready;          /* loop._ready deque; NULL if loop has none */
     PyObject  *asgi_run_request;    /* _asgi_protocol.run_asgi_request */
     uv_check_t asgi_check;          /* post-I/O coroutine stepper */
     uv_poll_t  asgi_poll;           /* watches asyncio's selector fd for async I/O */
