@@ -149,10 +149,22 @@ def test_key_order_matches_construction_order(environ_server):
     r = _fetch(environ_server, "/x?y=1", {"X-One": "1", "X-Two": "2"})
     keys = r["keys"]
     core = [
-        "wsgi.version", "wsgi.url_scheme", "wsgi.multithread", "wsgi.multiprocess",
-        "wsgi.run_once", "SERVER_NAME", "SERVER_PORT", "SERVER_SOFTWARE",
-        "SCRIPT_NAME", "wsgi.errors", "REQUEST_METHOD", "PATH_INFO", "QUERY_STRING",
-        "SERVER_PROTOCOL", "REMOTE_ADDR", "wsgi.input",
+        "wsgi.version",
+        "wsgi.url_scheme",
+        "wsgi.multithread",
+        "wsgi.multiprocess",
+        "wsgi.run_once",
+        "SERVER_NAME",
+        "SERVER_PORT",
+        "SERVER_SOFTWARE",
+        "SCRIPT_NAME",
+        "wsgi.errors",
+        "REQUEST_METHOD",
+        "PATH_INFO",
+        "QUERY_STRING",
+        "SERVER_PROTOCOL",
+        "REMOTE_ADDR",
+        "wsgi.input",
     ]
     assert keys[: len(core)] == core
     # request headers follow, in wire order
