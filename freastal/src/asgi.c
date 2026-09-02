@@ -1,6 +1,7 @@
 #include "server.h"
 #include "asgi.h"
 #include "hdrcache.h"
+#include "hdrvalid.h"
 #include <arpa/inet.h>
 #include <string.h>
 
@@ -454,6 +455,47 @@ PyObject *asgi_send_response_c(PyObject *self, PyObject *args) {
     if (!PyList_Check(headers)) {
         PyErr_SetString(PyExc_TypeError, "asgi headers must be a list");
         return NULL;
+    }
+
+    /*
+     * Reject CR, LF and NUL before anything is copied into the response
+     * buffer.  format_response_asgi() writes application names and values
+     * verbatim, so an app reflecting unvalidated input into a header could
+     * otherwise inject headers or split the response.  The status is an int
+     * here, so unlike the WSGI path it needs no checking.
+     */
+    {
+        Py_ssize_t nhdrs = PyList_GET_SIZE(headers);
+        for (Py_ssize_t i = 0; i < nhdrs; i++) {
+            PyObject *pair = PyList_GET_ITEM(headers, i);
+            PyObject *no, *vo;
+            if (PyTuple_CheckExact(pair) && PyTuple_GET_SIZE(pair) == 2) {
+                no = PyTuple_GET_ITEM(pair, 0);
+                vo = PyTuple_GET_ITEM(pair, 1);
+            } else if (PyList_CheckExact(pair) && PyList_GET_SIZE(pair) == 2) {
+                no = PyList_GET_ITEM(pair, 0);
+                vo = PyList_GET_ITEM(pair, 1);
+            } else {
+                /* Leave other shapes to the formatter, which handles the
+                 * general sequence case and reports its own error. */
+                continue;
+            }
+            if (!PyBytes_Check(no) || !PyBytes_Check(vo)) continue;
+
+            if (!freastal_hdr_name_ok(PyBytes_AS_STRING(no),
+                                      PyBytes_GET_SIZE(no))) {
+                PyErr_Format(PyExc_ValueError,
+                    "freastal asgi: invalid header name %R", no);
+                return NULL;
+            }
+            if (!freastal_hdr_value_ok(PyBytes_AS_STRING(vo),
+                                       PyBytes_GET_SIZE(vo))) {
+                PyErr_Format(PyExc_ValueError,
+                    "freastal asgi: header %R has a value containing a "
+                    "control character", no);
+                return NULL;
+            }
+        }
     }
 
     if (format_response_asgi(c, status, headers, body) < 0) {
