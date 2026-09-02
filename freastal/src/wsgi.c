@@ -79,6 +79,21 @@ static PyTypeObject StartResponse_type = {
  * Optimised for the common case of a single-element iterable.
  */
 static PyObject *collect_body(PyObject *iterable) {
+    /*
+     * Almost every app returns exactly [b"..."].  Taking that apart directly
+     * skips the iterator object, its two PyIter_Next() calls and the
+     * StopIteration they raise between them.  CheckExact on both, so a list
+     * or bytes subclass (whose __iter__ or tp_as_sequence may do anything)
+     * still goes the general way.
+     */
+    if (likely(PyList_CheckExact(iterable)) && PyList_GET_SIZE(iterable) == 1) {
+        PyObject *only = PyList_GET_ITEM(iterable, 0);
+        if (likely(PyBytes_CheckExact(only))) {
+            Py_INCREF(only);
+            return only;
+        }
+    }
+
     PyObject *iter = PyObject_GetIter(iterable);
     if (!iter) return NULL;
 
@@ -533,20 +548,20 @@ static PyObject *build_environ(client_t *c) {
 
     /* Per-request: REQUEST_METHOD */
     SET_NEW(REQUEST_METHOD,
-            PyUnicode_FromStringAndSize(c->method, (Py_ssize_t)c->method_len));
+            PyUnicode_DecodeLatin1(c->method, (Py_ssize_t)c->method_len, NULL));
 
     /* Per-request: PATH_INFO and QUERY_STRING (split on '?') */
     {
         const char *qmark = memchr(c->path, '?', c->path_len);
         if (qmark) {
             SET_NEW(PATH_INFO,
-                    PyUnicode_FromStringAndSize(c->path, (Py_ssize_t)(qmark - c->path)));
+                    PyUnicode_DecodeLatin1(c->path, (Py_ssize_t)(qmark - c->path), NULL));
             SET_NEW(QUERY_STRING,
-                    PyUnicode_FromStringAndSize(qmark + 1,
-                        (Py_ssize_t)(c->path + c->path_len - qmark - 1)));
+                    PyUnicode_DecodeLatin1(qmark + 1,
+                        (Py_ssize_t)(c->path + c->path_len - qmark - 1), NULL));
         } else {
             SET_NEW(PATH_INFO,
-                    PyUnicode_FromStringAndSize(c->path, (Py_ssize_t)c->path_len));
+                    PyUnicode_DecodeLatin1(c->path, (Py_ssize_t)c->path_len, NULL));
             SET(QUERY_STRING, k->empty_str);
         }
     }
@@ -591,11 +606,11 @@ static PyObject *build_environ(client_t *c) {
         size_t      hvl = c->headers[i].value_len;
 
         if (hnl == 12 && strncasecmp(hn, "content-type", 12) == 0) {
-            SET_NEW(CONTENT_TYPE, PyUnicode_FromStringAndSize(hv, (Py_ssize_t)hvl));
+            SET_NEW(CONTENT_TYPE, PyUnicode_DecodeLatin1(hv, (Py_ssize_t)hvl, NULL));
             continue;
         }
         if (hnl == 14 && strncasecmp(hn, "content-length", 14) == 0) {
-            SET_NEW(CONTENT_LENGTH, PyUnicode_FromStringAndSize(hv, (Py_ssize_t)hvl));
+            SET_NEW(CONTENT_LENGTH, PyUnicode_DecodeLatin1(hv, (Py_ssize_t)hvl, NULL));
             continue;
         }
 
@@ -611,11 +626,42 @@ static PyObject *build_environ(client_t *c) {
             hdr_key = wsgi_header_key(hn, hnl);
         }
 
-        PyObject *val = PyUnicode_FromStringAndSize(hv, (Py_ssize_t)hvl);
-        int rc = 0;
-        if (hdr_key && val) rc = PyDict_SetItem(env, hdr_key, val);
-        Py_XDECREF(hdr_key); Py_XDECREF(val);
-        if (rc < 0) { Py_DECREF(env); return NULL; }
+        PyObject *val = PyUnicode_DecodeLatin1(hv, (Py_ssize_t)hvl, NULL);
+        if (unlikely(!hdr_key || !val)) {
+            Py_XDECREF(hdr_key); Py_XDECREF(val);
+            Py_DECREF(env);
+            return NULL;
+        }
+
+        /*
+         * SetDefault probes the table once where a lookup followed by SetItem
+         * would probe twice, and it is what makes a repeated field visible at
+         * all: a plain SetItem silently kept only the last copy.  RFC 9110
+         * 5.3 says repeated field lines are equivalent to one line carrying
+         * the values joined by ", " (Cookie, per RFC 6265 5.4, by "; ").
+         *
+         * Presence is decided on the dict's size rather than on `prev != val`
+         * because a one-byte value comes back as an interned singleton, so a
+         * header repeated with the identical single-character value would
+         * otherwise compare equal to what is already stored.
+         *
+         * %U is safe for prev: every HTTP_-prefixed key in env was written by
+         * this loop, and the only thing it stores is a str.  No template entry
+         * carries that prefix, so none of them can be reached from here.
+         */
+        Py_ssize_t before = PyDict_GET_SIZE(env);
+        PyObject  *prev   = PyDict_SetDefault(env, hdr_key, val); /* borrowed */
+        int rc = prev ? 0 : -1;
+        if (prev && unlikely(PyDict_GET_SIZE(env) == before)) {
+            const char *sep = (hnl == 6 && strncasecmp(hn, "cookie", 6) == 0)
+                              ? "; " : ", ";
+            PyObject *joined = PyUnicode_FromFormat("%U%s%U", prev, sep, val);
+            rc = joined ? PyDict_SetItem(env, hdr_key, joined) : -1;
+            Py_XDECREF(joined);
+        }
+        Py_DECREF(hdr_key);
+        Py_DECREF(val);
+        if (unlikely(rc < 0)) { Py_DECREF(env); return NULL; }
     }
 
 #undef SET
@@ -664,7 +710,13 @@ void wsgi_call_application(client_t *c) {
     }
     sr->client = c;
 
-    PyObject *result = PyObject_CallFunctionObjArgs(g_server.app, environ, (PyObject *)sr, NULL);
+    /* Vectorcall with the ARGUMENTS_OFFSET slot: for a plain `def app(environ,
+     * start_response)` this reaches the function's vectorcall slot with no
+     * tuple built at all.  A callable *instance* (Flask, Django's WSGIHandler)
+     * has no vectorcall slot and still goes through _PyObject_MakeTpCall. */
+    PyObject *args[3] = { NULL, environ, (PyObject *)sr };
+    PyObject *result  = PyObject_Vectorcall(
+        g_server.app, args + 1, 2 | PY_VECTORCALL_ARGUMENTS_OFFSET, NULL);
     Py_DECREF(environ);
     Py_DECREF(sr);
 
