@@ -386,16 +386,42 @@ void asgi_dispatch(client_t *c) {
         Py_DECREF(scope); Py_DECREF(body); PyErr_Clear(); send_500_asgi(c); return;
     }
 
-    /* run_asgi_request(loop, app, scope, body, capsule) → asyncio.Task */
+    /*
+     * run_asgi_request(loop, app, scope, body, capsule) runs the app eagerly
+     * and returns None if it finished inline (the common case: the response
+     * is already written by then) or an asyncio.Task if it suspended.
+     *
+     * The app runs on this stack rather than inside _run_once(), so make the
+     * loop current for the call - apps and libraries expect
+     * asyncio.get_running_loop() to work.
+     */
+    set_running_loop(g_server.asgi_loop);
     PyObject *task = PyObject_CallFunctionObjArgs(
         g_server.asgi_run_request,
         g_server.asgi_loop, g_server.app,
         scope, body, cap, NULL
     );
+    set_running_loop(Py_None);
     Py_DECREF(scope); Py_DECREF(body); Py_DECREF(cap);
 
-    if (!task) { PyErr_Print(); send_500_asgi(c); return; }
-    c->asgi_task = task; /* ref held until on_write clears it */
+    if (!task) {
+        PyErr_Print();
+        /* If the app raised after sending, the response is already on the
+         * wire and a second one would corrupt the stream. */
+        if (c->resp_hdr_len == 0) send_500_asgi(c);
+        return;
+    }
+
+    if (task == Py_None) {
+        Py_DECREF(task);
+        /* Finished inline. A well-behaved app has already called send(); one
+         * that returned without sending would leave the connection hanging,
+         * so answer it rather than waiting for the peer to time out. */
+        if (c->resp_hdr_len == 0) send_500_asgi(c);
+        return;
+    }
+
+    c->asgi_task = task; /* suspended; ref held until on_write clears it */
 }
 
 /* ---- Server init ---- */

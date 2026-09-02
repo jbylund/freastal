@@ -212,6 +212,43 @@ async def _asgi_app(scope, receive, send):
         await send({"type": "http.response.body", "body": data})
         return
 
+    if path == "/running-loop":
+        # The eager fast path runs the app outside loop._run_once(), so this
+        # asserts freastal still makes the loop current for the call.
+        import asyncio
+
+        name = type(asyncio.get_running_loop()).__name__.encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": name})
+        return
+
+    if path == "/await-soon":
+        # Suspends once, on a future resolved from the loop's ready queue.
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        loop.call_soon(fut.set_result, b"resumed")
+        body = await fut
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    if path == "/boom":
+        raise RuntimeError("app failure")
+
     if path == "/scope":
         import json
 
