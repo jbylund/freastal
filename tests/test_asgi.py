@@ -1,8 +1,10 @@
 """ASGI-specific tests."""
 
 import json
+import sys
 
 import httpx
+import pytest
 
 
 def test_scope_fields(asgi_url):
@@ -46,3 +48,33 @@ def test_keep_alive_survives_a_mix_of_paths(asgi_url):
             assert client.get("/hello").content == b"hello"
             assert client.get("/await-soon").content == b"resumed"
             assert client.get("/await-io").content == b"pong"
+
+
+def test_contextvars_do_not_leak_between_requests(asgi_url):
+    """A ContextVar set while handling one request must not reach the next.
+
+    The eager path runs the app in the server's own context unless something
+    gives it one of its own, and then every later request on that worker
+    inherits whatever the last one set - trace ids, tenant ids, logging
+    context bleeding between callers.
+    """
+    with httpx.Client(base_url=asgi_url) as client:
+        assert client.get("/ctxvar").content == b"clean"
+        assert client.get("/ctxvar").content == b"clean", "leaked into next request"
+
+
+def test_current_task_is_set_inside_the_app(asgi_url):
+    assert httpx.get(f"{asgi_url}/current-task").content == b"task"
+
+
+def test_wait_for_works_inside_the_app(asgi_url):
+    r = httpx.get(f"{asgi_url}/wait-for", timeout=10)
+    assert r.status_code == 200
+    assert r.content == b"waited"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="asyncio.timeout is 3.11+")
+def test_expiring_timeout_raises_inside_the_app(asgi_url):
+    r = httpx.get(f"{asgi_url}/timeout-expires", timeout=10)
+    assert r.status_code == 200
+    assert r.content == b"expired"
