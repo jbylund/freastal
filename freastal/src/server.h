@@ -200,6 +200,19 @@ typedef struct {
     uv_poll_t  asgi_poll;           /* watches asyncio's selector fd for async I/O */
     bool       asgi_poll_active;
 
+    /* Keeping libuv awake while asyncio still has work.  libuv blocks in its
+     * poll phase whenever nothing is pending, which would stop uv_check_t from
+     * firing and strand any suspended task.  An active uv_idle_t forces
+     * uv_backend_timeout() to 0 so the next iteration happens immediately;
+     * asgi_timer wakes the loop for asyncio's next scheduled callback. */
+    uv_idle_t  asgi_idle;
+    uv_timer_t asgi_timer;
+    bool       asgi_idle_active;
+    bool       asgi_timer_active;
+    PyObject  *asgi_ready;          /* loop._ready deque (callbacks due now) */
+    PyObject  *asgi_scheduled;      /* loop._scheduled heap of TimerHandle */
+    PyObject  *asgi_loop_time;      /* loop.time bound method */
+
     /* Pre-built ASGI scope objects */
     PyObject  *asgi_type_http;
     PyObject  *asgi_http_11;
