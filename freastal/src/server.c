@@ -165,7 +165,7 @@ int http_dispatch(client_t *c, uv_stream_t *stream) {
     }
 
     size_t body_received = (size_t)(c->read_len - pret);
-    if (body_received < c->content_length) { c->last_len = c->read_len; return 0; }
+    if (body_received < c->content_length) return 0;
 
     uv_read_stop(stream);
     GIL_LOCK();
