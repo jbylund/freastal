@@ -191,10 +191,12 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
 }
 
 /*
- * write_response_uv – normal uv_write path (writev via two bufs).
- * Used for small responses and as fallback when io_uring is unavailable.
+ * write_response – send headers and body together as a single writev.
  */
-static void write_response_uv(client_t *c) {
+void write_response(client_t *c) {
+#ifdef FREASTAL_TLS
+    if (c->tls) { tls_write_response_impl(c); return; }
+#endif
     c->write_bufs[0] = uv_buf_init(c->resp_hdr, (size_t)c->resp_hdr_len);
 
     int nbufs = 1;
@@ -208,29 +210,6 @@ static void write_response_uv(client_t *c) {
 
     uv_write(&c->write_req, (uv_stream_t *)&c->handle,
              c->write_bufs, (unsigned int)nbufs, on_write);
-}
-
-/*
- * write_response – dispatch to the io_uring fixed-buffer path for large
- * responses, fall back to uv_write for small ones or when io_uring is off.
- */
-void write_response(client_t *c) {
-#ifdef FREASTAL_TLS
-    if (c->tls) { tls_write_response_impl(c); return; }
-#endif
-#ifdef FREASTAL_IOURING
-    if (g_server.iouring.enabled) {
-        Py_ssize_t body_len = c->resp_body ? PyBytes_GET_SIZE(c->resp_body) : 0;
-        size_t total = (size_t)c->resp_hdr_len + (size_t)body_len;
-        if (total > IOURING_LARGE_THRESH) {
-            const char *body_ptr = c->resp_body ? PyBytes_AS_STRING(c->resp_body) : NULL;
-            if (iouring_write(c, c->resp_hdr, (size_t)c->resp_hdr_len,
-                              body_ptr, (size_t)body_len) == 0)
-                return;  /* io_uring submission succeeded */
-        }
-    }
-#endif
-    write_response_uv(c);
 }
 
 static void on_write(uv_write_t *req, int status) {
@@ -420,11 +399,6 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
         return -1;
     }
 
-#ifdef FREASTAL_IOURING
-    /* Soft failure: log and continue without registered buffers */
-    iouring_init(g_server.loop, &g_server.iouring);
-#endif
-
 #ifdef FREASTAL_TLS
     if (certfile && keyfile) {
         if (tls_server_init(certfile, keyfile) < 0)
@@ -445,153 +419,6 @@ void server_run(void) {
     Py_END_ALLOW_THREADS
 }
 
-/* ============================================================
- * io_uring registered-buffer write path
- *
- * Active only when compiled with -DFREASTAL_IOURING (liburing present).
- * libuv 1.45+ also independently uses io_uring for its internal event
- * loop on Linux, providing syscall-batching for all I/O paths.
- *
- * This layer adds registered fixed-buffers on top, eliminating
- * per-write get_user_pages() overhead for responses > IOURING_LARGE_THRESH.
- * Benefit is most pronounced in the 12-50KB range targeted here.
- * ============================================================ */
-#ifdef FREASTAL_IOURING
-
-static void on_iouring_event(uv_poll_t *handle, int status, int events);
-
-int iouring_init(uv_loop_t *loop, iouring_ctx_t *ctx) {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->free_top = -1;
-
-    if (io_uring_queue_init(IOURING_QUEUE_DEPTH, &ctx->ring, 0) < 0) {
-        fprintf(stderr, "[freastal] io_uring_queue_init failed – uv_write fallback active\n");
-        return 0; /* soft failure */
-    }
-
-    /* Allocate page-aligned slab for registered buffers */
-    ctx->bufs = (char *)aligned_alloc(4096,
-                    (size_t)IOURING_BUF_COUNT * IOURING_BUF_SIZE);
-    if (!ctx->bufs) {
-        io_uring_queue_exit(&ctx->ring);
-        return 0;
-    }
-
-    /* Register the slab with the kernel.  After this, each write_fixed
-     * submission references a buffer by index, skipping page-pinning overhead. */
-    struct iovec iov[IOURING_BUF_COUNT];
-    for (int i = 0; i < IOURING_BUF_COUNT; i++) {
-        iov[i].iov_base = ctx->bufs + (size_t)i * IOURING_BUF_SIZE;
-        iov[i].iov_len  = IOURING_BUF_SIZE;
-    }
-    if (io_uring_register_buffers(&ctx->ring, iov, IOURING_BUF_COUNT) < 0) {
-        fprintf(stderr, "[freastal] io_uring_register_buffers failed – uv_write fallback active\n");
-        free(ctx->bufs); ctx->bufs = NULL;
-        io_uring_queue_exit(&ctx->ring);
-        return 0;
-    }
-
-    /* Build LIFO free stack: index IOURING_BUF_COUNT-1 is on top initially */
-    ctx->free_top = IOURING_BUF_COUNT - 1;
-    for (int i = 0; i < IOURING_BUF_COUNT; i++)
-        ctx->free_stack[i] = i;
-
-    /* Watch the ring fd from libuv's event loop so completions are processed
-     * as part of the normal event loop tick, not a separate thread. */
-    uv_poll_init(loop, &ctx->poll, ctx->ring.ring_fd);
-    uv_poll_start(&ctx->poll, UV_READABLE, on_iouring_event);
-
-    ctx->enabled = true;
-    fprintf(stderr, "[freastal] io_uring registered-buffer path enabled "
-                    "(%d x %dKB buffers, threshold %dB)\n",
-            IOURING_BUF_COUNT, IOURING_BUF_SIZE / 1024, IOURING_LARGE_THRESH);
-    return 0;
-}
-
-static int iou_alloc_buf(iouring_ctx_t *ctx) {
-    if (ctx->free_top < 0) return -1;
-    return ctx->free_stack[ctx->free_top--];
-}
-
-static void iou_free_buf(iouring_ctx_t *ctx, int idx) {
-    ctx->free_stack[++ctx->free_top] = idx;
-}
-
-int iouring_write(client_t *c,
-                  const char *headers, size_t headers_len,
-                  const char *body,    size_t body_len) {
-    iouring_ctx_t *ctx = &g_server.iouring;
-    size_t total = headers_len + body_len;
-
-    if (total > IOURING_BUF_SIZE) return -1; /* exceeds one buffer */
-
-    int buf_idx = iou_alloc_buf(ctx);
-    if (buf_idx < 0) return -1; /* all buffers in flight – fall back */
-
-    /* Copy response into the registered buffer */
-    char *buf = ctx->bufs + (size_t)buf_idx * IOURING_BUF_SIZE;
-    memcpy(buf, headers, headers_len);
-    if (body_len > 0)
-        memcpy(buf + headers_len, body, body_len);
-
-    uv_os_fd_t fd;
-    if (uv_fileno((uv_handle_t *)&c->handle, &fd) != 0) {
-        iou_free_buf(ctx, buf_idx);
-        return -1;
-    }
-
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
-    if (!sqe) {
-        /* Submission queue full – flush and retry once */
-        io_uring_submit(&ctx->ring);
-        sqe = io_uring_get_sqe(&ctx->ring);
-        if (!sqe) { iou_free_buf(ctx, buf_idx); return -1; }
-    }
-
-    /* write_fixed: kernel uses the pre-registered buffer; no get_user_pages */
-    io_uring_prep_write_fixed(sqe, (int)fd, buf, (unsigned int)total, 0, buf_idx);
-    io_uring_sqe_set_data(sqe, c);  /* recover client in completion handler */
-    c->iouring_buf_idx = buf_idx;
-
-    io_uring_submit(&ctx->ring);
-    return 0;
-}
-
-static void on_iouring_event(uv_poll_t *handle, int status, int events) {
-    (void)handle; (void)status; (void)events;
-    iouring_ctx_t *ctx = &g_server.iouring;
-
-    struct io_uring_cqe *cqe;
-    unsigned head;
-    unsigned nr = 0;  /* count consumed, not raw ring head */
-
-    io_uring_for_each_cqe(&ctx->ring, head, cqe) {
-        client_t *c    = (client_t *)io_uring_cqe_get_data(cqe);
-        int write_res  = cqe->res;
-        int buf_idx    = c->iouring_buf_idx;
-
-        iou_free_buf(ctx, buf_idx);
-        c->iouring_buf_idx = -1;
-
-        GIL_LOCK();
-        Py_CLEAR(c->resp_status);
-        Py_CLEAR(c->resp_pyheaders);
-        Py_CLEAR(c->resp_body);
-        Py_CLEAR(c->asgi_task);
-        GIL_UNLOCK();
-
-        if (write_res < 0 || !c->keep_alive) {
-            uv_close((uv_handle_t *)&c->handle, on_close);
-        } else {
-            client_reset(c);
-            uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read);
-        }
-        nr++;
-    }
-    io_uring_cq_advance(&ctx->ring, nr);
-}
-
-#endif /* FREASTAL_IOURING */
 
 #ifdef FREASTAL_TLS
 

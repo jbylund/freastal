@@ -80,7 +80,6 @@ TLS requires OpenSSL headers at build time. Wheels published to PyPI include TLS
 - **libuv** — cross-platform event loop; io\_uring-ready on Linux (libuv ≥ 1.45 batches syscalls automatically)
 - **picohttpparser** — SSE4.2/NEON SIMD HTTP/1.1 parser from the h2o project; vendored
 - **picotls** — TLS 1.3 library from the h2o project; vendored, gated by `FREASTAL_TLS`
-- **io_uring fixed-buffer path** (Linux, optional) — when built with `liburing`, responses > 4 KB are copied into pre-registered kernel buffers and sent with `io_uring_prep_write_fixed`, eliminating per-write `get_user_pages()` overhead. libuv ≥ 1.45 also transparently batches `accept`/`read`/`write` via io_uring regardless of this flag.
 - Single `uv_write` per response — headers and body sent together, no extra copy
 - HTTP/1.1 keep-alive: connections re-armed in-place without close/reopen; `TCP_NODELAY` set on every accepted socket
 - Slab allocator for per-connection state — no per-request malloc on the hot path
@@ -103,10 +102,6 @@ pip install freastal --no-binary freastal
 
 # Debian/Ubuntu
 apt-get install libuv1-dev libssl-dev
-pip install freastal --no-binary freastal
-
-# Debian/Ubuntu with io_uring fixed-buffer path (Linux ≥ 5.6)
-apt-get install libuv1-dev libssl-dev liburing-dev
 pip install freastal --no-binary freastal
 ```
 

@@ -120,8 +120,6 @@ has_uv_reuseport = probe_symbol(
     extra_include_dirs=include_dirs,
 )
 
-# ---------- liburing (Linux-only, optional) ----------
-
 define_macros = []
 if has_uv_reuseport:
     define_macros.append(("FREASTAL_REUSEPORT", "1"))
@@ -129,22 +127,6 @@ if has_uv_reuseport:
 else:
     print("freastal: UV_TCP_REUSEPORT not available – SO_REUSEPORT DISABLED")
 vendor_sources = []
-
-try:
-    subprocess.check_call(
-        ["pkg-config", "--exists", "liburing"], stderr=subprocess.DEVNULL
-    )
-    define_macros.append(("FREASTAL_IOURING", "1"))
-    include_dirs += [
-        f[2:] for f in pkg_config("--cflags-only-I", "liburing") if f.startswith("-I")
-    ]
-    library_dirs += [
-        f[2:] for f in pkg_config("--libs-only-L", "liburing") if f.startswith("-L")
-    ]
-    libraries += ["uring"]
-    print("freastal: liburing found – io_uring path ENABLED")
-except (subprocess.CalledProcessError, FileNotFoundError):
-    pass
 
 # ---------- OpenSSL + vendored picotls (optional, enables TLS 1.3) ----------
 
