@@ -70,7 +70,7 @@ def _spare_capacity(d):
     base = sys.getsizeof(probe)
     n = 0
     for i in range(4096):
-        probe["__spare_probe_%d__" % i] = None
+        probe[f"__spare_probe_{i}__"] = None
         if sys.getsizeof(probe) != base:
             break
         n += 1
@@ -173,10 +173,10 @@ def test_key_order_matches_construction_order(environ_server):
 
 def test_many_headers_still_correct(environ_server):
     """More headers than the template's spare capacity: dict resizes normally."""
-    headers = {"X-Q%d" % i: "v%d" % i for i in range(45)}
+    headers = {f"X-Q{i}": f"v{i}" for i in range(45)}
     r = _fetch(environ_server, "/lots", headers)
     for i in range(45):
-        assert "HTTP_X_Q%d" % i in r["keys"]
+        assert f"HTTP_X_Q{i}" in r["keys"]
     assert r["none_values"] == []
 
 
@@ -194,11 +194,11 @@ def test_environ_key_table_is_presized(environ_server):
     r = _fetch(environ_server, "/", {"X-A": "1", "X-B": "2"})
     grown_from_empty = {}
     for i in range(r["len"]):
-        grown_from_empty["k%03d" % i] = i
+        grown_from_empty[f"k{i:03d}"] = i
     base = sys.getsizeof(grown_from_empty)
     naive_spare = 0
     for i in range(4096):
-        grown_from_empty["__p%d__" % i] = None
+        grown_from_empty[f"__p{i}__"] = None
         if sys.getsizeof(grown_from_empty) != base:
             break
         naive_spare += 1
