@@ -480,6 +480,73 @@ static int init_wsgi_keys(void) {
 
 /* ---- Server init / run ---- */
 
+/*
+ * Will libuv honour UV_TCP_REUSEPORT on THIS machine?
+ *
+ * setup.py can only answer a different question -- does the enum exist in the
+ * uv.h we compiled against -- and that answer is not the one callers need.  It
+ * is true on macOS, where every REUSEPORT bind then fails with ENOTSUP, and it
+ * is fixed at build time for a wheel that gets run on other machines.
+ *
+ * Asking the kernel instead is worse, not better.  macOS *has* SO_REUSEPORT:
+ * setsockopt succeeds, a second bind to the same port succeeds, and then the
+ * last binder takes every connection while the first gets none -- measured
+ * here at 40 out of 40.  That is BSD rebind semantics, not Linux's
+ * connection-distributing SO_REUSEPORT (FreeBSD added a separate option,
+ * SO_REUSEPORT_LB, to get the Linux behaviour, and that is what libuv uses
+ * there).  So a setsockopt probe answers a question nobody asked -- "does the
+ * option exist" -- and hands back a server where one worker serves everything.
+ *
+ * Which makes libuv's refusal a feature: it tracks the distinction we actually
+ * need.  And its own header is the argument against writing that list down
+ * anywhere in here -- uv.h, verbatim:
+ *
+ *     This flag is available only on Linux 3.9+, DragonFlyBSD 3.6+,
+ *     FreeBSD 12.0+, Solaris 11.4, and AIX 7.2.5+ for now.
+ *
+ * Note the version floors, and the "for now".  A platform *name* is not the
+ * capability either: Linux 3.8 and FreeBSD 11 compile the enum and fail the
+ * behaviour, which is the same mistake as the compile-time probe one layer
+ * down.  Any table we kept here would be wrong for some machine and stale for
+ * the rest, so keep none: ask libuv directly, by doing the exact bind serve()
+ * would do, on an ephemeral loopback port, and throwing the socket away.  The
+ * side effect is one socket held for the length of a bind(); the answer is
+ * cached because it cannot change under a running process.
+ */
+int server_reuseport_supported(void) {
+#ifndef FREASTAL_REUSEPORT
+    /* Built against a uv.h with no UV_TCP_REUSEPORT: there is no flag to pass,
+     * so the honest answer is no, whatever the running kernel could do. */
+    return 0;
+#else
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+
+    uv_loop_t loop;
+    if (uv_loop_init(&loop) != 0) {
+        /* Don't cache a failure that says nothing about REUSEPORT. */
+        return 0;
+    }
+
+    int supported = 0;
+    uv_tcp_t probe;
+    if (uv_tcp_init(&loop, &probe) == 0) {
+        struct sockaddr_in addr;
+        uv_ip4_addr("127.0.0.1", 0, &addr);
+        supported = uv_tcp_bind(&probe, (const struct sockaddr *)&addr,
+                                UV_TCP_REUSEPORT) == 0;
+        uv_close((uv_handle_t *)&probe, NULL);
+    }
+    /* uv_loop_close() returns EBUSY unless the close callback has run. */
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    cached = supported;
+    return cached;
+#endif
+}
+
 int server_init(PyObject *app, const char *host, int port, bool reuse_port,
                 const char *certfile, const char *keyfile, int listen_fd) {
 #ifndef FREASTAL_TLS

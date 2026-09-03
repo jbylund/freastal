@@ -116,7 +116,24 @@ static PyObject *py_tls_buffer_stats(PyObject *self, PyObject *args) {
 #endif
 }
 
+
+/* ---- freastal.reuse_port_supported() ---- */
+
+static PyObject *py_reuse_port_supported(PyObject *self, PyObject *args) {
+    (void)self; (void)args;
+    return PyBool_FromLong(server_reuseport_supported());
+}
+
 static PyMethodDef freastal_methods[] = {
+    {
+        "reuse_port_supported",
+        py_reuse_port_supported,
+        METH_NOARGS,
+        "reuse_port_supported()\n\n"
+        "True if libuv on THIS machine will honour UV_TCP_REUSEPORT, probed by\n"
+        "attempting the bind rather than inferred from the platform name or\n"
+        "from what setup.py saw at build time.",
+    },
     {
         "tls_buffer_stats",
         py_tls_buffer_stats,
@@ -194,6 +211,11 @@ PyMODINIT_FUNC PyInit__freastal(void) {
      * Without it the C layer used to drop a reuse_port=True request on the
      * floor; exporting the flag lets serve() refuse instead of pretending. */
 #ifdef FREASTAL_REUSEPORT
+    /* Retained only to say whether the *flag exists* in the uv.h this was
+     * compiled against. Whether it will be honoured is a runtime question and
+     * is answered by reuse_port_supported(); a wheel built on one machine runs
+     * on another, and macOS compiles the enum then fails every REUSEPORT bind
+     * with ENOTSUP. Callers want the function, not this. */
     PyModule_AddIntConstant(m, "HAS_REUSE_PORT", 1);
 #else
     PyModule_AddIntConstant(m, "HAS_REUSE_PORT", 0);

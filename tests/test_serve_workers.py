@@ -38,6 +38,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -258,6 +259,27 @@ def _run_snippet(body, timeout=30):
     )
 
 
+def _run_module(body, timeout=30):
+    """Run a snippet from a real file, not `python -c`.
+
+    Necessary wherever the snippet starts workers: a spawned child re-imports
+    __main__ *by path*, and `-c` code has no path, so the child cannot bring
+    the module back. The snippet would then hang instead of reporting whatever
+    it was written to report.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "snippet.py")
+        with open(path, "w") as f:
+            f.write(textwrap.dedent(body))
+        return subprocess.run(
+            [sys.executable, path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+
 # ---------------------------------------------------------------------------
 # The grid
 # ---------------------------------------------------------------------------
@@ -439,16 +461,19 @@ def test_reuse_port_true_is_refused_where_it_cannot_work(entry):
 def test_reuse_port_resolution_is_explicit_about_what_it_chose():
     """The tri-state resolves the same way the bind path will behave.
 
-    reuse_port=None is "auto": on only where it does something, which means
-    more than one worker and a kernel that spreads connections.  An explicit
-    False stays False everywhere.
+    reuse_port=None is "auto": on wherever the kernel will honour it, off
+    everywhere else.  An explicit False stays False everywhere.
     """
     assert freastal._resolve_reuse_port(False, workers=4) is False
     assert freastal._resolve_reuse_port(False, workers=1) is False
 
-    # Auto never turns it on at one worker -- there is nothing to balance, and
-    # turning it on there is precisely what made bug 1 reachable by default.
-    assert freastal._resolve_reuse_port(None, workers=1) is False
+    # Auto keys off the capability, NOT off the worker count. Gating it on
+    # workers>1 would read as harmless -- there is nothing to balance at one
+    # worker -- but it turns reuse_port off at workers=1 on Linux, where
+    # nothing was broken, and breaks a zero-downtime restart done by
+    # overlapping two single-worker processes on the same port: the second
+    # bind starts failing with EADDRINUSE at deploy time.
+    assert freastal._resolve_reuse_port(None, workers=1) is KERNEL_LOAD_BALANCES
     assert freastal._resolve_reuse_port(None, workers=4) is KERNEL_LOAD_BALANCES
 
     if KERNEL_LOAD_BALANCES:
@@ -462,8 +487,15 @@ def test_kernel_capability_matches_libuv_platform_list():
     """freastal's notion of "this kernel load-balances" is the one libuv uses.
 
     Kept as a test because the two have to agree: the single-worker path still
-    hands reuse_port to uv_tcp_bind, which fails with ENOTSUP anywhere outside
-    that list, so a more optimistic answer here turns into a bind failure there.
+    hands reuse_port to uv_tcp_bind, which fails with ENOTSUP anywhere libuv
+    will not honour the flag, so a more optimistic answer here turns into a
+    bind failure there.
+
+    Note that freastal keeps no platform table of its own -- this asks the
+    extension, which probes by attempting the bind. A table would restate a
+    list libuv owns, go stale as libuv adds platforms, and still be wrong on
+    old kernels: uv.h requires Linux 3.9+, DragonFlyBSD 3.6+, FreeBSD 12.0+,
+    Solaris 11.4 or AIX 7.2.5+, so a platform *name* is not the capability.
     """
     assert freastal._kernel_load_balances_reuse_port() is KERNEL_LOAD_BALANCES
 
@@ -546,11 +578,20 @@ def test_app_that_cannot_reach_the_worker_is_reported():
     the failure still has to be visible rather than a server that silently
     never serves.
     """
+    if mp.get_start_method() == "fork":
+        pytest.skip(
+            "fork does not pickle the target, so an unpicklable app is not an "
+            "error there; this is a spawn/forkserver requirement"
+        )
+    # A real file, not `python -c`: a spawned child re-imports __main__ by
+    # path, and there is no path for -c code, so the snippet would hang rather
+    # than report the very failure under test.
     port = _free_port()
-    result = _run_snippet(f"""
+    result = _run_module(f"""
         import freastal
         app = lambda environ, start_response: []
-        freastal.serve(app, host="{HOST}", port={port}, workers=2)
+        if __name__ == "__main__":
+            freastal.serve(app, host="{HOST}", port={port}, workers=2)
     """)
     assert result.returncode != 0
     assert "pickle" in result.stderr.lower() or "RuntimeError" in result.stderr, (

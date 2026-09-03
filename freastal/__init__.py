@@ -31,30 +31,49 @@ __all__ = ["__version__", "serve", "serve_asgi"]
 # delivers every connection to one socket in the group -- measured at 60/60 to
 # a single listener out of three.  A probe that only checked setsockopt+bind
 # would call that "supported" and be wrong in exactly the way that matters.
-_LOAD_BALANCING_PLATFORMS = ("linux", "freebsd", "dragonfly", "sunos")
-
-
 def _kernel_load_balances_reuse_port():
-    """True where SO_REUSEPORT actually distributes connections across workers."""
-    return sys.platform.startswith(_LOAD_BALANCING_PLATFORMS) and hasattr(
-        socket, "SO_REUSEPORT"
-    )
+    """True if libuv on THIS machine will honour UV_TCP_REUSEPORT.
+
+    Asks the extension, which probes by attempting the bind. Deliberately not a
+    platform table and not a setsockopt check:
+
+    * A table restates a list libuv owns and goes stale as libuv adds
+      platforms. It is also wrong on old kernels regardless -- uv.h says the
+      flag needs "Linux 3.9+, DragonFlyBSD 3.6+, FreeBSD 12.0+, Solaris 11.4,
+      and AIX 7.2.5+ for now", so a platform *name* is not the capability.
+    * A setsockopt probe is worse than useless. macOS *has* SO_REUSEPORT:
+      setsockopt succeeds, a second bind to the same port succeeds, and then
+      the last binder takes every connection while the first gets none --
+      measured at 40 out of 40. That is BSD rebind semantics, not Linux's
+      connection-distributing SO_REUSEPORT, and a probe that answers "does the
+      option exist" hands back a server where one worker serves everything.
+    * setup.py can only say whether the enum was in the uv.h it compiled
+      against, which is fixed into a wheel that then runs on other machines.
+
+    libuv's refusal tracks the distinction that matters, so ask libuv.
+    """
+    return bool(_freastal.reuse_port_supported())
 
 
 def _resolve_reuse_port(reuse_port, workers):
     """Turn the tri-state reuse_port into the bool the bind path will use.
 
-    None means "auto": on only where it does something, which is more than one
-    worker plus a kernel that load-balances.  It used to default to True, which
-    meant a bare freastal.serve(app) could not bind at all on macOS (issue #48),
-    for a flag that does nothing whatsoever at one worker.
+    None means "auto": on wherever the kernel will honour it, off everywhere
+    else.  It used to default to True, which meant a bare freastal.serve(app)
+    could not bind at all on macOS (#49).
+
+    Auto keys off the capability, not off the worker count.  Turning it off at
+    workers=1 would be a behaviour change on Linux -- the one platform where
+    nothing was broken -- and would break a zero-downtime restart done by
+    overlapping two single-worker processes on the same port, which relies on
+    today's default and would start failing with EADDRINUSE at deploy time.
 
     True on a platform or build that cannot honour it raises.  Ignoring it would
     hand back a server that looks like it has N workers and behaves like it has
     one, and that silence is why the broken default survived this long.
     """
     if reuse_port is None:
-        return bool(workers > 1 and _kernel_load_balances_reuse_port())
+        return _kernel_load_balances_reuse_port()
 
     if not reuse_port:
         return False
@@ -68,14 +87,6 @@ def _resolve_reuse_port(reuse_port, workers):
             "the same reason.  Leave reuse_port unset (or pass False) and "
             "freastal shares one bound listening socket across the workers "
             "instead, which does load-balance."
-        )
-
-    if not getattr(_freastal, "HAS_REUSE_PORT", 0):
-        raise ValueError(
-            "reuse_port=True was requested but this freastal was built against "
-            "a libuv without UV_TCP_REUSEPORT, so the flag cannot be set.  "
-            "Rebuild against libuv >= 1.44, or leave reuse_port unset to share "
-            "one bound listening socket across the workers."
         )
 
     return True
@@ -111,6 +122,16 @@ def _wsgi_worker(worker_id, sock, app, host, port, certfile, keyfile):
     re-imports rather than inheriting, so the app has to be picklable -- in
     practice a module-level callable.
     """
+    # A worker has to die when the supervisor terminates it.  Under fork it
+    # inherits the supervisor's Python-level SIGTERM handler, and a Python
+    # handler cannot run while server_run() is inside uv_run with the GIL
+    # released: an idle worker would not notice SIGTERM until its next request,
+    # the supervisor's join() would time out, and the worker would be
+    # reparented to init and left running -- 54 of them after one test run.
+    # Restoring the default disposition kills the process in the kernel.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
     print(f"[freastal] worker {worker_id} pid={os.getpid()} starting", flush=True)
     try:
         _serve_single(
@@ -127,6 +148,16 @@ def _wsgi_worker(worker_id, sock, app, host, port, certfile, keyfile):
 
 def _asgi_worker(worker_id, sock, app, host, port, certfile, keyfile):
     """As _wsgi_worker, with a fresh event loop per worker."""
+    # A worker has to die when the supervisor terminates it.  Under fork it
+    # inherits the supervisor's Python-level SIGTERM handler, and a Python
+    # handler cannot run while server_run() is inside uv_run with the GIL
+    # released: an idle worker would not notice SIGTERM until its next request,
+    # the supervisor's join() would time out, and the worker would be
+    # reparented to init and left running -- 54 of them after one test run.
+    # Restoring the default disposition kills the process in the kernel.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
     print(f"[freastal] ASGI worker {worker_id} pid={os.getpid()} starting", flush=True)
     try:
         loop = asyncio.new_event_loop()
@@ -182,8 +213,16 @@ def _run_workers(worker, app, host, port, workers, reuse_port, certfile, keyfile
             p.join(timeout=5)
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    # Pre-existing, and hit for real by anything that calls serve() off the
+    # main thread: signal.signal raises ValueError there.  Terminating the
+    # workers on SIGINT is a convenience, so failing to arm it must not stop
+    # the server from starting -- the workers are daemon=True and die with the
+    # parent regardless.
+    try:
+        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+    except ValueError:
+        pass
 
     for i in range(workers):
         p = multiprocessing.Process(
