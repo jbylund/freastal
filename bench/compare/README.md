@@ -28,7 +28,7 @@ figures between servers measured identically, not as absolute capacity.
 
 ## What it measures
 
-Five configurations, all serving the same body with the same headers:
+Six configurations, all serving the same body with the same headers:
 
 | row | launched as |
 |---|---|
@@ -36,10 +36,13 @@ Five configurations, all serving the same body with the same headers:
 | bjoern, WSGI | one listening socket, `N` pre-forked processes |
 | freastal, WSGI | `freastal.serve(..., workers=N)` |
 | freastal, ASGI | `freastal.serve_asgi(..., workers=N)` |
-| freastal, TLS 1.3 | `freastal.serve(..., certfile=..., keyfile=...)` |
+| freastal, WSGI + TLS 1.3 | `freastal.serve(..., certfile=..., keyfile=...)` |
+| freastal, ASGI + TLS 1.3 | `freastal.serve_asgi(..., certfile=..., keyfile=...)` |
 
-TLS is WSGI-only because `serve_asgi()` takes no `certfile`/`keyfile`. That
-looks like an oversight rather than a design choice.
+Each is measured at every `--worker-counts` and `--bodies` value, so the
+published table is that grid: protocol x TLS x workers x body size. Comparing
+along one axis at a time is the point - TLS against plaintext at the same
+worker count, or one worker against four for the same server.
 
 ## Three fairness traps this harness exists to avoid
 
