@@ -19,4 +19,11 @@ void  tls_bigbuf_put(void *buf, size_t cap);
 /* Hand back every block tls_write_response_impl() chained onto c->tls_wblock.
  * Safe to call on a connection that never wrote one, plaintext included. */
 void  tls_release_wbuf(client_t *c);
+
+/* Read-overflow blocks, recycled the same way. */
+void *tls_spill_get(void);
+void  tls_spill_put(void *block);
+/* Release c->tls_spill if it holds one.  Safe on a connection that never
+ * overflowed, and on plaintext connections. */
+void  tls_release_spill(client_t *c);
 #endif /* FREASTAL_TLS */

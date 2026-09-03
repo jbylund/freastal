@@ -112,6 +112,8 @@ static void on_tls_hs_write(uv_write_t *req, int status);
 static void tls_hs_send(client_t *c, ptls_buffer_t *outbuf);
 static void tls_on_read_data(client_t *c, uv_stream_t *stream, const char *data, size_t nread);
 static void tls_write_response_impl(client_t *c);
+static void tls_spill_drain(client_t *c);
+static void tls_read_flow(client_t *c, uv_stream_t *stream);
 #endif
 
 /* ---- libuv I/O callbacks ---- */
@@ -125,6 +127,13 @@ static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
     client_t *c = (client_t *)handle;
 #ifdef FREASTAL_TLS
     if (c->tls) {
+        /*
+         * Deliberately not bounded by the free space in read_buf, the way the
+         * plaintext branch below is: libuv is being handed a *ciphertext*
+         * buffer, and how much plaintext it becomes is not known until
+         * ptls_receive() has run.  Whatever read_buf cannot take is kept in
+         * the spill and folded back in by tls_spill_drain().
+         */
         buf->base = c->tls_enc;
         buf->len  = TLS_ENC_BUF_SIZE;
         return;
@@ -202,15 +211,14 @@ int http_dispatch(client_t *c, uv_stream_t *stream) {
      * in_flight is what keeps the protocol correct in its place: a pipelined
      * request that arrives now accumulates in read_buf and is dispatched by
      * on_write, so responses cannot interleave on the wire.
+     *
+     * The encrypted path used to stop the read here, because a TLS read
+     * cannot be bounded by the free space in read_buf.  It no longer needs
+     * to: what does not fit is kept in the spill (see tls_spill_drain) and
+     * tls_read_flow() stops the read only once there is genuinely nowhere to
+     * put more.
      */
     c->in_flight = true;
-#ifdef FREASTAL_TLS
-    /* TLS records decrypt into read_buf and the plaintext size cannot be
-     * predicted from the ciphertext, so there is no read at which the
-     * encrypted path could safely stop.  Keep its existing behaviour of not
-     * reading at all while a response is outstanding. */
-    if (c->tls) { uv_read_stop(stream); c->read_armed = false; }
-#endif
     GIL_LOCK();
     if (g_server.asgi_mode)
         asgi_dispatch(c);
@@ -306,8 +314,11 @@ void write_response(client_t *c) {
 static void on_write(uv_write_t *req, int status) {
     client_t *c = CONTAINER_OF(req, client_t, write_req);
 #ifdef FREASTAL_TLS
-    /* uv_write held a pointer into tls_wbuf until now; this is the earliest
-     * point at which the block may go back to the pool. */
+    /* uv_write held a pointer into every block of the chain until now; this is
+     * the earliest point at which they may go back to the pool.  It runs before
+     * the close branch below, so a connection torn down here still releases
+     * them; tls_conn_free() repeats the call for the paths that never got a
+     * write, and it is idempotent. */
     if (c->tls) tls_release_wbuf(c);
 #endif
 
@@ -329,14 +340,24 @@ static void on_write(uv_write_t *req, int status) {
     client_reset(c);
     c->in_flight = false;
 
+#ifdef FREASTAL_TLS
+    /* client_reset() has just slid read_buf down, so anything a read could not
+     * fit into it goes back in now -- before the parse below, which is what
+     * makes the request it belongs to complete. */
+    if (c->tls) tls_spill_drain(c);
+#endif
+
     /* A pipelined request may already be buffered.  Dispatch it directly. */
     if (c->read_len > 0 && http_dispatch(c, (uv_stream_t *)&c->handle) < 0)
         return;
 
+#ifdef FREASTAL_TLS
+    if (c->tls) { tls_read_flow(c, (uv_stream_t *)&c->handle); return; }
+#endif
+
     /* Reading is normally still armed, so there is nothing to do here.  It is
-     * only ever off because on_read hit a full read_buf, or because this is
-     * the TLS path, and in both cases it goes back on as soon as read_buf has
-     * room and no response is outstanding. */
+     * only ever off because on_read hit a full read_buf, and it goes back on
+     * as soon as read_buf has room and no response is outstanding. */
     if (unlikely(!c->read_armed) && !c->in_flight) {
         c->read_armed = true;
         uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read);
@@ -570,6 +591,107 @@ static void tls_hs_send(client_t *c, ptls_buffer_t *outbuf) {
     uv_write(&hw->req, (uv_stream_t *)&c->handle, &uvbuf, 1, on_tls_hs_write);
 }
 
+/*
+ * Overflow plaintext.
+ *
+ * alloc_cb cannot bound a TLS read by the free space in read_buf, so a read
+ * can decrypt to more plaintext than read_buf has room for.  This used to end
+ * the connection; it now keeps the surplus here and folds it back in from
+ * on_write, once client_reset() has slid read_buf down.  The two requests that
+ * overlap in read_buf are then dispatched in order exactly as they are on the
+ * plaintext path, where the same situation just means the socket backs up for
+ * a moment.
+ *
+ * One invariant makes the rest of this safe to reason about: the spill is
+ * non-empty only while read_buf is completely full, because tls_spill_stash()
+ * is reached only after read_buf has been filled and tls_spill_drain() empties
+ * it into whatever room there is.  So a non-empty spill always has an
+ * in-flight response, or a request too large to serve, behind it -- never a
+ * connection that has quietly stopped making progress.
+ *
+ * A block is taken from the pool the first time a connection overflows and
+ * goes straight back the moment it drains, so an idle connection never holds
+ * one.  tls_conn_free() releases any block still held, and every close path
+ * reaches it through on_close.
+ */
+static int tls_spill_stash(client_t *c, const uint8_t *src, size_t len) {
+    if (unlikely((size_t)c->tls_spill_len + len > TLS_SPILL_SIZE))
+        return -1;                          /* see TLS_SPILL_SIZE: unreachable */
+    if (c->tls_spill == NULL && (c->tls_spill = tls_spill_get()) == NULL)
+        return -1;
+    memcpy(c->tls_spill + c->tls_spill_len, src, len);
+    c->tls_spill_len += (int)len;
+    return 0;
+}
+
+static void tls_spill_drain(client_t *c) {
+    if (likely(c->tls_spill_len == 0)) return;
+    size_t room = (size_t)(READ_BUF_SIZE - c->read_len);
+    if (room == 0) return;
+    size_t take = (size_t)c->tls_spill_len < room ? (size_t)c->tls_spill_len : room;
+    memcpy(c->read_buf + c->read_len, c->tls_spill, take);
+    c->read_len += (int)take;
+    c->tls_spill_len -= (int)take;
+    if (c->tls_spill_len > 0)
+        memmove(c->tls_spill, c->tls_spill + take, (size_t)c->tls_spill_len);
+    else
+        tls_release_spill(c);   /* empty: back to the pool, not held to close */
+}
+
+/*
+ * Give up on a connection whose TLS state is unusable.
+ *
+ * Reading stays armed across a response now, so a decryption failure can be
+ * discovered while uv_write still holds the response buffers.  Closing here
+ * would complete that write with UV_ECANCELED, and on_write would then close
+ * a second time, which libuv aborts on -- the same trap the nread < 0 branch
+ * of on_read documents.  uv_is_closing() cannot be the answer either: it
+ * would stop this close from repeating, not on_write's.  So when a response
+ * is outstanding, stop reading and let on_write do the closing; keep_alive =
+ * false is what makes it take that branch.
+ */
+static void tls_read_failed(client_t *c, uv_stream_t *stream) {
+    if (unlikely(c->in_flight)) {
+        c->keep_alive = false;
+        if (c->read_armed) { uv_read_stop(stream); c->read_armed = false; }
+        return;
+    }
+    uv_close((uv_handle_t *)&c->handle, on_close);
+}
+
+/*
+ * Decide whether the connection should be reading, having just changed what
+ * read_buf and the spill hold.  The encrypted counterpart of the tail of
+ * on_read(): reading stays armed across a response and stops only when a read
+ * would have nowhere to put what it delivered.
+ */
+static void tls_read_flow(client_t *c, uv_stream_t *stream) {
+    if (unlikely(uv_is_closing((uv_handle_t *)&c->handle))) return;
+
+    if (unlikely(c->read_len >= READ_BUF_SIZE && !c->in_flight)) {
+        /*
+         * read_buf is full, no complete request came out of it, and no
+         * response is running that could free any of it -- so the request is
+         * itself larger than READ_BUF_SIZE and nothing will ever finish it.
+         * The plaintext path reaches the same verdict by way of a zero-length
+         * alloc_cb and UV_ENOBUFS.
+         */
+        if (c->read_armed) { uv_read_stop(stream); c->read_armed = false; }
+        uv_close((uv_handle_t *)&c->handle, on_close);
+        return;
+    }
+
+    bool want = (c->read_len < READ_BUF_SIZE) && (c->tls_spill_len == 0);
+    if (want == c->read_armed) return;
+    if (want) {
+        c->read_armed = true;
+        uv_read_start(stream, alloc_cb, on_read);
+    } else {
+        uv_read_stop(stream);
+        c->read_armed = false;
+    }
+}
+
 static void tls_on_read_data(client_t *c, uv_stream_t *stream,
                               const char *data, size_t nread) {
     if (!c->tls_hs_done) {
@@ -584,7 +706,7 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
             if (inlen < nread)
                 tls_on_read_data(c, stream, data + inlen, nread - inlen);
         } else if (ret != PTLS_ERROR_IN_PROGRESS) {
-            uv_close((uv_handle_t *)&c->handle, on_close);
+            tls_read_failed(c, stream);
         }
         return;
     }
@@ -611,22 +733,40 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
         size_t inlen = nread - off;
         if (ptls_receive(c->tls, &plain, data + off, &inlen) != 0) {
             ptls_buffer_dispose(&plain);
-            uv_close((uv_handle_t *)&c->handle, on_close);
+            tls_read_failed(c, stream);
             return;
         }
         if (unlikely(inlen == 0)) break;   /* no progress; nothing left to parse */
         off += inlen;
     }
     if (plain.off == 0) { ptls_buffer_dispose(&plain); return; }
-    if (c->read_len + (int)plain.off > READ_BUF_SIZE) {
-        ptls_buffer_dispose(&plain);
-        uv_close((uv_handle_t *)&c->handle, on_close);
+
+    /* Take what fits; the rest waits in the spill until a response completes
+     * and makes room.  Overflowing here is not an error and not a large
+     * request -- two ordinary pipelined requests that happen to straddle the
+     * end of read_buf do it. */
+    size_t room = (size_t)(READ_BUF_SIZE - c->read_len);
+    size_t take = plain.off < room ? plain.off : room;
+    memcpy(c->read_buf + c->read_len, plain.base, take);
+    c->read_len += (int)take;
+    int stashed = 0;
+    if (unlikely(take < plain.off))
+        stashed = tls_spill_stash(c, plain.base + take, plain.off - take);
+    ptls_buffer_dispose(&plain);
+    if (unlikely(stashed < 0)) {
+        tls_read_failed(c, stream);
         return;
     }
-    memcpy(c->read_buf + c->read_len, plain.base, plain.off);
-    c->read_len += (int)plain.off;
-    ptls_buffer_dispose(&plain);
-    http_dispatch(c, stream);
+
+    /*
+     * Reading is armed across a response now, so this can run with one in
+     * flight.  Dispatching then would put a second response on the wire
+     * underneath the first; the bytes just accumulate instead and on_write
+     * dispatches them, which is exactly what the plaintext on_read() does.
+     */
+    if (likely(!c->in_flight) && unlikely(http_dispatch(c, stream) < 0))
+        return;
+    tls_read_flow(c, stream);
 }
 
 /* Bytes ptls_send() will append for a plaintext run of len: the payload plus

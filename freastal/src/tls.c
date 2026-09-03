@@ -5,6 +5,50 @@
 #include <openssl/evp.h>
 #include <stdio.h>
 
+/*
+ * picotls' own default, ptls_openssl_key_exchanges[], holds secp256r1 and
+ * nothing else.  Chrome and Firefox do list P-256 in supported_groups, but
+ * neither ever sends a P-256 key share -- they guess X25519MLKEM768 and
+ * X25519 -- so a P-256-only server matches nothing in the first ClientHello
+ * and has to answer with a HelloRetryRequest.  That is an extra round trip on
+ * every new browser connection, plus a keygen both ends then discard, before
+ * settling on the slower of the two curves anyway.
+ *
+ * Membership, not order, is what fixes it.  Both selection sites in picotls
+ * iterate the *client's* list on the outside and ours on the inside:
+ * select_key_share() walks the client's key_share entries and assigns
+ * *selected only while it is still NULL, and select_negotiated_group() walks
+ * the client's supported_groups and returns on its first hit.  The client's
+ * preference decides; the order below is documentation.
+ *
+ * secp384r1 and secp521r1 are deliberately absent.  RFC 8446 makes secp256r1
+ * mandatory for conformant TLS 1.3 clients, so P-256 is already the universal
+ * floor and the larger curves buy no interop -- what they would buy is a
+ * client-chosen cost, since an unauthenticated peer that offers secp521r1 --
+ * as a key share, or first in supported_groups on the retry path -- would
+ * make us do a P-521 ECDH per handshake for no security X25519 does not
+ * already give us.  ptls_openssl_key_exchanges_all[] is not the answer
+ * either: on top of those two curves it carries the bare mlkem512/768/1024
+ * groups, which have no classical component at all, whereas the hybrid keeps
+ * X25519 underneath as a floor.
+ *
+ * Both macros below are always defined by picotls/openssl.h, to 0 when the
+ * algorithm is unavailable, and secp256r1 is unconditional, so every
+ * combination yields a valid list.  OpenSSL < 3.5 degrades to
+ * {x25519, secp256r1}; CI builds that path and the tests confirm it
+ * negotiates X25519 without a retry.  LibreSSL sets neither macro and would
+ * land back on today's {secp256r1} -- read off the header, not built here.
+ */
+static ptls_key_exchange_algorithm_t *freastal_key_exchanges[] = {
+#if PTLS_OPENSSL_HAVE_X25519MLKEM768
+    &ptls_openssl_x25519mlkem768,
+#endif
+#if PTLS_OPENSSL_HAVE_X25519
+    &ptls_openssl_x25519,
+#endif
+    &ptls_openssl_secp256r1,
+    NULL};
+
 int tls_server_init(const char *certfile, const char *keyfile) {
     tls_server_t *ts = &g_server.tls;
     memset(ts, 0, sizeof(*ts));
@@ -30,7 +74,25 @@ int tls_server_init(const char *certfile, const char *keyfile) {
 
     ts->ctx.random_bytes     = ptls_openssl_random_bytes;
     ts->ctx.get_time         = &ptls_get_time;
-    ts->ctx.key_exchanges    = ptls_openssl_key_exchanges;
+    ts->ctx.key_exchanges    = freastal_key_exchanges;
+    /*
+     * ptls_openssl_cipher_suites[] names AES-256-GCM-SHA384 first, which reads
+     * like a misordering but is not, and is left alone on purpose.  The memset
+     * above leaves ctx.server_cipher_preference at 0, so select_cipher()
+     * honors the *client's* order and this list is only a membership filter:
+     * browsers on AES-capable hardware ask for AES-128-GCM-SHA256 first and
+     * get it, browsers without AES instructions ask for ChaCha20-Poly1305
+     * first and get that.  Both are the right answer for the peer that asked,
+     * and choosing for them here would only make one of the two cases worse.
+     * Entry 0 is not wholly arbitrary -- cipher_suites[0]->hash is the one
+     * fixed position picotls reads, as the HMAC hash for stateless-retry
+     * cookies (calc_cookie_signature, plus the two sites that size and verify
+     * that signature), and that path needs a hash before any suite has been
+     * negotiated.  But picotls.h documents no ordering rule for the list, and
+     * we pass no handshake properties, so cookies are never enabled here.
+     * picotls annotates its own array "ciphers used with sha384 (must be
+     * first)"; whatever that is for, the vendored order is left as it is.
+     */
     ts->ctx.cipher_suites    = ptls_openssl_cipher_suites;
     ts->ctx.sign_certificate = &ts->sign_cert.super;
 
@@ -195,20 +257,63 @@ void tls_release_wbuf(client_t *c) {
     }
 }
 
+/* Same free-list-in-the-first-word shape as tls_wbuf_get()/put() above. */
+void *tls_spill_get(void) {
+    void *block = g_server.tls_spill_pool;
+    if (block != NULL) {
+        g_server.tls_spill_pool = *(void **)block;
+        g_server.tls_spill_pool_n--;
+        return block;
+    }
+    return malloc(TLS_SPILL_SIZE);
+}
+
+void tls_spill_put(void *block) {
+    if (unlikely(g_server.tls_spill_pool_n >= TLS_SPILL_POOL_MAX)) {
+        free(block);
+        return;
+    }
+    *(void **)block = g_server.tls_spill_pool;
+    g_server.tls_spill_pool = block;
+    g_server.tls_spill_pool_n++;
+}
+
+void tls_release_spill(client_t *c) {
+    if (c->tls_spill != NULL) {
+        tls_spill_put(c->tls_spill);
+        c->tls_spill = NULL;
+    }
+    c->tls_spill_len = 0;
+}
+
 void tls_conn_init(client_t *c) {
     c->tls_enc     = malloc(TLS_ENC_BUF_SIZE);
     c->tls         = ptls_new(&g_server.tls.ctx, 1 /* is_server */);
     c->tls_hs_done = false;
     c->tls_wblock  = NULL;
-    c->tls_wbig    = NULL;
+    c->tls_wbig      = NULL;
+    c->tls_spill     = NULL;
+    c->tls_spill_len = 0;
 }
 
 void tls_conn_free(client_t *c) {
     free(c->tls_enc); c->tls_enc = NULL;
-    if (c->tls) { ptls_free(c->tls); c->tls = NULL; }
     /* Reached on every close path, including the ones that never wrote a
      * response (400 Bad Request, handshake failure) and plaintext connections,
-     * for which this is a no-op. */
+     * for which both releases are a no-op.  The spill is normally handed back
+     * by tls_spill_drain() as soon as it empties; this catches a connection
+     * torn down while one was still held.
+     *
+     * The tls_release_wbuf() call is normally redundant -- on_write has
+     * already run it, and it is idempotent -- but it is load-bearing on the
+     * paths where tls_write_response_impl() closes without ever reaching
+     * uv_write: a block or the oversized buffer could not be allocated, or
+     * ptls_send() failed partway through and it took the abandon branch.
+     * Those are all out-of-memory paths, so no test reaches them without an
+     * allocation-failure hook; deleting this as dead code would leak the whole
+     * chain the first time the pool and malloc both came up empty. */
+    tls_release_spill(c);
+    if (c->tls) { ptls_free(c->tls); c->tls = NULL; }
     tls_release_wbuf(c);
     c->tls_hs_done = false;
 }

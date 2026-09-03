@@ -14,6 +14,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -630,6 +631,225 @@ def test_two_records_in_one_segment(sized_tls_server):
             assert body == expected_body(n), f"size {n} in coalesced records"
 
 
+# --- A record fragmented across segments, with a request behind it ------
+def _record_stream(sock, outgoing, requests):
+    """Encrypt each request separately and return the concatenated records."""
+    out = b""
+    for req in requests:
+        sock.write(req)
+        out += outgoing.read()
+    return out
+
+
+def _big_request(total):
+    """A POST whose headers and body come to exactly `total` bytes.
+
+    16384 of plaintext is the largest a single TLS record can carry, and it is
+    also exactly READ_BUF_SIZE, which is what makes it the interesting size.
+    """
+    head = b"POST /n/500 HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n"
+    body_len = total
+    for _ in range(5):  # settles immediately; the length field barely moves
+        body_len = total - len(head % body_len)
+    request = (head % body_len) + b"x" * body_len
+    assert len(request) == total, len(request)
+    return request
+
+
+def test_split_record_then_pipelined_request(sized_tls_server):
+    """A record fragmented across segments, then a pipelined request behind it.
+
+    This is the case that used to drop the connection outright.  picotls
+    buffers an incomplete record internally, so the *second* read emits the
+    whole 16KB record's plaintext plus the small request that followed it in
+    the same segment -- more plaintext than READ_BUF_SIZE -- and the old code
+    answered that by closing the socket rather than by pacing the decryption.
+
+    Splitting the first record is what makes it reachable: without the split,
+    one read can never emit more plaintext than the ciphertext it took in.
+    """
+    _proto, port = sized_tls_server
+    big = _big_request(16384)
+    small = b"GET /n/300 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+
+    with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
+        sock, incoming, outgoing = _handshake_over_bio(raw, tls_context())
+        records = _record_stream(sock, outgoing, [big, small])
+        # One maximum-sized record followed by a small one.
+        assert len(records) > 16384, len(records)
+
+        raw.sendall(records[:16000])  # first record, incomplete
+        time.sleep(0.3)  # force a separate read, leaving a partial record
+        raw.sendall(records[16000:])  # its tail plus the whole second record
+
+        raw.settimeout(20)
+        reader = _BioReader(raw, sock, incoming)
+        buf = b""
+        body, buf = _read_one_response(reader, buf)
+        assert body == expected_body(500), "large request lost"
+        body, buf = _read_one_response(reader, buf)
+        assert body == expected_body(300), "pipelined request behind it lost"
+
+
+# --------------------------------------------------------------------------
+# What the handshake negotiated, not merely that it completed.
+#
+# Every test above drives the server with Python's ssl module, which offers
+# P-256 and eats a HelloRetryRequest without comment -- so it can never tell
+# which groups the server actually knows.  Browsers can: Chrome and Firefox
+# list P-256 in supported_groups but send key shares only for X25519MLKEM768
+# and X25519.  A server that knows P-256 alone matches no share and answers
+# with a HelloRetryRequest: an extra round trip on every new connection,
+# invisible to a keep-alive benchmark and to everything above.
+#
+# These drive `openssl s_client`, the only client here that can be told exactly
+# which groups and cipher suites to offer and will print what it exchanged.
+# They skip, never fail, when there is no s_client or it is too old for an
+# option or a group name.
+#
+# Two things about detecting the retry are easy to get wrong:
+#
+#   * P-256 must stay in -groups.  It sets supported_groups as well as the key
+#     shares, so `-groups X25519MLKEM768:X25519` leaves a P-256-only server
+#     nothing to retry *toward*: it fails the handshake outright rather than
+#     paying for a round trip.  That is a real case too, covered separately
+#     below, but it is not the browser one.
+#   * Grepping for "HelloRetryRequest" finds nothing either way.  A retry is a
+#     ServerHello on the wire, distinguished only by a sentinel random, and
+#     neither -msg nor -trace ever prints that name.  Counting ClientHellos
+#     does work: two means the client had to start over.
+# --------------------------------------------------------------------------
+
+S_CLIENT_TIMEOUT = 30
+
+# s_client refuses an option it does not have, or a group name this build does
+# not know, before it ever connects.  Both mean "this openssl is too old for
+# this assertion", not "the server is wrong".  Compared against a lowercased
+# transcript so the match does not hinge on the exact capitalization, which
+# has not been checked across releases.
+S_CLIENT_UNUSABLE = (
+    "call to ssl_conf_cmd",  # e.g. -groups X25519MLKEM768 on OpenSSL < 3.5
+    "unknown option",
+    "usage: s_client",
+)
+
+# A ClientHello as -msg announces it, so cert text mentioning the word cannot
+# be miscounted.
+_CLIENT_HELLO = re.compile(r"^>>> TLS 1\.3, Handshake .*ClientHello", re.MULTILINE)
+
+# s_client reports the negotiated group two different ways, and which one it
+# prints varies by release.  A hybrid KEM appears only in the summary line
+# ("Negotiated TLS1.3 group: X25519MLKEM768"), which 3.0 does not print at
+# all.  A plain curve appears only as the temp key, and the label differs:
+# 3.0.13 says "Server Temp Key: X25519, 253 bits" where 3.6.3 says "Peer Temp
+# Key" (with an "ECDH, " prefix for the NIST curves: "ECDH, prime256v1, 256
+# bits").  Those are the two releases actually observed -- where in between
+# the rename landed is not known, so accept both spellings rather than
+# switching on a version.  Miss one and a 3.0 handshake that did negotiate
+# X25519 reads as no handshake at all, which is what CI first caught.
+_GROUP_LINE = re.compile(r"Negotiated TLS1\.3 group:\s*(\S+)")
+_TEMP_KEY_LINE = re.compile(r"(?:Peer|Server) Temp Key:\s*(?:ECDH,\s*)?([^,\n]+)")
+
+GROUP_CASES = [
+    ("X25519MLKEM768:X25519:P-256", "X25519MLKEM768"),  # current Chrome/Firefox
+    ("X25519:P-256", "X25519"),  # a client with no post-quantum support
+]
+
+
+def s_client(port, args):
+    """Run one `openssl s_client` handshake, returning its whole transcript."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl s_client not available")
+    proc = subprocess.run(
+        ["openssl", "s_client", "-connect", f"127.0.0.1:{port}", *args],
+        input=b"",
+        capture_output=True,
+        timeout=S_CLIENT_TIMEOUT,
+        check=False,
+    )
+    out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+    lowered = out.lower()
+    for unusable in S_CLIENT_UNUSABLE:
+        if unusable in lowered:
+            pytest.skip(f"openssl s_client cannot run {' '.join(args)}: {unusable}")
+    return out
+
+
+def negotiated_group(trace):
+    m = _GROUP_LINE.search(trace)
+    if m is not None and m.group(1) != "<NULL>":
+        return m.group(1)
+    m = _TEMP_KEY_LINE.search(trace)
+    return m.group(1).strip() if m is not None else None
+
+
+def assert_single_round_trip(trace, groups):
+    hellos = len(_CLIENT_HELLO.findall(trace))
+    assert hellos == 1, (
+        f"-groups {groups}: {hellos} ClientHellos, so the server forced a "
+        f"HelloRetryRequest instead of accepting an offered key share"
+    )
+
+
+@pytest.mark.parametrize(("groups", "expected"), GROUP_CASES)
+def test_offered_key_share_is_accepted_without_a_retry(tls_server, groups, expected):
+    """The direct test for the P-256-only key_exchanges list.
+
+    Every group here is one the client sent a key share for, so a correct
+    server picks one and answers in a single round trip.
+    """
+    _proto, port = tls_server
+    trace = s_client(port, ["-groups", groups, "-msg"])
+    assert_single_round_trip(trace, groups)
+    assert negotiated_group(trace) == expected, (
+        f"-groups {groups}: negotiated {negotiated_group(trace)}, wanted {expected}"
+    )
+
+
+@pytest.mark.parametrize("groups", ["X25519MLKEM768:X25519", "X25519"])
+def test_handshake_without_p256_in_the_offer(tls_server, groups):
+    """A client that offers no P-256 at all must still get a handshake.
+
+    With P-256 absent from supported_groups there is nothing left to retry
+    with, so a P-256-only server fails outright rather than merely paying for
+    a round trip.
+    """
+    _proto, port = tls_server
+    trace = s_client(port, ["-groups", groups, "-msg"])
+    assert_single_round_trip(trace, groups)
+    assert negotiated_group(trace) is not None, (
+        f"-groups {groups}: no group negotiated - the handshake failed because "
+        f"the server supports none of the groups the client offered"
+    )
+
+
+@pytest.mark.parametrize(
+    ("ciphersuites", "expected"),
+    [
+        ("TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256"),
+        ("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"),
+    ],
+    ids=["client-prefers-aes128", "client-prefers-aes256"],
+)
+def test_cipher_follows_client_order(tls_server, ciphersuites, expected):
+    """Client preference decides the cipher, both ways round.
+
+    ctx.server_cipher_preference is left at 0, so select_cipher() takes the
+    first client-offered suite it supports and the order of
+    ptls_openssl_cipher_suites does not matter.  That is what lets a phone
+    without AES instructions get ChaCha20 instead of paying for AES in
+    software.  Anyone "fixing" the server list's apparently-backwards order by
+    turning server preference on breaks that, and breaks this.
+    """
+    _proto, port = tls_server
+    out = s_client(port, ["-ciphersuites", ciphersuites])
+    line = next((ln for ln in out.splitlines() if ln.startswith("New,")), None)
+    assert line is not None, f"s_client never completed a handshake:\n{out[-800:]}"
+    assert line.endswith(expected), (
+        f"client offered {ciphersuites}; server chose {line!r}, wanted {expected}"
+    )
+
+
 # TLS 1.3 caps a record's plaintext at 16KB and frames it with 22 bytes: a
 # 5-byte header outside the length field, then the content-type byte and the
 # 16-byte AEAD tag inside it.
@@ -892,6 +1112,52 @@ def test_handshake_failure_releases_cleanly(sized_tls_server):
         "127.0.0.1", port, context=tls_context(), timeout=20
     )
     try:
+        st = _stats(conn)
+        assert st["blocks_live"] == 0, st
+        assert st["bigbufs_live"] == 0, st
+    finally:
+        conn.close()
+
+
+def test_read_failure_while_a_segmented_response_is_writing(sized_tls_server):
+    """A decryption failure discovered while a multi-block response is on the
+    wire: the interaction between the deferred read teardown and the chain.
+
+    Reading stays armed across a response, so tls_read_failed() can fire while
+    uv_write still holds every block of a segmented response.  It must not
+    close there -- on_write would then close a second time, which libuv aborts
+    on -- so it defers, and on_write releases the chain and closes.  Nothing in
+    either change alone exercises that: before segmentation there was one
+    buffer rather than a chain, and before the read stayed armed this could not
+    happen at all.
+
+    Whether any one iteration wins the race depends on the response still being
+    on the wire when the bad record lands; instrumenting tls_read_failed()
+    while writing this showed 9 of 10 taking the deferred branch with blocks
+    held.  The counters are checked afterwards either way.
+    """
+    _proto, port = sized_tls_server
+    # 2000000 is a block chain; 3000000 is past TLS_WSEG_MAX, so it holds the
+    # oversized buffer instead.  Both have to survive the deferred teardown.
+    for n in [2_000_000, 3_000_000] * 3:
+        with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
+            sock, _incoming, outgoing = _handshake_over_bio(raw, tls_context())
+            sock.write(f"GET /n/{n} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+            raw.sendall(outgoing.read())
+            # A well-formed application-data record whose body cannot possibly
+            # authenticate: ptls_receive() fails while the response is still
+            # being written.
+            raw.sendall(b"\x17\x03\x03\x00\x20" + os.urandom(32))
+            with contextlib.suppress(OSError, ssl.SSLError):
+                while raw.recv(65536):
+                    pass
+
+    conn = http.client.HTTPSConnection(
+        "127.0.0.1", port, context=tls_context(), timeout=20
+    )
+    try:
+        conn.request("GET", "/n/65536")
+        assert len(conn.getresponse().read()) == 65536
         st = _stats(conn)
         assert st["blocks_live"] == 0, st
         assert st["bigbufs_live"] == 0, st
