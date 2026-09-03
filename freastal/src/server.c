@@ -963,9 +963,9 @@ static void tls_write_response_impl(client_t *c) {
      * call, into a block whose remaining capacity was checked first.
      *
      * Records pack greedily rather than one to a block.  A block holds 16896
-     * bytes and a maximal record is 16406, so a response header's record --
-     * a hundred-odd bytes on the wire -- rides in front of the first body
-     * record instead of costing a block and an iovec of its own.
+     * bytes and a maximal record is 16406, so a final short record -- up to
+     * 468 bytes of plaintext -- rides behind a maximal one instead of costing
+     * a block and a uv_write iovec of its own.
      *
      * The one thing that does not segment is a response big enough to drain
      * the pool: past TLS_WSEG_MAX blocks it takes a single oversized buffer
@@ -973,6 +973,16 @@ static void tls_write_response_impl(client_t *c) {
      * picotls with is_allocated = 0, exactly as a pooled block is, so it is
      * neither freed nor swept by picotls on release.  The block opened here
      * then carries only the chain node.
+     *
+     * Both counts below are taken over the whole stream, header included,
+     * because that is what ptls_send_v() cuts records out of.  Counting the
+     * header's records separately and adding -- which is what this did when
+     * the header was its own send -- predicts one record too many whenever the
+     * header fits in the slack of the body's last record.  That is enough to
+     * push a response needing exactly TLS_WSEG_MAX blocks onto the oversized
+     * path, and to reserve a record's framing more than the buffer needs.
+     * Under-counting would be the dangerous direction: it would run the chain
+     * past the end of uvbufs[TLS_WSEG_MAX].
      */
     size_t nrec      = tls_record_count(total);
     bool   oversized = unlikely(nrec > TLS_WSEG_MAX);
