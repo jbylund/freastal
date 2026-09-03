@@ -23,6 +23,16 @@
 /* Cap on retained blocks.  The pool's natural high-water mark is the number of
  * responses in flight at once, but a one-off burst should not pin its peak. */
 #  define TLS_WBUF_POOL_MAX        256
+/* Plaintext that one read produced and read_buf had no room for.
+ *
+ * A read hands picotls at most TLS_ENC_BUF_SIZE fresh ciphertext bytes on top
+ * of the one incomplete record it may already be holding, which parse_record()
+ * caps at 5 + PTLS_MAX_ENCRYPTED_RECORD_SIZE (vendor/picotls/lib/picotls.c).
+ * Every record costs at least 22 bytes of framing, so the plaintext a single
+ * ptls_receive() sweep can emit is strictly below the sum of the two; two
+ * whole encrypted records is comfortably above it. */
+#  define TLS_MAX_ENC_RECORD       (16384 + 256)
+#  define TLS_SPILL_SIZE           (2 * TLS_MAX_ENC_RECORD)
 typedef struct {
     ptls_context_t               ctx;
     ptls_openssl_sign_certificate_t sign_cert;
@@ -113,6 +123,8 @@ typedef struct client_s {
     bool          tls_hs_done;
     ptls_buffer_t tls_wbuf;  /* encrypted response buf; alive until on_write */
     void         *tls_wblock; /* pooled block backing tls_wbuf, or NULL if picotls owns it */
+    char         *tls_spill;  /* decrypted overflow, NULL until a read first overruns read_buf */
+    int           tls_spill_len;              /* bytes held in tls_spill */
 #endif
 
     /* --- Large buffers; NOT cleared by client_alloc().  Keep last. --- */

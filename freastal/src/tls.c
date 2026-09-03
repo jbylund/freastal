@@ -105,11 +105,15 @@ void tls_conn_init(client_t *c) {
     c->tls         = ptls_new(&g_server.tls.ctx, 1 /* is_server */);
     c->tls_hs_done = false;
     c->tls_wblock  = NULL;
+    c->tls_spill     = NULL;
+    c->tls_spill_len = 0;
     memset(&c->tls_wbuf, 0, sizeof(c->tls_wbuf));
 }
 
 void tls_conn_free(client_t *c) {
     free(c->tls_enc); c->tls_enc = NULL;
+    free(c->tls_spill); c->tls_spill = NULL;
+    c->tls_spill_len = 0;
     if (c->tls) { ptls_free(c->tls); c->tls = NULL; }
     /* Reached on every close path, including the ones that never wrote a
      * response (400 Bad Request, handshake failure) and plaintext connections,
