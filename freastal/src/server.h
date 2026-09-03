@@ -35,9 +35,10 @@
  * is ever held, because tls_read_flow() stops reading while the spill is
  * non-empty, so the bound does not accumulate across reads.
  *
- * This is a derivation, not a measurement: nothing exercises the bound at its
- * limit, and the largest overflow seen while developing this was around 14KB.
- * tls_spill_stash() range-checks against it rather than trusting the argument. */
+ * The derivation is checked below rather than trusted: the assertion states
+ * the same sum the paragraph argues.  Nothing exercises the bound at its limit
+ * -- the largest overflow seen while developing this was around 14KB -- so
+ * tls_spill_stash() still range-checks rather than trusting its argument. */
 #  define TLS_MAX_ENC_RECORD       (16384 + 256)
 #  define TLS_SPILL_SIZE           (2 * TLS_MAX_ENC_RECORD)
 /* Spill blocks are recycled through a free list, like the encryption blocks
@@ -46,6 +47,51 @@
  * number that have ever overflowed, which is what keeps a pipelining-heavy
  * workload from pinning 32KB on every open connection. */
 #  define TLS_SPILL_POOL_MAX       64
+/*
+ * What a record costs the buffer it is decrypted into, over and above the
+ * plaintext that comes out of it.
+ *
+ * handle_input() (vendor/picotls/lib/picotls.c) reserves 5 + rec.length before
+ * touching a record, where rec.length is the *encrypted* body, and then
+ * decrypts in place at base + off.  A TLS 1.3 record body is the plaintext
+ * plus one inner content-type byte plus the AEAD tag, so
+ *
+ *     reserve = 5 + plaintext + 1 + tag_size (+ padding)
+ *
+ * Every suite in ptls_openssl_cipher_suites[] -- AES-128-GCM, AES-256-GCM,
+ * ChaCha20-Poly1305 -- has a 16-byte tag, which fixes the constant part at 22.
+ * Padding only ever makes the reserve larger and picotls strips it after
+ * decrypting, so a peer that pads is caught by tls_on_read_data()'s fallback
+ * rather than by this number.
+ */
+#  define TLS_RECORD_OVERHEAD      22
+/*
+ * The largest reserve one record can ask for.  parse_record_header() refuses
+ * an APPDATA record whose body exceeds PTLS_MAX_ENCRYPTED_RECORD_SIZE, which
+ * is what TLS_MAX_ENC_RECORD mirrors; handle_input() adds the 5-byte header.
+ *
+ * read_buf is smaller than this, and deliberately so -- sizing it to cover a
+ * maximal record would cost 16KB on every client_t, TLS or not.  So no
+ * arrangement of read_buf can *rule out* picotls growing the buffer it is
+ * handed, and tls_on_read_data() detects growth instead of proving it away.
+ * What is proved away is the case that matters: a request that stays within
+ * TLS_READ_ZEROCOPY_MAX decrypts into read_buf with no growth, hence no
+ * allocation and no copy.
+ */
+#  define TLS_MAX_DECRYPT_RESERVE  (5 + TLS_MAX_ENC_RECORD)
+/*
+ * The zero-copy guarantee, stated as a size.  Growth happens exactly when
+ * read_len + plaintext + TLS_RECORD_OVERHEAD exceeds READ_BUF_SIZE, so a
+ * request whose accumulated bytes never pass this never grows -- whatever the
+ * peer's record sizes, and however many records or reads it is split over.
+ */
+#  define TLS_READ_ZEROCOPY_MAX    (READ_BUF_SIZE - TLS_RECORD_OVERHEAD)
+_Static_assert(TLS_RECORD_OVERHEAD == 5 + 1 + 16,
+               "5-byte record header, one inner content-type byte, 16-byte "
+               "AEAD tag; revisit if a suite with another tag size is added");
+_Static_assert(TLS_MAX_DECRYPT_RESERVE <= TLS_SPILL_SIZE,
+               "the growth fallback copies a whole sweep back out of picotls's "
+               "buffer, and what read_buf cannot take goes to the spill");
 /* Blocks one response may claim.  The cap is about pool fairness, not about
  * iovec limits: letting one response take half of a 256-block pool would push
  * every connection sharing the loop onto malloc for as long as it took to
@@ -108,6 +154,19 @@ typedef struct {
 #define MAX_HEADERS     64
 #define LISTEN_BACKLOG  4096
 #define PEER_ADDR_LEN   64
+
+#ifdef FREASTAL_TLS
+/* Down here rather than beside the TLS sizes above: both of these expand to
+ * READ_BUF_SIZE, which that block is written against but cannot assert on,
+ * because it is defined a few lines up from here. */
+_Static_assert(TLS_SPILL_SIZE >= TLS_ENC_BUF_SIZE + TLS_MAX_ENC_RECORD,
+               "one sweep's surplus plaintext must fit the spill: the fresh "
+               "ciphertext a read delivers, plus the one partial record "
+               "picotls may already be holding, bound it from above");
+_Static_assert(TLS_READ_ZEROCOPY_MAX > 0 && TLS_READ_ZEROCOPY_MAX < READ_BUF_SIZE,
+               "read_buf must hold one record's framing and some plaintext, "
+               "or tls_on_read_data() has no zero-copy path at all");
+#endif
 
 /*
  * Per-connection state.
@@ -286,6 +345,14 @@ typedef struct {
     unsigned long tls_wbuf_live;      /* blocks handed out and not yet returned */
     unsigned long tls_bigbuf_live;    /* oversized buffers handed out and not yet returned */
     unsigned long tls_wbuf_mallocs;   /* malloc() calls made by the two getters */
+    /* Read path.  The zero-copy claim -- a request inside
+     * TLS_READ_ZEROCOPY_MAX is decrypted straight into read_buf, with no
+     * allocation and no copy -- is invisible from the wire in exactly the same
+     * way, so it gets a counter too.  tls_read_grows counts the sweeps in
+     * which picotls replaced the buffer it was handed, which is the one event
+     * that costs both a malloc and a copy back. */
+    unsigned long tls_read_grows;
+    unsigned long tls_read_spills;    /* sweeps that left plaintext in the spill */
 #endif
 
     /* ASGI mode (runtime-selected; zero-init = WSGI) */

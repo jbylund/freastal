@@ -13,6 +13,7 @@ say which of those two behaviours each situation actually gets.
 """
 
 import hashlib
+import json
 import socket
 import ssl
 import subprocess
@@ -31,11 +32,13 @@ from test_tls import (  # noqa: F401  (certpair is used as a fixture)
 # response can be matched to the request that produced it.
 APP_SRC = r"""
 import hashlib
+import json
 import sys
 PROTO = sys.argv[1]
 PORT = int(sys.argv[2])
 CERT, KEY = sys.argv[3], sys.argv[4]
 import freastal
+from freastal._freastal import tls_buffer_stats
 
 _cache = {}
 
@@ -53,6 +56,9 @@ def reply(tag, body):
 def route(path, body):
     # /n/<size>  -> a response body of <size> bytes
     # /p/<tag>   -> a fingerprint of the request body
+    # /stats     -> the TLS buffer counters, sampled inside the callback
+    if path == "/stats":
+        return json.dumps(tls_buffer_stats()).encode()
     if path.startswith("/n/"):
         try:
             n = max(0, min(4000000, int(path.rsplit("/", 1)[-1])))
@@ -357,4 +363,263 @@ def test_keep_alive_after_an_overflowing_pipeline(echo_tls_server):
             s.sendall(get(f"/n/{n}"))
             body, buf = expect_response(s, buf, f"GET /n/{n}")
             assert body == expected_body(n), n
+        assert buf == b""
+
+
+# ---------------------------------------------------------------------------
+# Decrypting straight into read_buf (issue #38).
+#
+# The read path hands picotls read_buf's free tail as the buffer to append
+# decrypted records to, instead of decrypting into a staging buffer and copying
+# afterwards.  Nothing about that is visible in a response, so these tests come
+# in two halves: bodies at every size where the arithmetic could be wrong, and
+# the counters that say which path each of them actually took.
+#
+# The arithmetic, in one line.  handle_input() reserves 5 + <encrypted record
+# length> before decrypting, an encrypted record is the plaintext plus one
+# inner content-type byte plus a 16-byte AEAD tag, so a record costs 22 bytes
+# more capacity than the plaintext it yields.  picotls therefore has to grow --
+# malloc, copy, and take the buffer over -- exactly when
+#
+#     read_len + plaintext + 22 > READ_BUF_SIZE
+#
+# which makes READ_BUF_SIZE - 22 the largest request that is guaranteed to be
+# decrypted in place.  The server reports it as read_zerocopy_max rather than
+# having the tests restate it.
+# ---------------------------------------------------------------------------
+
+
+def stats(sock, buf=b""):
+    """Read the server's TLS buffer counters over an established connection."""
+    sock.sendall(get("/stats"))
+    body, buf = expect_response(sock, buf, "/stats")
+    return json.loads(body), buf
+
+
+def post_of_total(tag, total):
+    """A POST whose complete wire form is exactly `total` bytes.
+
+    Content-Length changing width as the body shrinks is what makes this a
+    loop rather than a subtraction.
+    """
+    nbody = total - len(post(tag, 0)[0])
+    for _ in range(8):
+        req, body = post(tag, nbody)
+        if len(req) == total:
+            return req, body
+        nbody -= len(req) - total
+    raise AssertionError(f"no body length gives a {total}-byte request")
+
+
+# Body sizes, on one connection.  0/1 bracket the empty body; 4000-4200
+# straddles the 4096-byte staging buffer the old code decrypted into, which is
+# where it used to start reallocating; 8191-8193 and 12000 are ordinary
+# mid-range bodies that nothing covered before; the rest walk up to the largest
+# body that still fits read_buf.
+# fmt: off
+BODY_SIZES = [
+    0, 1, 63, 64, 1000,
+    4000, 4095, 4096, 4097, 4098, 4200,
+    6000, 8000, 8191, 8192, 8193, 12000, 14000, 15000, 16000, 16100, 16200,
+]
+# fmt: on
+
+
+def test_post_bodies_across_the_decrypt_boundary(echo_tls_server):
+    """Every interesting body size, in order, down one connection.
+
+    Reusing the connection is the point.  read_buf is recycled by
+    client_reset() between requests and the decrypt now writes into it
+    directly, so a size that is mishandled shows up as a corrupt or truncated
+    *next* request rather than as a bad response to itself.
+    """
+    _proto, port = echo_tls_server
+    with connect(port, timeout=30) as s:
+        buf = b""
+        for n in BODY_SIZES:
+            req, body = post(f"d{n}", n)
+            assert len(req) <= READ_BUF_SIZE, n
+            s.sendall(req)
+            got, buf = expect_response(s, buf, f"POST of {n} bytes")
+            assert got == fingerprint(f"d{n}", body), n
+        assert buf == b""
+
+
+def test_mid_range_post_bodies_are_decrypted_in_place(echo_tls_server):
+    """The 4KB-16KB band: correct, and taking the zero-copy path.
+
+    This is the band the old code paid most for -- over 4096 bytes of
+    plaintext in a read meant a malloc, a doubling-realloc chain, a full copy
+    into read_buf and a ptls_clear_memory() over the body on the way out --
+    and the band nothing tested.  read_grows is what says it is not happening
+    any more; the fingerprints are what say the plaintext still arrives.
+    """
+    _proto, port = echo_tls_server
+    with connect(port, timeout=30) as s:
+        before, buf = stats(s)
+        assert before["read_zerocopy_max"] == READ_BUF_SIZE - 22, before
+        for n in (4096, 5000, 6144, 8192, 10000, 12288, 14000, 16000):
+            req, body = post(f"m{n}", n)
+            s.sendall(req)
+            got, buf = expect_response(s, buf, f"POST of {n} bytes")
+            assert got == fingerprint(f"m{n}", body), n
+        after, buf = stats(s, buf)
+        assert after["read_grows"] == before["read_grows"], (before, after)
+        assert after["read_spills"] == before["read_spills"], (before, after)
+        assert buf == b""
+
+
+def test_requests_up_to_the_zero_copy_limit_never_grow(echo_tls_server):
+    """Either side of read_zerocopy_max, by total request size.
+
+    The limit is a property of the *request*, not of the body, because the
+    reservation is against read_buf as a whole -- so these are built to an
+    exact wire length.  Below it the decrypt must stay in place; the sizes
+    above it are here to be answered correctly, not quickly.
+    """
+    _proto, port = echo_tls_server
+    with connect(port, timeout=30) as s:
+        base, buf = stats(s)
+        limit = base["read_zerocopy_max"]
+
+        for total in (limit - 64, limit - 2, limit - 1, limit):
+            req, body = post_of_total(f"z{total}", total)
+            s.sendall(req)
+            got, buf = expect_response(s, buf, f"{total}-byte request")
+            assert got == fingerprint(f"z{total}", body), total
+        mid, buf = stats(s, buf)
+        assert mid["read_grows"] == base["read_grows"], (base, mid)
+
+        # The last 22 bytes of read_buf: the record's framing needs room the
+        # payload leaves nothing for, so picotls takes the buffer over.  The
+        # request is still answered, which is the whole point of detecting
+        # that rather than failing on it.
+        for total in (limit + 1, limit + 2, READ_BUF_SIZE - 1, READ_BUF_SIZE):
+            req, body = post_of_total(f"o{total}", total)
+            s.sendall(req)
+            got, buf = expect_response(s, buf, f"{total}-byte request")
+            assert got == fingerprint(f"o{total}", body), total
+        end, buf = stats(s, buf)
+        assert end["read_grows"] > mid["read_grows"], (mid, end)
+        assert buf == b""
+
+
+def test_a_record_carrying_several_whole_requests(echo_tls_server):
+    """Pipelined requests packed into one TLS record, right up to the record
+    limit.
+
+    One ptls_receive() call yields one record, so this is the case where a
+    single append has to place several requests in read_buf at once and the
+    parser has to find all of them.  A 16384-byte record is also the largest
+    plaintext picotls will emit in one go, which is what the capacity
+    arithmetic is written against.
+    """
+    _proto, port = echo_tls_server
+    reqs, bodies, tags = [], [], []
+    total = 0
+    i = 0
+    while True:
+        tag = f"r{i}"
+        req, body = post(tag, 900)
+        if total + len(req) > 16384:
+            break
+        reqs.append(req)
+        bodies.append(body)
+        tags.append(tag)
+        total += len(req)
+        i += 1
+    assert len(reqs) > 8, len(reqs)
+
+    with connect(port, timeout=30) as s:
+        s.sendall(b"".join(reqs))  # one sendall -> one TLS record
+        buf = b""
+        for tag, body in zip(tags, bodies):
+            got, buf = expect_response(s, buf, tag)
+            assert got == fingerprint(tag, body), tag
+        assert buf == b""
+
+
+def test_a_body_split_across_reads_mid_record(echo_tls_server):
+    """A record the peer flushes in one write but the socket delivers in
+    pieces.
+
+    picotls holds the partial record in recvbuf.rec and emits nothing at all
+    for the earlier reads, so those sweeps end with plain.off == 0 and must
+    not disturb read_buf.  The whole body then lands in a single append on a
+    later read.
+    """
+    _proto, port = echo_tls_server
+    req, body = post("split", 15000)
+    assert len(req) < READ_BUF_SIZE
+    with connect(port, timeout=30) as s:
+        buf = b""
+        # Two TLS records, the second deliberately handed over in slices so
+        # the server sees it arrive a fragment at a time.
+        s.sendall(req[:100])
+        time.sleep(0.2)
+        for i in range(100, len(req), 3000):
+            s.sendall(req[i : i + 3000])
+            time.sleep(0.05)
+        got, buf = expect_response(s, buf, "the split request")
+        assert got == fingerprint("split", body)
+        assert buf == b""
+
+
+def test_read_buf_is_not_scrubbed_under_the_parser(echo_tls_server):
+    """A request that is parsed, answered, and then followed by another that
+    reuses the same bytes of read_buf.
+
+    ptls_buffer_dispose() runs ptls_clear_memory(base, off) whether or not it
+    owns the memory, so disposing a buffer that points into read_buf would
+    zero the request that was just decrypted -- after the parser has taken
+    pointers into it, and only for requests large enough to have reached that
+    far.  Headers are read back out of read_buf, so a scrub shows up as a
+    fingerprint for the wrong tag, or no response at all.
+    """
+    _proto, port = echo_tls_server
+    with connect(port, timeout=30) as s:
+        buf = b""
+        for i, n in enumerate([9000, 40, 13000, 40, 5000]):
+            tag = f"scrub{i}"
+            req, body = post(tag, n)
+            s.sendall(req)
+            got, buf = expect_response(s, buf, tag)
+            assert got == fingerprint(tag, body), (tag, n)
+        assert buf == b""
+
+
+def test_overflowing_pipeline_still_reaches_the_spill(echo_tls_server):
+    """The growth fallback and the spill, on the same connection as ordinary
+    traffic.
+
+    A burst larger than read_buf makes picotls take the decrypt buffer over
+    and leaves the surplus in the spill block; the connection has to come back
+    to the in-place path afterwards with nothing left over.
+    """
+    _proto, port = echo_tls_server
+    tags = [f"sp{i}" for i in range(6)]
+    reqs, bodies = [], []
+    for t in tags:
+        r, b = post(t, 6000)
+        reqs.append(r)
+        bodies.append(b)
+    assert sum(len(r) for r in reqs) > 2 * READ_BUF_SIZE
+
+    with connect(port, timeout=30) as s:
+        before, buf = stats(s)
+        s.sendall(b"".join(reqs))
+        for i, t in enumerate(tags):
+            body, buf = expect_response(s, buf, t)
+            assert body == fingerprint(t, bodies[i]), t
+        after, buf = stats(s, buf)
+        assert after["read_spills"] > before["read_spills"], (before, after)
+
+        # ...and the connection is back on the in-place path.
+        quiet, buf = stats(s, buf)
+        req, body = post("after", 7000)
+        s.sendall(req)
+        got, buf = expect_response(s, buf, "after")
+        assert got == fingerprint("after", body)
+        done, buf = stats(s, buf)
+        assert done["read_grows"] == quiet["read_grows"], (quiet, done)
         assert buf == b""
