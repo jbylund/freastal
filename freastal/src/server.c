@@ -4,6 +4,7 @@
 #include "hdrcache.h"
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <unistd.h>
 
 server_t g_server;
 
@@ -479,8 +480,75 @@ static int init_wsgi_keys(void) {
 
 /* ---- Server init / run ---- */
 
+/*
+ * Will libuv honour UV_TCP_REUSEPORT on THIS machine?
+ *
+ * setup.py can only answer a different question -- does the enum exist in the
+ * uv.h we compiled against -- and that answer is not the one callers need.  It
+ * is true on macOS, where every REUSEPORT bind then fails with ENOTSUP, and it
+ * is fixed at build time for a wheel that gets run on other machines.
+ *
+ * Asking the kernel instead is worse, not better.  macOS *has* SO_REUSEPORT:
+ * setsockopt succeeds, a second bind to the same port succeeds, and then the
+ * last binder takes every connection while the first gets none -- measured
+ * here at 40 out of 40.  That is BSD rebind semantics, not Linux's
+ * connection-distributing SO_REUSEPORT (FreeBSD added a separate option,
+ * SO_REUSEPORT_LB, to get the Linux behaviour, and that is what libuv uses
+ * there).  So a setsockopt probe answers a question nobody asked -- "does the
+ * option exist" -- and hands back a server where one worker serves everything.
+ *
+ * Which makes libuv's refusal a feature: it tracks the distinction we actually
+ * need.  And its own header is the argument against writing that list down
+ * anywhere in here -- uv.h, verbatim:
+ *
+ *     This flag is available only on Linux 3.9+, DragonFlyBSD 3.6+,
+ *     FreeBSD 12.0+, Solaris 11.4, and AIX 7.2.5+ for now.
+ *
+ * Note the version floors, and the "for now".  A platform *name* is not the
+ * capability either: Linux 3.8 and FreeBSD 11 compile the enum and fail the
+ * behaviour, which is the same mistake as the compile-time probe one layer
+ * down.  Any table we kept here would be wrong for some machine and stale for
+ * the rest, so keep none: ask libuv directly, by doing the exact bind serve()
+ * would do, on an ephemeral loopback port, and throwing the socket away.  The
+ * side effect is one socket held for the length of a bind(); the answer is
+ * cached because it cannot change under a running process.
+ */
+int server_reuseport_supported(void) {
+#ifndef FREASTAL_REUSEPORT
+    /* Built against a uv.h with no UV_TCP_REUSEPORT: there is no flag to pass,
+     * so the honest answer is no, whatever the running kernel could do. */
+    return 0;
+#else
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+
+    uv_loop_t loop;
+    if (uv_loop_init(&loop) != 0) {
+        /* Don't cache a failure that says nothing about REUSEPORT. */
+        return 0;
+    }
+
+    int supported = 0;
+    uv_tcp_t probe;
+    if (uv_tcp_init(&loop, &probe) == 0) {
+        struct sockaddr_in addr;
+        uv_ip4_addr("127.0.0.1", 0, &addr);
+        supported = uv_tcp_bind(&probe, (const struct sockaddr *)&addr,
+                                UV_TCP_REUSEPORT) == 0;
+        uv_close((uv_handle_t *)&probe, NULL);
+    }
+    /* uv_loop_close() returns EBUSY unless the close callback has run. */
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    cached = supported;
+    return cached;
+#endif
+}
+
 int server_init(PyObject *app, const char *host, int port, bool reuse_port,
-                const char *certfile, const char *keyfile) {
+                const char *certfile, const char *keyfile, int listen_fd) {
 #ifndef FREASTAL_TLS
     /* This build has no picotls, so a certfile cannot be honoured.  Accepting
      * it and carrying on is a silent downgrade: the server comes up in
@@ -539,35 +607,72 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
 
     uv_tcp_init(g_server.loop, &g_server.handle);
 
-    struct sockaddr_in addr;
-    /* uv_ip4_addr() fills in the family and the port before it parses the
-     * address, so a failure it does not report leaves a well-formed sockaddr
-     * for 0.0.0.0 on the requested port.  serve(host="localhost") therefore
-     * used to listen on every interface, on the right port, and behave
-     * correctly in every visible way -- which is why it went unnoticed.  A
-     * caller asking for loopback got a public listener. */
-    if (uv_ip4_addr(host, port, &addr) != 0) {
-        PyErr_Format(PyExc_ValueError,
-            "freastal: host must be a dotted-quad IPv4 address, not %s -- "
-            "freastal does not resolve names. Use 127.0.0.1 for loopback, "
-            "or 0.0.0.0 for every interface.", host);
-        return -1;
-    }
+    if (listen_fd >= 0) {
+        /* A listening socket the caller already bound.  freastal/__init__.py
+         * binds it once in the parent and hands the same socket to every
+         * worker, because libuv only honours UV_TCP_REUSEPORT where the kernel
+         * actually distributes connections -- letting each worker bind for
+         * itself makes workers>1 impossible everywhere else (EADDRINUSE for
+         * all but the first), and sharing one bound socket needs no flag at all.
+         *
+         * dup() so ownership is unambiguous: libuv closes whatever fd it is
+         * given when the handle closes, and the caller's socket object closes
+         * its own.  Handing the same descriptor to both is a double close, and
+         * the second one lands on whatever unrelated fd got that number next. */
+        int owned = dup(listen_fd);
+        if (owned < 0) {
+            PyErr_SetFromErrno(PyExc_OSError);
+            return -1;
+        }
+        int rc = uv_tcp_open(&g_server.handle, (uv_os_sock_t)owned);
+        if (rc != 0) {
+            close(owned);
+            PyErr_Format(PyExc_OSError, "freastal: uv_tcp_open failed on fd %d: %s",
+                         listen_fd, uv_strerror(rc));
+            return -1;
+        }
+    } else {
+        struct sockaddr_in addr;
+        /* uv_ip4_addr() fills in the family and the port before it parses the
+         * address, so a failure it does not report leaves a well-formed
+         * sockaddr for 0.0.0.0 on the requested port.  serve(host="localhost")
+         * therefore used to listen on every interface, on the right port, and
+         * behave correctly in every visible way -- which is why it went
+         * unnoticed.  A caller asking for loopback got a public listener. */
+        int rc = uv_ip4_addr(host, port, &addr);
+        if (rc != 0) {
+            PyErr_Format(PyExc_ValueError,
+                "freastal: host must be a dotted-quad IPv4 address, not %s -- "
+                "freastal does not resolve names. Use 127.0.0.1 for loopback, "
+                "or 0.0.0.0 for every interface.", host);
+            return -1;
+        }
 
-    /* UV_TCP_REUSEPORT availability is probed at build time by setup.py */
+        /* UV_TCP_REUSEPORT availability is probed at build time by setup.py and
+         * re-exported as _freastal.HAS_REUSE_PORT, so a caller that asks for it
+         * on a build without it is refused in Python rather than having the
+         * request quietly dropped here. */
 #ifdef FREASTAL_REUSEPORT
-    unsigned int bind_flags = reuse_port ? UV_TCP_REUSEPORT : 0;
+        unsigned int bind_flags = reuse_port ? UV_TCP_REUSEPORT : 0;
 #else
-    (void)reuse_port;
-    unsigned int bind_flags = 0;
+        (void)reuse_port;
+        unsigned int bind_flags = 0;
 #endif
-    if (uv_tcp_bind(&g_server.handle, (const struct sockaddr *)&addr, bind_flags) != 0) {
-        PyErr_Format(PyExc_OSError, "freastal: uv_tcp_bind failed on %s:%d", host, port);
-        return -1;
+        /* The errno matters: ENOTSUP (libuv refusing UV_TCP_REUSEPORT on this
+         * platform) and EADDRINUSE are very different problems and used to be
+         * reported with the same bare message. */
+        rc = uv_tcp_bind(&g_server.handle, (const struct sockaddr *)&addr, bind_flags);
+        if (rc != 0) {
+            PyErr_Format(PyExc_OSError, "freastal: uv_tcp_bind failed on %s:%d: %s",
+                         host, port, uv_strerror(rc));
+            return -1;
+        }
     }
 
-    if (uv_listen((uv_stream_t *)&g_server.handle, LISTEN_BACKLOG, on_new_connection) != 0) {
-        PyErr_SetString(PyExc_OSError, "freastal: uv_listen failed");
+    int rc = uv_listen((uv_stream_t *)&g_server.handle, LISTEN_BACKLOG, on_new_connection);
+    if (rc != 0) {
+        PyErr_Format(PyExc_OSError, "freastal: uv_listen failed on %s:%d: %s",
+                     host, port, uv_strerror(rc));
         return -1;
     }
 

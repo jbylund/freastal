@@ -12,8 +12,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.10", "3.12", "3.13"]
+        # Both Ubuntu LTS releases are pinned deliberately, because they ship
+        # different libuv versions and therefore exercise different code:
+        #
+        #   24.04 -> libuv 1.48, no UV_TCP_REUSEPORT -> shared listening socket
+        #   26.04 -> libuv 1.51, has it             -> one socket per worker
+        #
+        # `ubuntu-latest` would cover exactly one of those, and would silently
+        # switch which one when GitHub moves the alias -- taking the other path
+        # out of CI without anyone noticing. That is not hypothetical: the
+        # shared-socket path exists because libuv 1.48 has no flag to pass, and
+        # 24.04 is the LTS most production deployments are on.
+        os: [ubuntu-24.04, ubuntu-26.04, macos-latest]
+        python-version: ["3.12"]
+        include:
+          # The libuv path does not vary with the Python version, so the full
+          # interpreter sweep runs on one OS rather than nine times over.
+          - os: ubuntu-24.04
+            python-version: "3.10"
+          - os: ubuntu-24.04
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: "3.13"
 
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +57,25 @@ jobs:
         # 3.12+ environments do not preinstall it; tests/test_build_deps.py
         # imports setup.py, so ask for it explicitly.
         run: pip install -e . pytest httpx setuptools
+
+      # Which of the two worker-binding paths did this job actually exercise?
+      # It is decided by the libuv the runner happens to ship, so a job name
+      # cannot say it and a reader of a red build should not have to guess.
+      - name: Report libuv and the path under test
+        run: |
+          python - <<'EOF'
+          from freastal import _freastal as f
+          v = f.libuv_version
+          probe = f.reuse_port_supported()
+          print(f"libuv {v}")
+          print(f"UV_TCP_REUSEPORT compiled in : {bool(getattr(f, 'HAS_REUSE_PORT', 0))}")
+          print(f"honoured at runtime          : {probe}")
+          print(
+              "worker binding path          : "
+              + ("one socket per worker (SO_REUSEPORT)" if probe
+                 else "one shared listening socket")
+          )
+          EOF
 
       - name: Run tests
         run: python -m pytest tests/ -v

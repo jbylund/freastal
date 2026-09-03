@@ -19,6 +19,12 @@ if __name__ == "__main__":
         host="127.0.0.1",
         port=int(os.environ.get("BENCH_PORT", "8123")),
         workers=int(os.environ.get("BENCH_WORKERS", "1")),
-        # macOS libuv has no load-balancing SO_REUSEPORT; single worker here.
-        reuse_port=bool(int(os.environ.get("BENCH_REUSEPORT", "0"))),
+        # Unset means "auto": on where SO_REUSEPORT load-balances, off on macOS,
+        # where the workers share the parent's listening socket instead.  Set
+        # BENCH_REUSEPORT to pin it either way for a like-for-like comparison.
+        reuse_port=(
+            bool(int(os.environ["BENCH_REUSEPORT"]))
+            if "BENCH_REUSEPORT" in os.environ
+            else None
+        ),
     )

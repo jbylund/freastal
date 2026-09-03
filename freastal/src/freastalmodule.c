@@ -4,22 +4,23 @@
 #include "wsgi.h"
 #include "asgi.h"
 
-/* ---- freastal.serve(app, host='0.0.0.0', port=8000, reuse_port=True) ---- */
+/* ---- freastal.serve(app, host='0.0.0.0', port=8000, reuse_port=False) ---- */
 
 static PyObject *py_serve(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
     static const char *kwlist[] = {
-        "app", "host", "port", "reuse_port", "certfile", "keyfile", NULL
+        "app", "host", "port", "reuse_port", "certfile", "keyfile", "fd", NULL
     };
     PyObject   *app      = NULL;
     const char *host     = "0.0.0.0";
     int         port     = 8000;
-    int         reuse_p  = 1;
+    int         reuse_p  = 0;
     const char *certfile = NULL;
     const char *keyfile  = NULL;
+    int         fd       = -1;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|sipzz",
-            (char **)kwlist, &app, &host, &port, &reuse_p, &certfile, &keyfile))
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|sipzzi",
+            (char **)kwlist, &app, &host, &port, &reuse_p, &certfile, &keyfile, &fd))
         return NULL;
 
     if (!PyCallable_Check(app)) {
@@ -27,7 +28,7 @@ static PyObject *py_serve(PyObject *self, PyObject *args, PyObject *kwargs) {
         return NULL;
     }
 
-    if (server_init(app, host, port, (bool)reuse_p, certfile, keyfile) < 0) {
+    if (server_init(app, host, port, (bool)reuse_p, certfile, keyfile, fd) < 0) {
         if (!PyErr_Occurred())
             PyErr_SetString(PyExc_RuntimeError, "freastal: server_init failed");
         return NULL;
@@ -43,19 +44,21 @@ static PyObject *py_serve(PyObject *self, PyObject *args, PyObject *kwargs) {
 static PyObject *py_serve_asgi(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
     static const char *kwlist[] = {
-        "app", "loop", "host", "port", "reuse_port", "certfile", "keyfile", NULL
+        "app", "loop", "host", "port", "reuse_port", "certfile", "keyfile",
+        "fd", NULL
     };
     PyObject   *app      = NULL;
     PyObject   *loop     = NULL;
     const char *host     = "0.0.0.0";
     int         port     = 8000;
-    int         reuse_p  = 1;
+    int         reuse_p  = 0;
     const char *certfile = NULL;
     const char *keyfile  = NULL;
+    int         fd       = -1;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|sipzz",
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|sipzzi",
             (char **)kwlist, &app, &loop, &host, &port, &reuse_p,
-            &certfile, &keyfile))
+            &certfile, &keyfile, &fd))
         return NULL;
 
     if (!PyCallable_Check(app)) {
@@ -63,7 +66,7 @@ static PyObject *py_serve_asgi(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    if (server_init(app, host, port, (bool)reuse_p, certfile, keyfile) < 0) {
+    if (server_init(app, host, port, (bool)reuse_p, certfile, keyfile, fd) < 0) {
         if (!PyErr_Occurred())
             PyErr_SetString(PyExc_RuntimeError, "freastal: server_init failed");
         return NULL;
@@ -113,7 +116,24 @@ static PyObject *py_tls_buffer_stats(PyObject *self, PyObject *args) {
 #endif
 }
 
+
+/* ---- freastal.reuse_port_supported() ---- */
+
+static PyObject *py_reuse_port_supported(PyObject *self, PyObject *args) {
+    (void)self; (void)args;
+    return PyBool_FromLong(server_reuseport_supported());
+}
+
 static PyMethodDef freastal_methods[] = {
+    {
+        "reuse_port_supported",
+        py_reuse_port_supported,
+        METH_NOARGS,
+        "reuse_port_supported()\n\n"
+        "True if libuv on THIS machine will honour UV_TCP_REUSEPORT, probed by\n"
+        "attempting the bind rather than inferred from the platform name or\n"
+        "from what setup.py saw at build time.",
+    },
     {
         "tls_buffer_stats",
         py_tls_buffer_stats,
@@ -129,8 +149,11 @@ static PyMethodDef freastal_methods[] = {
         "serve",
         (PyCFunction)(void(*)(void))py_serve,
         METH_VARARGS | METH_KEYWORDS,
-        "serve(app, host='0.0.0.0', port=8000, reuse_port=True, certfile=None, keyfile=None)\n\n"
+        "serve(app, host='0.0.0.0', port=8000, reuse_port=False, certfile=None,\n"
+        "      keyfile=None, fd=-1)\n\n"
         "Run a WSGI app under the freastal server.\n"
+        "fd, if >= 0, is an already-bound listening socket to serve on instead\n"
+        "of binding host:port; host and port are still used for the environ.\n"
         "Pass certfile and keyfile (PEM paths) to enable TLS 1.3 (requires picotls).\n"
         "Blocks until the event loop exits (e.g. SIGINT)."
     },
@@ -138,9 +161,11 @@ static PyMethodDef freastal_methods[] = {
         "serve_asgi",
         (PyCFunction)(void(*)(void))py_serve_asgi,
         METH_VARARGS | METH_KEYWORDS,
-        "serve_asgi(app, loop, host='0.0.0.0', port=8000, reuse_port=True,\n"
-        "           certfile=None, keyfile=None)\n\n"
+        "serve_asgi(app, loop, host='0.0.0.0', port=8000, reuse_port=False,\n"
+        "           certfile=None, keyfile=None, fd=-1)\n\n"
         "Run an ASGI app under the freastal server.\n"
+        "fd, if >= 0, is an already-bound listening socket to serve on instead\n"
+        "of binding host:port; host and port are still used for the environ.\n"
         "Pass certfile and keyfile (PEM paths) to enable TLS 1.3 (requires picotls).\n"
         "loop must be a running asyncio event loop.\n"
         "Blocks until the event loop exits."
@@ -181,6 +206,26 @@ PyMODINIT_FUNC PyInit__freastal(void) {
         Py_DECREF(m);
         return NULL;
     }
+
+    /* Whether this build can pass UV_TCP_REUSEPORT to uv_tcp_bind at all.
+     * Without it the C layer used to drop a reuse_port=True request on the
+     * floor; exporting the flag lets serve() refuse instead of pretending. */
+    /* Which libuv this is actually linked against. UV_TCP_REUSEPORT arrived in
+     * 1.49.0, and whether it is present changes how workers>1 binds -- so when
+     * someone reports "multi-worker is slow", this is the first thing to ask
+     * for, and a build log is usually long gone by then. */
+    PyModule_AddStringConstant(m, "libuv_version", uv_version_string());
+
+#ifdef FREASTAL_REUSEPORT
+    /* Retained only to say whether the *flag exists* in the uv.h this was
+     * compiled against. Whether it will be honoured is a runtime question and
+     * is answered by reuse_port_supported(); a wheel built on one machine runs
+     * on another, and macOS compiles the enum then fails every REUSEPORT bind
+     * with ENOTSUP. Callers want the function, not this. */
+    PyModule_AddIntConstant(m, "HAS_REUSE_PORT", 1);
+#else
+    PyModule_AddIntConstant(m, "HAS_REUSE_PORT", 0);
+#endif
 
     PyModule_AddStringConstant(m, "__version__", "0.0.1");
 
