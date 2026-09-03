@@ -306,7 +306,9 @@ void write_response(client_t *c) {
 static void on_write(uv_write_t *req, int status) {
     client_t *c = CONTAINER_OF(req, client_t, write_req);
 #ifdef FREASTAL_TLS
-    if (c->tls) ptls_buffer_dispose(&c->tls_wbuf);
+    /* uv_write held a pointer into tls_wbuf until now; this is the earliest
+     * point at which the block may go back to the pool. */
+    if (c->tls) tls_release_wbuf(c);
 #endif
 
     GIL_LOCK();
@@ -607,20 +609,75 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
     http_dispatch(c, stream);
 }
 
+/* Bytes ptls_send() will append for a plaintext run of len: the payload plus
+ * one lot of record framing (5-byte header, content-type byte, AEAD tag) for
+ * each 16KB record it is split into.  Rounds up, and never under-counts. */
+static inline size_t tls_encrypted_size(size_t len, size_t rec_overhead) {
+    return len + (len / TLS_MAX_RECORD_PLAINTEXT + 1) * rec_overhead;
+}
+
 static void tls_write_response_impl(client_t *c) {
-    /* tls_wbuf outlives this function (uv_write holds a reference), so
-     * we must heap-back the buffer. is_allocated=1 forces realloc on grow. */
-    c->tls_wbuf.base = malloc(8192);
-    c->tls_wbuf.capacity = c->tls_wbuf.base ? 8192 : 0;
-    c->tls_wbuf.off = 0;
-    c->tls_wbuf.is_allocated = 1;
+    size_t      hdr_len  = (size_t)c->resp_hdr_len;
+    const char *body     = NULL;
+    size_t      body_len = 0;
+    if (c->resp_body && PyBytes_GET_SIZE(c->resp_body) > 0) {
+        body     = PyBytes_AS_STRING(c->resp_body);
+        body_len = (size_t)PyBytes_GET_SIZE(c->resp_body);
+    }
+
+    /*
+     * One record instead of two.  A second record costs a 5-byte header, a
+     * fresh AEAD setup and a 16-byte tag, which for a ~130-byte response
+     * header is nearly all of what sending it costs.  resp_hdr is 8KB and
+     * already holds the header, so a body that fits behind it can be appended
+     * there and the two sent as a single record for the price of copying the
+     * body -- the trade lighttpd makes in chunkqueue_small_resp_optim().
+     *
+     * Above that the copy is the more expensive half, so large bodies keep
+     * their own record and are encrypted straight out of the Python bytes.
+     */
+    bool   coalesce = (body_len != 0 && hdr_len + body_len <= RESP_HDR_SIZE);
+    size_t rec_oh   = ptls_get_record_overhead(c->tls);
+    size_t need     = coalesce ? tls_encrypted_size(hdr_len + body_len, rec_oh)
+                               : tls_encrypted_size(hdr_len, rec_oh)
+                                 + (body_len ? tls_encrypted_size(body_len, rec_oh) : 0);
+
+    /*
+     * tls_wbuf outlives this function -- uv_write holds a pointer into it
+     * until on_write -- so it has to be heap-backed either way.  Sizing it up
+     * front means picotls never has to grow it, which for a 12KB body used to
+     * mean a second malloc and a copy on top of the first.
+     *
+     * A pooled block is handed over with is_allocated = 0: picotls must not
+     * free it, tls_release_wbuf() returns it instead.  Anything too big for a
+     * block gets its own allocation with is_allocated = 1, which is the old
+     * behaviour and leaves picotls to free it in on_write.
+     */
+    if (likely(need <= TLS_WBUF_SIZE)) {
+        c->tls_wblock = tls_wbuf_get();
+        if (unlikely(!c->tls_wblock)) { uv_close((uv_handle_t *)&c->handle, on_close); return; }
+        c->tls_wbuf.base         = (uint8_t *)c->tls_wblock;
+        c->tls_wbuf.capacity     = TLS_WBUF_SIZE;
+        c->tls_wbuf.is_allocated = 0;
+    } else {
+        c->tls_wblock = NULL;
+        c->tls_wbuf.base = (uint8_t *)malloc(need);
+        if (unlikely(!c->tls_wbuf.base)) { uv_close((uv_handle_t *)&c->handle, on_close); return; }
+        c->tls_wbuf.capacity     = need;
+        c->tls_wbuf.is_allocated = 1;
+    }
+    c->tls_wbuf.off        = 0;
     c->tls_wbuf.align_bits = 0;
-    if (!c->tls_wbuf.base) { uv_close((uv_handle_t *)&c->handle, on_close); return; }
-    ptls_send(c->tls, &c->tls_wbuf, c->resp_hdr, (size_t)c->resp_hdr_len);
-    if (c->resp_body && PyBytes_GET_SIZE(c->resp_body) > 0)
-        ptls_send(c->tls, &c->tls_wbuf,
-                  PyBytes_AS_STRING(c->resp_body),
-                  (size_t)PyBytes_GET_SIZE(c->resp_body));
+
+    if (coalesce) {
+        memcpy(c->resp_hdr + hdr_len, body, body_len);
+        ptls_send(c->tls, &c->tls_wbuf, c->resp_hdr, hdr_len + body_len);
+    } else {
+        ptls_send(c->tls, &c->tls_wbuf, c->resp_hdr, hdr_len);
+        if (body_len)
+            ptls_send(c->tls, &c->tls_wbuf, body, body_len);
+    }
+
     uv_buf_t uvbuf = uv_buf_init((char *)c->tls_wbuf.base, (unsigned)c->tls_wbuf.off);
     uv_write(&c->write_req, (uv_stream_t *)&c->handle, &uvbuf, 1, on_write);
 }

@@ -9,6 +9,7 @@ build time), detected by the handshake failing rather than by a build flag,
 since the module exposes none.
 """
 
+import hashlib
 import http.client
 import os
 import shutil
@@ -233,3 +234,282 @@ def test_plain_http_still_reports_http_scheme():
     finally:
         proc.kill()
         proc.wait(timeout=10)
+
+
+# --------------------------------------------------------------------------
+# Response sizes across the TLS write path's buffer boundaries.
+#
+# The encrypted response is built in a recycled block that is sized up front,
+# and small responses are coalesced into a single TLS record by appending the
+# body to resp_hdr.  Both of those have size thresholds, and both reuse memory
+# across requests on a connection, so the interesting cases are: bodies either
+# side of every threshold, and several of them down one connection.
+# --------------------------------------------------------------------------
+
+SIZED_APP_SRC = r"""
+import hashlib
+import sys
+PROTO = sys.argv[1]
+PORT = int(sys.argv[2])
+CERT, KEY = sys.argv[3], sys.argv[4]
+import freastal
+
+_cache = {}
+
+def body_for(n):
+    b = _cache.get(n)
+    if b is None:
+        seed = hashlib.sha256(str(n).encode()).digest()
+        b = (seed * (n // 32 + 1))[:n]
+        _cache[n] = b
+    return b
+
+def size_of(path):
+    try:
+        return max(0, min(4000000, int(path.rsplit("/", 1)[-1])))
+    except ValueError:
+        return 0
+
+if PROTO == "asgi":
+    async def app(scope, receive, send):
+        body = body_for(size_of(scope["path"]))
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [[b"content-type", b"application/octet-stream"]],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    freastal.serve_asgi(app, host="127.0.0.1", port=PORT, workers=1,
+                        reuse_port=False, certfile=CERT, keyfile=KEY)
+else:
+    def app(environ, start_response):
+        body = body_for(size_of(environ["PATH_INFO"]))
+        start_response("200 OK", [
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", str(len(body))),
+        ])
+        return [body]
+
+    freastal.serve(app, host="127.0.0.1", port=PORT, workers=1,
+                   reuse_port=False, certfile=CERT, keyfile=KEY)
+"""
+
+
+def expected_body(n):
+    seed = hashlib.sha256(str(n).encode()).digest()
+    return (seed * (n // 32 + 1))[:n]
+
+
+def start_sized(proto, certpair):
+    cert, key = certpair
+    port = free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", SIZED_APP_SRC, proto, str(port), cert, key],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            pytest.skip(f"{proto} sized server exited; build probably lacks TLS")
+        try:
+            conn = http.client.HTTPSConnection(
+                "127.0.0.1", port, context=tls_context(), timeout=1
+            )
+            conn.request("GET", "/n/1")
+            conn.getresponse().read()
+            conn.close()
+            return proc, port
+        except (OSError, ssl.SSLError, http.client.HTTPException):
+            time.sleep(0.25)
+    proc.kill()
+    pytest.skip(f"{proto} sized server never became reachable")
+
+
+@pytest.fixture(scope="module", params=["wsgi", "asgi"])
+def sized_tls_server(request, certpair):
+    proc, port = start_sized(request.param, certpair)
+    yield request.param, port
+    proc.kill()
+    proc.wait(timeout=10)
+
+
+# 0 and 1 bracket the empty-body path; 8000-8300 straddles the 8KB resp_hdr
+# coalescing limit; 16384 and 16896 straddle the recycled block, past which the
+# encrypted response gets its own allocation; 40000 needs three TLS records.
+# fmt: off
+BOUNDARY_SIZES = [
+    0, 1, 63, 64, 1000,
+    8000, 8050, 8060, 8061, 8062, 8063, 8064, 8100, 8191, 8192, 8193, 8300,
+    12000, 16000, 16383, 16384, 16385, 16895, 16896, 16897,
+    20000, 33000, 40000,
+]
+# fmt: on
+
+
+def test_body_sizes_across_buffer_boundaries(sized_tls_server):
+    """One connection, every interesting size, in order.
+
+    Reusing the connection is the point: the encryption block is recycled, so a
+    size that is mishandled leaves its damage on the *next* response.
+    """
+    _proto, port = sized_tls_server
+    conn = http.client.HTTPSConnection(
+        "127.0.0.1", port, context=tls_context(), timeout=15
+    )
+    try:
+        for n in BOUNDARY_SIZES:
+            conn.request("GET", f"/n/{n}")
+            resp = conn.getresponse()
+            body = resp.read()
+            assert resp.status == 200, n
+            assert body == expected_body(n), (
+                f"size {n}: got {len(body)} bytes, wanted {n}"
+            )
+    finally:
+        conn.close()
+
+
+def test_alternating_sizes_reuse_one_connection(sized_tls_server):
+    """Alternate over/under both thresholds so every request changes which
+    branch of the write path runs against the same recycled block."""
+    _proto, port = sized_tls_server
+    conn = http.client.HTTPSConnection(
+        "127.0.0.1", port, context=tls_context(), timeout=15
+    )
+    try:
+        for n in [100, 12000, 200, 40000, 8192, 0, 16384, 500] * 3:
+            conn.request("GET", f"/n/{n}")
+            resp = conn.getresponse()
+            assert resp.status == 200
+            assert resp.read() == expected_body(n), n
+    finally:
+        conn.close()
+
+
+def _read_exactly(sock, n):
+    chunks = []
+    got = 0
+    while got < n:
+        b = sock.recv(min(65536, n - got))
+        if not b:
+            raise AssertionError(f"connection closed after {got} of {n} bytes")
+        chunks.append(b)
+        got += len(b)
+    return b"".join(chunks)
+
+
+def _read_one_response(sock, buf):
+    """Pull one complete HTTP/1.1 response out of sock, returning (body, rest)."""
+    while b"\r\n\r\n" not in buf:
+        b = sock.recv(65536)
+        if not b:
+            raise AssertionError("connection closed mid-headers")
+        buf += b
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    length = None
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.lower() == b"content-length":
+            length = int(value)
+    assert length is not None, head
+    while len(rest) < length:
+        b = sock.recv(65536)
+        if not b:
+            raise AssertionError("connection closed mid-body")
+        rest += b
+    return rest[:length], rest[length:]
+
+
+def test_pipelined_requests_over_tls(sized_tls_server):
+    """All requests written before any response is read.
+
+    A write buffer that is recycled while uv_write still points into it
+    corrupts exactly here and nowhere else - a plain request/response test
+    never has two responses close enough together to notice.
+    """
+    _proto, port = sized_tls_server
+    sizes = [500, 12000, 100, 8192, 40000, 64, 16384, 1000]
+    request = b"".join(
+        f"GET /n/{n} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode() for n in sizes
+    )
+    with (
+        socket.create_connection(("127.0.0.1", port), timeout=20) as raw,
+        tls_context().wrap_socket(raw, server_hostname="localhost") as s,
+    ):
+        s.sendall(request)
+        buf = b""
+        for n in sizes:
+            body, buf = _read_one_response(s, buf)
+            assert body == expected_body(n), f"pipelined size {n}"
+        assert buf == b""
+
+
+def test_many_concurrent_tls_connections(sized_tls_server):
+    """Several connections with responses in flight at once, which is what
+    decides how many encryption blocks the pool has to hand out."""
+    _proto, port = sized_tls_server
+    conns = []
+    try:
+        for i in range(16):
+            c = http.client.HTTPSConnection(
+                "127.0.0.1", port, context=tls_context(), timeout=20
+            )
+            c.connect()
+            conns.append(c)
+        sizes = [(i * 997) % 20000 for i in range(len(conns))]
+        for c, n in zip(conns, sizes):
+            c.request("GET", f"/n/{n}")
+        for c, n in zip(conns, sizes):
+            resp = c.getresponse()
+            assert resp.status == 200
+            assert resp.read() == expected_body(n), n
+    finally:
+        for c in conns:
+            c.close()
+
+
+def test_pipelined_flood_stalls_the_socket(sized_tls_server):
+    """Pipeline more than a socket buffer's worth before reading a byte.
+
+    On loopback uv_write nearly always hands the whole response to the kernel
+    before it returns, so a buffer recycled one instruction too early is
+    invisible.  Backing the socket up is what forces libuv to queue the write
+    and keep its pointer into the encryption buffer live across event-loop
+    turns, which is the only state in which premature reuse can be observed.
+    """
+    _proto, port = sized_tls_server
+    count, size = 96, 16000
+    request = b"".join(
+        f"GET /n/{size} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode()
+        for _ in range(count)
+    )
+    want = expected_body(size)
+    with (
+        socket.create_connection(("127.0.0.1", port), timeout=30) as raw,
+        tls_context().wrap_socket(raw, server_hostname="localhost") as s,
+    ):
+        s.sendall(request)
+        time.sleep(0.5)  # let the server fill and then block on the socket
+        buf = b""
+        for i in range(count):
+            body, buf = _read_one_response(s, buf)
+            assert body == want, f"response {i} of {count} came back corrupted"
+        assert buf == b""
+
+
+def test_response_larger_than_the_socket_buffer(sized_tls_server):
+    """A single response too big for one write, so libuv keeps the encryption
+    buffer alive across several loop turns while draining it."""
+    _proto, port = sized_tls_server
+    size = 2_000_000
+    with (
+        socket.create_connection(("127.0.0.1", port), timeout=30) as raw,
+        tls_context().wrap_socket(raw, server_hostname="localhost") as s,
+    ):
+        s.sendall(f"GET /n/{size} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+        time.sleep(0.3)
+        body, rest = _read_one_response(s, b"")
+        assert rest == b""
+        assert body == expected_body(size)
