@@ -13,6 +13,16 @@
 #  include <picotls.h>
 #  include <picotls/openssl.h>
 #  define TLS_ENC_BUF_SIZE READ_BUF_SIZE
+/* Recycled encryption-output block.  TLS 1.3 caps a record's plaintext at
+ * 16KB and frames it with 22 bytes, so one block of this size holds the
+ * ciphertext of any response that fits a single record -- which is every
+ * response this server emits in practice.  Larger ones fall back to a
+ * per-response malloc that picotls owns, exactly as before. */
+#  define TLS_MAX_RECORD_PLAINTEXT (16 * 1024)
+#  define TLS_WBUF_SIZE            (TLS_MAX_RECORD_PLAINTEXT + 512)
+/* Cap on retained blocks.  The pool's natural high-water mark is the number of
+ * responses in flight at once, but a one-off burst should not pin its peak. */
+#  define TLS_WBUF_POOL_MAX        256
 typedef struct {
     ptls_context_t               ctx;
     ptls_openssl_sign_certificate_t sign_cert;
@@ -102,6 +112,7 @@ typedef struct client_s {
     ptls_t       *tls;
     bool          tls_hs_done;
     ptls_buffer_t tls_wbuf;  /* encrypted response buf; alive until on_write */
+    void         *tls_wblock; /* pooled block backing tls_wbuf, or NULL if picotls owns it */
 #endif
 
     /* --- Large buffers; NOT cleared by client_alloc().  Keep last. --- */
@@ -202,6 +213,8 @@ typedef struct {
 #ifdef FREASTAL_TLS
     tls_server_t  tls;
     bool          tls_enabled;
+    void         *tls_wbuf_pool;      /* free list of TLS_WBUF_SIZE blocks, linked through their first word */
+    int           tls_wbuf_pool_n;
 #endif
 
     /* ASGI mode (runtime-selected; zero-init = WSGI) */
