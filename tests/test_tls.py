@@ -925,6 +925,204 @@ def test_cipher_follows_client_order(tls_server, ciphersuites, expected):
 
 
 # --------------------------------------------------------------------------
+# Orderly shutdown.
+#
+# A TLS close is announced, not just performed: RFC 8446 6.1 has each side
+# send a close_notify alert before dropping the connection, so a peer reading
+# to EOF can tell an intended close from an attacker cutting the TCP stream
+# short.  freastal used to close the socket and nothing else, which every HTTP
+# client tolerates when Content-Length already said the body was complete --
+# and which OpenSSL punishes in the one place it can, by refusing to keep a
+# session it saw truncated.  That is why the resumption below could not work
+# until this did (#57).
+#
+# Python's ssl module papers over exactly this by default:
+# suppress_ragged_eofs=True turns a missing close_notify into a quiet b"".
+# These tests turn it off, which makes reaching EOF at all the assertion.
+# --------------------------------------------------------------------------
+
+CLOSE_REQUEST = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+HTTP10_REQUEST = b"GET / HTTP/1.0\r\n\r\n"
+
+
+def _read_to_eof_strictly(port, request):
+    """One request, read to EOF on a socket that will not hide a bad close.
+
+    recv() raises ssl.SSLEOFError if the server drops the connection without
+    a close_notify, so the return itself is the assertion; the bytes come back
+    so the caller can also check the response survived intact.
+    """
+    raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+    with tls_context().wrap_socket(
+        raw, server_hostname="localhost", suppress_ragged_eofs=False
+    ) as sock:
+        sock.sendall(request)
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+
+@pytest.mark.parametrize(
+    ("label", "request_bytes"),
+    [("connection-close", CLOSE_REQUEST), ("http-1.0", HTTP10_REQUEST)],
+)
+def test_close_notify_precedes_the_close(tls_server, label, request_bytes):
+    """Both ways an HTTP client asks for the connection to end.
+
+    They are one branch in on_write -- !keep_alive -- but they reach it by
+    different routes, a Connection header and an absent one, so both are worth
+    stating.  The response has to arrive intact as well as cleanly terminated:
+    sending the alert in place of the last of the body would satisfy the EOF
+    and serve nobody.
+    """
+    _proto, port = tls_server
+    resp = _read_to_eof_strictly(port, request_bytes)
+    assert resp.startswith(b"HTTP/1."), (label, resp[:80])
+    assert b" 200 " in resp.split(b"\r\n", 1)[0], (label, resp[:80])
+    assert resp.endswith(BODY), (label, resp[-80:])
+
+
+def test_close_notify_after_a_segmented_response(sized_tls_server):
+    """Responses whose encryption spanned one block, a chain of them, and the
+    oversized buffer.
+
+    The alert takes a pooled block of its own, and takes it in on_write just
+    after that chain went back -- so this is the case where the close path
+    reuses a block the response was holding a moment earlier.
+    """
+    _proto, port = sized_tls_server
+    for n in [0, 8, 16384, 65536, 2_000_000, 3_000_000]:
+        resp = _read_to_eof_strictly(
+            port,
+            f"GET /n/{n} HTTP/1.1\r\nHost: localhost\r\n"
+            f"Connection: close\r\n\r\n".encode(),
+        )
+        body = resp.split(b"\r\n\r\n", 1)[1]
+        assert body == expected_body(n), (n, len(body))
+
+
+def test_close_notify_blocks_go_back_to_the_pool(sized_tls_server):
+    """The block the alert borrows is released again.
+
+    Leaked here it would leak one per closed connection, which is a shape no
+    keep-alive test can see: every other TLS test in this file reuses its
+    connection or never asks the server to close one.
+    """
+    _proto, port = sized_tls_server
+    for _ in range(20):
+        _read_to_eof_strictly(port, CLOSE_REQUEST)
+
+    conn = http.client.HTTPSConnection(
+        "127.0.0.1", port, context=tls_context(), timeout=20
+    )
+    try:
+        st = _stats(conn)
+        assert st["blocks_live"] == 0, st
+        assert st["bigbufs_live"] == 0, st
+    finally:
+        conn.close()
+
+
+def test_a_peer_that_keeps_talking_through_the_close(sized_tls_server):
+    """Requests pipelined behind the one that asked for the close.
+
+    The alert costs a loop turn that the bare uv_close() did not, and reading
+    is armed across a response, so on_read can now fire on a connection that
+    has already said goodbye.  Starting a second response there would put a
+    second user on c->write_req while the alert still holds it, so
+    tls_send_close_notify() stops reading first.  What the client must see is
+    one response and a clean end, not two responses and not a dead server.
+    """
+    _proto, port = sized_tls_server
+    raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+    with tls_context().wrap_socket(
+        raw, server_hostname="localhost", suppress_ragged_eofs=False
+    ) as sock:
+        sock.sendall(
+            b"GET /n/16384 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            + b"GET /n/8 HTTP/1.1\r\nHost: localhost\r\n\r\n" * 8
+        )
+        resp = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            resp += chunk
+    assert resp.count(b"HTTP/1.1 200") == 1, resp[:200]
+    assert resp.split(b"\r\n\r\n", 1)[1] == expected_body(16384)
+
+    # The server is still serving: a libuv abort on the second write would
+    # have taken the whole process with it.
+    conn = http.client.HTTPSConnection(
+        "127.0.0.1", port, context=tls_context(), timeout=20
+    )
+    try:
+        conn.request("GET", "/n/8")
+        assert conn.getresponse().read() == expected_body(8)
+        st = _stats(conn)
+        assert st["blocks_live"] == 0, st
+    finally:
+        conn.close()
+
+
+def _shutdown_was_announced(raw, sock, incoming):
+    """Read a memory-BIO session to its end; True if it ended in close_notify.
+
+    Handing the BIO a real EOF is what tells the two endings apart: OpenSSL
+    returns b"" when it decrypted a close_notify first, and raises
+    ssl.SSLEOFError when the stream merely stopped.  A wrapped socket cannot
+    be used here because the test has to inject a raw record of its own.
+    """
+    eof = False
+    while True:
+        try:
+            if sock.read(65536):
+                continue
+            return True
+        except ssl.SSLEOFError:
+            return False
+        except ssl.SSLWantReadError:
+            if eof:
+                return False  # nothing more is coming, and no alert came
+        try:
+            chunk = raw.recv(65536)
+        except OSError:
+            chunk = b""  # a reset is an unannounced ending too
+        if chunk:
+            incoming.write(chunk)
+        else:
+            incoming.write_eof()
+            eof = True
+
+
+def test_a_broken_record_layer_closes_without_close_notify(sized_tls_server):
+    """The deliberate asymmetry: a connection whose TLS state is unusable is
+    dropped, not signed off.
+
+    ptls_send_alert() asks only whether the encryption keys exist, so it would
+    happily encrypt an alert with a record layer the peer has just proved it
+    cannot follow -- an announcement that announces nothing.  A bare close is
+    the honest ending, and the guard in tls_read_failed() is what keeps it,
+    so this pins it rather than letting it quietly stop mattering.
+
+    Same shape as test_read_failure_while_a_segmented_response_is_writing:
+    a well-formed application-data record whose body cannot authenticate.
+    """
+    _proto, port = sized_tls_server
+    for _ in range(3):
+        with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
+            sock, incoming, outgoing = _handshake_over_bio(raw, tls_context())
+            sock.write(b"GET /n/8 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            raw.sendall(outgoing.read())
+            raw.sendall(b"\x17\x03\x03\x00\x20" + os.urandom(32))
+            assert not _shutdown_was_announced(raw, sock, incoming)
+
+
+# --------------------------------------------------------------------------
 # Session resumption.
 #
 # The handshake above is the expensive one: a fresh certificate signature on
@@ -943,8 +1141,6 @@ def test_cipher_follows_client_order(tls_server, ciphersuites, expected):
 # has the handshake's own session; what a ticket adds is a non-zero lifetime
 # hint and the ability to resume, so those are what get asserted.
 # --------------------------------------------------------------------------
-
-CLOSE_REQUEST = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
 
 
 def request_over_new_connection(port, ctx, session=None):
