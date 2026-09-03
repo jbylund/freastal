@@ -24,11 +24,12 @@
 /* Cap on retained blocks.  The pool's natural high-water mark is the number of
  * responses in flight at once, but a one-off burst should not pin its peak. */
 #  define TLS_WBUF_POOL_MAX        256
-/* Blocks one response may claim.  Past this it goes back to a single
- * picotls-owned allocation: a response this large is bandwidth-bound, so the
- * memset picotls does on release is amortised over milliseconds of wire time,
- * whereas letting one response take half of a 256-block pool would push every
- * connection sharing the loop onto malloc for as long as it took to drain. */
+/* Blocks one response may claim.  The cap is about pool fairness, not about
+ * iovec limits: letting one response take half of a 256-block pool would push
+ * every connection sharing the loop onto malloc for as long as it took to
+ * drain.  Past this a response takes a single oversized buffer instead --
+ * still freastal's, not picotls's, so there is no ptls_clear_memory() on that
+ * path either.  See tls_bigbuf_get() for how it is retained and reused. */
 #  define TLS_WSEG_MAX             128
 /* Largest oversized buffer worth keeping between responses.  One is retained
  * per loop; anything above this is freed on release rather than pinned. */

@@ -703,9 +703,11 @@ static void tls_write_response_impl(client_t *c) {
      * record instead of costing a block and an iovec of its own.
      *
      * The one thing that does not segment is a response big enough to drain
-     * the pool: past TLS_WSEG_MAX blocks it takes a single picotls-owned
-     * allocation, in the shape tls_release_wbuf() already handles for a block
-     * picotls outgrew.  The block opened here then carries only the chain node.
+     * the pool: past TLS_WSEG_MAX blocks it takes a single oversized buffer
+     * from tls_bigbuf_get(), which freastal owns and retains -- handed to
+     * picotls with is_allocated = 0, exactly as a pooled block is, so it is
+     * neither freed nor swept by picotls on release.  The block opened here
+     * then carries only the chain node.
      */
     size_t nrec      = tls_record_count(hdr_len) + tls_record_count(body_len);
     bool   oversized = unlikely(nrec > TLS_WSEG_MAX);

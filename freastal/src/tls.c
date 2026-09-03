@@ -140,9 +140,22 @@ void tls_bigbuf_put(void *buf, size_t cap) {
  * any reservation the sizing failed to anticipate -- in which case base no
  * longer points at the pooled block and the replacement is picotls-owned and
  * must be freed.  Checking base rather than trusting the sizing is what keeps
- * that from being either a leak or a double free, and it is also how the
- * oversize path is released: there the block carries only the chain node and
- * the ciphertext lives in an allocation picotls was given up front.
+ * that from being either a leak or a double free.
+ *
+ * So base tells the three cases apart:
+ *
+ *   base == block        the ciphertext is in the block itself: no dispose,
+ *                        straight back to the pool.
+ *   base == c->tls_wbig  an oversized response (past TLS_WSEG_MAX blocks).
+ *                        That buffer is freastal's too, handed over with
+ *                        is_allocated = 0, so it goes back to the retained
+ *                        slot and picotls never sweeps it either.  The block
+ *                        carries only the chain node.
+ *   anything else        picotls replaced what we gave it and owns the
+ *                        replacement; dispose frees that.  If it displaced the
+ *                        oversized buffer, ours is still live and its capacity
+ *                        is no longer recorded anywhere, so it goes back to
+ *                        malloc rather than to the slot.
  *
  * Every segment of the chain is released, which matters because a response is
  * one uv_write over all of them: they live and die together.
