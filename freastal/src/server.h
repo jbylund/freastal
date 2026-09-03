@@ -23,6 +23,28 @@
 /* Cap on retained blocks.  The pool's natural high-water mark is the number of
  * responses in flight at once, but a one-off burst should not pin its peak. */
 #  define TLS_WBUF_POOL_MAX        256
+/* Plaintext that one read produced and read_buf had no room for.
+ *
+ * A read hands picotls at most TLS_ENC_BUF_SIZE fresh ciphertext bytes on top
+ * of the one incomplete record it may already be holding, which parse_record()
+ * caps at 5 + PTLS_MAX_ENCRYPTED_RECORD_SIZE (vendor/picotls/lib/picotls.c).
+ * Every record costs at least 22 bytes of framing, so the plaintext a single
+ * ptls_receive() sweep can emit is strictly below the sum of the two; two
+ * whole encrypted records is comfortably above it.  Only one sweep's surplus
+ * is ever held, because tls_read_flow() stops reading while the spill is
+ * non-empty, so the bound does not accumulate across reads.
+ *
+ * This is a derivation, not a measurement: nothing exercises the bound at its
+ * limit, and the largest overflow seen while developing this was around 14KB.
+ * tls_spill_stash() range-checks against it rather than trusting the argument. */
+#  define TLS_MAX_ENC_RECORD       (16384 + 256)
+#  define TLS_SPILL_SIZE           (2 * TLS_MAX_ENC_RECORD)
+/* Spill blocks are recycled through a free list, like the encryption blocks
+ * above, and handed back the moment one drains.  The high-water mark is then
+ * the number of connections overflowing at the same instant rather than the
+ * number that have ever overflowed, which is what keeps a pipelining-heavy
+ * workload from pinning 32KB on every open connection. */
+#  define TLS_SPILL_POOL_MAX       64
 typedef struct {
     ptls_context_t               ctx;
     ptls_openssl_sign_certificate_t sign_cert;
@@ -113,6 +135,8 @@ typedef struct client_s {
     bool          tls_hs_done;
     ptls_buffer_t tls_wbuf;  /* encrypted response buf; alive until on_write */
     void         *tls_wblock; /* pooled block backing tls_wbuf, or NULL if picotls owns it */
+    char         *tls_spill;                  /* pooled overflow block, held only while tls_spill_len > 0 */
+    int           tls_spill_len;              /* bytes held in tls_spill; 0 means no block is held */
 #endif
 
     /* --- Large buffers; NOT cleared by client_alloc().  Keep last. --- */
@@ -215,6 +239,8 @@ typedef struct {
     bool          tls_enabled;
     void         *tls_wbuf_pool;      /* free list of TLS_WBUF_SIZE blocks, linked through their first word */
     int           tls_wbuf_pool_n;
+    void         *tls_spill_pool;     /* same, for TLS_SPILL_SIZE read-overflow blocks */
+    int           tls_spill_pool_n;
 #endif
 
     /* ASGI mode (runtime-selected; zero-init = WSGI) */
