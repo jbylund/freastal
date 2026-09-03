@@ -1,3 +1,4 @@
+import glob
 import os
 import subprocess
 import sys
@@ -185,6 +186,41 @@ if has_openssl:
 else:
     print("freastal: OpenSSL not found – TLS 1.3 DISABLED")
 
+# ---------- Build dependency tracking ----------
+
+
+def headers():
+    """Every header the extension compiles against.
+
+    setuptools decides whether to recompile by comparing `sources` plus
+    `depends` against the built object/.so, so headers that are not listed
+    here are invisible to that check: editing server.h alone would leave the
+    stale .so in place and still report success.  Listing them in `depends`
+    does not change the compile line.
+    """
+    return sorted(
+        glob.glob(os.path.join(src_dir, "*.h"))
+        + glob.glob(os.path.join(vendor_php, "*.h"))
+        + glob.glob(os.path.join(vendor_ptls, "lib", "*.h"))
+        + glob.glob(os.path.join(vendor_ptls, "include", "**", "*.h"), recursive=True)
+    )
+
+
+def vendor_inputs():
+    """Every vendor source and header the prebuilt archive stands in for."""
+    return sorted(
+        glob.glob(os.path.join(vendor_php, "*.[ch]"))
+        + glob.glob(os.path.join(vendor_ptls, "lib", "*.[ch]"))
+        + glob.glob(os.path.join(vendor_ptls, "include", "**", "*.h"), recursive=True)
+    )
+
+
+def newer_than(paths, reference):
+    """Return the paths modified more recently than `reference`."""
+    cutoff = os.path.getmtime(reference)
+    return [p for p in paths if os.path.getmtime(p) > cutoff]
+
+
 # ---------- Precompiled vendor archive (cibuildwheel only) ----------
 # scripts/build_vendor.sh compiles picotls + picohttpparser once per arch in
 # before-all so we don't recompile ~11k lines of C for every Python version.
@@ -199,7 +235,23 @@ if os.path.exists(_VENDOR_ARCHIVE):
         os.path.join(src_dir, "freastalmodule.c"),
     ]
     extra_objects = [_VENDOR_ARCHIVE]
-    print(f"freastal: using precompiled vendor archive {_VENDOR_ARCHIVE}")
+    print(
+        f"freastal: using precompiled vendor archive {_VENDOR_ARCHIVE} – "
+        "sources under vendor/ are NOT compiled by this build"
+    )
+    # The archive is built once per arch in cibuildwheel's before-all, so it is
+    # normally newer than everything it contains.  A leftover archive on a dev
+    # machine is not, and then an edit under vendor/ is silently linked away.
+    _stale_vendor = newer_than(vendor_inputs(), _VENDOR_ARCHIVE)
+    if _stale_vendor:
+        print(
+            f"freastal: WARNING {len(_stale_vendor)} vendor file(s) are newer "
+            f"than the archive and will be IGNORED, starting with "
+            f"{_stale_vendor[0]}"
+        )
+        print(
+            f"freastal: WARNING delete {_VENDOR_ARCHIVE} to compile vendor/ from source"
+        )
 else:
     ext_sources = [
         os.path.join(vendor_php, "picohttpparser.c"),
@@ -216,6 +268,7 @@ else:
 ext = Extension(
     "freastal._freastal",
     sources=ext_sources,
+    depends=headers(),
     include_dirs=[
         src_dir,
         vendor_php,
@@ -240,4 +293,5 @@ ext = Extension(
     extra_link_args=extra_link_args,
 )
 
-setup(ext_modules=[ext])
+if __name__ == "__main__":
+    setup(ext_modules=[ext])

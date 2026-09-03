@@ -31,7 +31,10 @@ jobs:
         run: brew install libuv openssl@3
 
       - name: Install freastal + test deps
-        run: pip install -e . pytest httpx
+        # setuptools is a build-system requirement, not a runtime one, and
+        # 3.12+ environments do not preinstall it; tests/test_build_deps.py
+        # imports setup.py, so ask for it explicitly.
+        run: pip install -e . pytest httpx setuptools
 
       - name: Run tests
         run: python -m pytest tests/ -v
