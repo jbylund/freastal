@@ -513,3 +513,77 @@ def test_response_larger_than_the_socket_buffer(sized_tls_server):
         body, rest = _read_one_response(s, b"")
         assert rest == b""
         assert body == expected_body(size)
+
+
+def _handshake_over_bio(raw, ctx):
+    """Drive a TLS handshake through memory BIOs.
+
+    A wrapped socket gives no control over how writes are framed into
+    records; memory BIOs do, which is the only way to put two complete
+    records into one segment on purpose.
+    """
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    sock = ctx.wrap_bio(incoming, outgoing, server_hostname="localhost")
+    while True:
+        try:
+            sock.do_handshake()
+            break
+        except ssl.SSLWantReadError:
+            pending = outgoing.read()
+            if pending:
+                raw.sendall(pending)
+            incoming.write(raw.recv(65536))
+    pending = outgoing.read()
+    if pending:
+        raw.sendall(pending)
+    return sock, incoming, outgoing
+
+
+class _BioReader:
+    """Gives a memory-BIO TLS object the .recv() that _read_one_response wants."""
+
+    def __init__(self, raw, sock, incoming):
+        self._raw, self._sock, self._incoming = raw, sock, incoming
+
+    def recv(self, n):
+        while True:
+            try:
+                data = self._sock.read(n)
+                if data:
+                    return data
+            except ssl.SSLWantReadError:
+                pass
+            chunk = self._raw.recv(65536)
+            if not chunk:
+                return b""
+            self._incoming.write(chunk)
+
+
+def test_two_records_in_one_segment(sized_tls_server):
+    """Two pipelined requests the peer flushed separately.
+
+    ptls_receive() returns after one record's worth of application data, so
+    a read holding two records needs two calls.  Making only the first
+    dropped the second request outright: the server answered once and the
+    client waited for a response that was never sent.
+
+    test_pipelined_requests_over_tls cannot catch this - sendall() of eight
+    small requests is well under the 16KB record limit, so OpenSSL emits a
+    single record and there is no residual to lose.
+    """
+    _proto, port = sized_tls_server
+    sizes = [500, 12000]
+    with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
+        sock, incoming, _outgoing = _handshake_over_bio(raw, tls_context())
+        records = b""
+        for n in sizes:
+            sock.write(f"GET /n/{n} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+            records += _outgoing.read()
+        raw.sendall(records)  # one segment, two complete records
+
+        raw.settimeout(20)
+        reader = _BioReader(raw, sock, incoming)
+        buf = b""
+        for n in sizes:
+            body, buf = _read_one_response(reader, buf)
+            assert body == expected_body(n), f"size {n} in coalesced records"
