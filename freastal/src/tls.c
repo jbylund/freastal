@@ -146,8 +146,8 @@ void tls_wbuf_put(void *block) {
  * pre-segmentation code did at every size over 16,739 bytes -- would make
  * ptls_buffer_dispose() responsible for it, and ptls_buffer__release_memory()
  * memsets buf->off bytes before freeing.  There is nothing there to scrub:
- * ptls_send() encrypts straight from the caller's plaintext into this buffer
- * and never stages a plaintext copy in it, so every byte of it has already
+ * ptls_send_v() encrypts straight from the caller's plaintext into this
+ * buffer and never stages a plaintext copy in it, so every byte of it has already
  * gone out on the wire in the clear.
  *
  * So freastal owns this one too, and keeps one per loop rather than returning
@@ -195,7 +195,7 @@ void tls_bigbuf_put(void *buf, size_t cap) {
  * When the block came from the pool picotls was handed a buffer it does not
  * own (is_allocated = 0), so ptls_buffer_dispose() would neither free it nor
  * return it here -- and its ptls_clear_memory() pass would sweep the entire
- * record for nothing, since ptls_send() encrypts straight from the caller's
+ * record for nothing, since ptls_send_v() encrypts straight from the caller's
  * plaintext into this buffer and so it only ever holds ciphertext.
  *
  * picotls can still swap a block out from under us -- a KeyUpdate record, or
@@ -308,7 +308,7 @@ void tls_conn_free(client_t *c) {
      * already run it, and it is idempotent -- but it is load-bearing on the
      * paths where tls_write_response_impl() closes without ever reaching
      * uv_write: a block or the oversized buffer could not be allocated, or
-     * ptls_send() failed partway through and it took the abandon branch.
+     * ptls_send_v() failed partway through and it took the abandon branch.
      * Those are all out-of-memory paths, so no test reaches them without an
      * allocation-failure hook; deleting this as dead code would leak the whole
      * chain the first time the pool and malloc both came up empty. */

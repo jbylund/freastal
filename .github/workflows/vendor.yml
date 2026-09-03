@@ -1,0 +1,26 @@
+name: Vendored picotls
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "vendor/**"
+      - "scripts/vendor_picotls.sh"
+      - ".github/workflows/vendor.yml"
+  pull_request:
+    paths:
+      - "vendor/**"
+      - "scripts/vendor_picotls.sh"
+      - ".github/workflows/vendor.yml"
+
+jobs:
+  check:
+    name: vendor/picotls == upstream + patches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A hand-edit to vendor/picotls is invisible until the next upstream sync
+      # silently throws it away.  This is what makes that a red build instead:
+      # it re-derives the tree from UPSTREAM_COMMIT plus vendor/patches and
+      # diffs it against what is committed.
+      - run: scripts/vendor_picotls.sh --check

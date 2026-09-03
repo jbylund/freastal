@@ -1759,6 +1759,12 @@ int ptls_receive(ptls_t *tls, ptls_buffer_t *plaintextbuf, const void *input, si
  */
 int ptls_send(ptls_t *tls, ptls_buffer_t *sendbuf, const void *input, size_t inlen);
 /**
+ * encrypts the concatenation of given vectors into multiple TLS records, without the application having to gather the vectors into
+ * one contiguous buffer first. Record boundaries are determined by the total length alone; a boundary may fall in the middle of a
+ * vector. `vec` is read but never modified.
+ */
+int ptls_send_v(ptls_t *tls, ptls_buffer_t *sendbuf, ptls_iovec_t *vec, size_t veccnt);
+/**
  * updates the send traffic key (as well as asks the peer to update)
  */
 int ptls_update_key(ptls_t *tls, int request_update);

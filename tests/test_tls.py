@@ -406,15 +406,17 @@ def sized_tls_server(request, certpair):
 
 
 # 0 and 1 bracket the empty-body path; 8000-8300 straddles the 8KB resp_hdr
-# coalescing limit; 16383-16385 straddles the one-record limit.
+# coalescing limit that ptls_send_v() removed -- kept because it is exactly
+# where a regression would land if the header and the body ever stop being one
+# plaintext stream; 16383-16385 straddles the one-record limit.
 #
 # The rest straddle block boundaries.  A block holds 16896 bytes of ciphertext
-# and a maximal record is 16406, so the first block carries the response
-# header's record, one full body record, and a few hundred bytes of a second;
-# every block after it holds one record.  Where exactly a block ends therefore
-# depends on how long this app's response header is, which is why the sizes
-# come in adjacent triples rather than as one number per boundary.
-# 65536 needs four body records, 100000 seven.
+# and a maximal record is 16406, so a block carries one full record and has no
+# room for a second; the response's last, short record rides in whatever block
+# is open when it is produced.  Where exactly a block ends therefore depends on
+# how long this app's response header is, which is why the sizes come in
+# adjacent triples rather than as one number per boundary.
+# 65536 needs five records, 100000 seven.
 # fmt: off
 BOUNDARY_SIZES = [
     0, 1, 63, 64, 1000,
@@ -995,16 +997,23 @@ RECORD_INNER_OVERHEAD = 17
 CONTENT_TYPE_APPDATA = 23
 
 
-@pytest.mark.parametrize("size", [65536, 100000])
+@pytest.mark.parametrize("size", [65536, 100000, 2_200_000])
 def test_multi_block_response_keeps_maximal_record_framing(sized_tls_server, size):
     """A response spanning several encryption blocks, seen on the wire.
 
     Above one block the response is encrypted a record at a time into a chain
     of pooled blocks and sent as one writev.  What must not change is the
-    framing: one record for the response header, then the body in maximal
-    16KB records.  Splitting the body anywhere else -- at a block boundary,
-    say, or once per iovec -- still decrypts to the right bytes, so a test
-    that only checks the body cannot tell the difference.  This one can.
+    framing: header and body are one plaintext stream cut into maximal 16KB
+    records, so every record but the last is full and the first one is not
+    the short header-only record it used to be.  Splitting anywhere else --
+    at a block boundary, say, or once per iovec -- still decrypts to the right
+    bytes, so a test that only checks the body cannot tell the difference.
+    This one can.
+
+    2_200_000 is past TLS_WSEG_MAX records, so it goes down the oversized
+    path: one buffer, one ptls_send_v() call, and picotls rather than
+    tls_write_response_impl() doing the splitting.  Same framing either way,
+    which is the point of asserting it here rather than in the caller.
     """
     _proto, port = sized_tls_server
     with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
@@ -1021,15 +1030,74 @@ def test_multi_block_response_keeps_maximal_record_framing(sized_tls_server, siz
     records = _tls_records(bytes(reader.ciphertext))
     assert all(t == CONTENT_TYPE_APPDATA for t, _ in records), records
 
+    # The header is not on the wire in the clear, so recover its length from
+    # what the records add up to rather than hard-coding this app's header.
+    plaintext = sum(ln - RECORD_INNER_OVERHEAD for _t, ln in records)
+    assert 0 < plaintext - size < 1024, (plaintext, size)
+
     chunks = [
-        min(MAX_RECORD_PLAINTEXT, size - o)
-        for o in range(0, size, MAX_RECORD_PLAINTEXT)
+        min(MAX_RECORD_PLAINTEXT, plaintext - o)
+        for o in range(0, plaintext, MAX_RECORD_PLAINTEXT)
     ]
-    want = [n + RECORD_INNER_OVERHEAD for n in chunks]
-    assert [ln for _t, ln in records[1:]] == want
-    # The header rides in its own record in front of the first body record,
-    # not in a block of its own.
-    assert records[0][1] < 1024, records[0]
+    assert [ln for _t, ln in records] == [n + RECORD_INNER_OVERHEAD for n in chunks]
+    # The header shares the first record with the body: a record boundary
+    # falls mid-body, not at the seam between the two iovecs.
+    assert records[0][1] == MAX_RECORD_PLAINTEXT + RECORD_INNER_OVERHEAD
+
+
+# Straddles both thresholds: 8191-8300 the 8KB resp_hdr coalescing limit that
+# used to end a record, and 16383-16385 the 16384 that actually does -- with
+# the response header counted in, so the seam falls a little below 16384.
+# fmt: off
+RECORD_COUNT_SIZES = [
+    0, 1, 1000, 8000, 8191, 8192, 8193, 8300,
+    16000, 16200, 16256, 16383, 16384, 16385, 20000, 33000,
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("size", RECORD_COUNT_SIZES)
+def test_response_fills_each_record_before_starting_another(sized_tls_server, size):
+    """Count what a response actually costs in records on the wire.
+
+    The response header and the body are handed to ptls_send_v() as two
+    vectors of one plaintext stream, so the only thing that can end a record
+    is running out of the 16384 bytes TLS 1.3 allows in one.  An 8300-byte
+    body used to cost two records because it was over RESP_HDR_SIZE, the 8KB
+    of scratch embedded in client_t -- a fact about the connection struct's
+    layout, not about TLS.  Now it costs one.
+
+    Asserting that every record but the last is maximal pins both halves at
+    once: no record is cut short at the header/body seam, and none is cut
+    short at a 16KB offset into the *body* either, which is what a naive
+    per-vector split would do.
+    """
+    _proto, port = sized_tls_server
+    with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
+        sock, incoming, outgoing = _handshake_over_bio(raw, tls_context())
+        sock.write(f"GET /n/{size} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+        raw.sendall(outgoing.read())
+        raw.settimeout(20)
+        reader = _BioReader(raw, sock, incoming)
+        body, rest = _read_one_response(reader, b"")
+
+    assert body == expected_body(size)
+    assert rest == b""
+
+    records = _tls_records(bytes(reader.ciphertext))
+    assert all(t == CONTENT_TYPE_APPDATA for t, _ in records), records
+
+    plaintext = sum(ln - RECORD_INNER_OVERHEAD for _t, ln in records)
+    hdr_len = plaintext - size
+    assert 0 < hdr_len < 1024, (hdr_len, records)
+
+    want = [MAX_RECORD_PLAINTEXT + RECORD_INNER_OVERHEAD] * (
+        plaintext // MAX_RECORD_PLAINTEXT
+    )
+    tail = plaintext % MAX_RECORD_PLAINTEXT
+    if tail:
+        want.append(tail + RECORD_INNER_OVERHEAD)
+    assert [ln for _t, ln in records] == want, (size, hdr_len)
 
 
 def test_many_large_responses_in_flight_at_once(sized_tls_server):
