@@ -606,15 +606,15 @@ static void tls_hs_send(client_t *c, ptls_buffer_t *outbuf) {
  * in-flight response, or a request too large to serve, behind it -- never a
  * connection that has quietly stopped making progress.
  *
- * The block is allocated the first time a connection overflows and released by
- * tls_conn_free(), which every close path reaches through on_close.  A
- * connection that never overflows never pays for it, and one that pipelines
- * hard does not malloc per burst.
+ * A block is taken from the pool the first time a connection overflows and
+ * goes straight back the moment it drains, so an idle connection never holds
+ * one.  tls_conn_free() releases any block still held, and every close path
+ * reaches it through on_close.
  */
 static int tls_spill_stash(client_t *c, const uint8_t *src, size_t len) {
     if (unlikely((size_t)c->tls_spill_len + len > TLS_SPILL_SIZE))
         return -1;                          /* see TLS_SPILL_SIZE: unreachable */
-    if (c->tls_spill == NULL && (c->tls_spill = malloc(TLS_SPILL_SIZE)) == NULL)
+    if (c->tls_spill == NULL && (c->tls_spill = tls_spill_get()) == NULL)
         return -1;
     memcpy(c->tls_spill + c->tls_spill_len, src, len);
     c->tls_spill_len += (int)len;
@@ -631,6 +631,29 @@ static void tls_spill_drain(client_t *c) {
     c->tls_spill_len -= (int)take;
     if (c->tls_spill_len > 0)
         memmove(c->tls_spill, c->tls_spill + take, (size_t)c->tls_spill_len);
+    else
+        tls_release_spill(c);   /* empty: back to the pool, not held to close */
+}
+
+/*
+ * Give up on a connection whose TLS state is unusable.
+ *
+ * Reading stays armed across a response now, so a decryption failure can be
+ * discovered while uv_write still holds the response buffers.  Closing here
+ * would complete that write with UV_ECANCELED, and on_write would then close
+ * a second time, which libuv aborts on -- the same trap the nread < 0 branch
+ * of on_read documents.  uv_is_closing() cannot be the answer either: it
+ * would stop this close from repeating, not on_write's.  So when a response
+ * is outstanding, stop reading and let on_write do the closing; keep_alive =
+ * false is what makes it take that branch.
+ */
+static void tls_read_failed(client_t *c, uv_stream_t *stream) {
+    if (unlikely(c->in_flight)) {
+        c->keep_alive = false;
+        if (c->read_armed) { uv_read_stop(stream); c->read_armed = false; }
+        return;
+    }
+    uv_close((uv_handle_t *)&c->handle, on_close);
 }
 
 /*
@@ -680,7 +703,7 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
             if (inlen < nread)
                 tls_on_read_data(c, stream, data + inlen, nread - inlen);
         } else if (ret != PTLS_ERROR_IN_PROGRESS) {
-            uv_close((uv_handle_t *)&c->handle, on_close);
+            tls_read_failed(c, stream);
         }
         return;
     }
@@ -707,7 +730,7 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
         size_t inlen = nread - off;
         if (ptls_receive(c->tls, &plain, data + off, &inlen) != 0) {
             ptls_buffer_dispose(&plain);
-            uv_close((uv_handle_t *)&c->handle, on_close);
+            tls_read_failed(c, stream);
             return;
         }
         if (unlikely(inlen == 0)) break;   /* no progress; nothing left to parse */
@@ -728,7 +751,7 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
         stashed = tls_spill_stash(c, plain.base + take, plain.off - take);
     ptls_buffer_dispose(&plain);
     if (unlikely(stashed < 0)) {
-        uv_close((uv_handle_t *)&c->handle, on_close);
+        tls_read_failed(c, stream);
         return;
     }
 

@@ -587,3 +587,63 @@ def test_two_records_in_one_segment(sized_tls_server):
         for n in sizes:
             body, buf = _read_one_response(reader, buf)
             assert body == expected_body(n), f"size {n} in coalesced records"
+
+
+# --- A record fragmented across segments, with a request behind it ------
+def _record_stream(sock, outgoing, requests):
+    """Encrypt each request separately and return the concatenated records."""
+    out = b""
+    for req in requests:
+        sock.write(req)
+        out += outgoing.read()
+    return out
+
+
+def _big_request(total):
+    """A POST whose headers and body come to exactly `total` bytes.
+
+    16384 of plaintext is the largest a single TLS record can carry, and it is
+    also exactly READ_BUF_SIZE, which is what makes it the interesting size.
+    """
+    head = b"POST /n/500 HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n"
+    body_len = total
+    for _ in range(5):  # settles immediately; the length field barely moves
+        body_len = total - len(head % body_len)
+    request = (head % body_len) + b"x" * body_len
+    assert len(request) == total, len(request)
+    return request
+
+
+def test_split_record_then_pipelined_request(sized_tls_server):
+    """A record fragmented across segments, then a pipelined request behind it.
+
+    This is the case that used to drop the connection outright.  picotls
+    buffers an incomplete record internally, so the *second* read emits the
+    whole 16KB record's plaintext plus the small request that followed it in
+    the same segment -- more plaintext than READ_BUF_SIZE -- and the old code
+    answered that by closing the socket rather than by pacing the decryption.
+
+    Splitting the first record is what makes it reachable: without the split,
+    one read can never emit more plaintext than the ciphertext it took in.
+    """
+    _proto, port = sized_tls_server
+    big = _big_request(16384)
+    small = b"GET /n/300 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+
+    with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
+        sock, incoming, outgoing = _handshake_over_bio(raw, tls_context())
+        records = _record_stream(sock, outgoing, [big, small])
+        # One maximum-sized record followed by a small one.
+        assert len(records) > 16384, len(records)
+
+        raw.sendall(records[:16000])  # first record, incomplete
+        time.sleep(0.3)  # force a separate read, leaving a partial record
+        raw.sendall(records[16000:])  # its tail plus the whole second record
+
+        raw.settimeout(20)
+        reader = _BioReader(raw, sock, incoming)
+        buf = b""
+        body, buf = _read_one_response(reader, buf)
+        assert body == expected_body(500), "large request lost"
+        body, buf = _read_one_response(reader, buf)
+        assert body == expected_body(300), "pipelined request behind it lost"

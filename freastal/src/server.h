@@ -33,6 +33,12 @@
  * whole encrypted records is comfortably above it. */
 #  define TLS_MAX_ENC_RECORD       (16384 + 256)
 #  define TLS_SPILL_SIZE           (2 * TLS_MAX_ENC_RECORD)
+/* Spill blocks are recycled through a free list, like the encryption blocks
+ * above, and handed back the moment one drains.  The high-water mark is then
+ * the number of connections overflowing at the same instant rather than the
+ * number that have ever overflowed, which is what keeps a pipelining-heavy
+ * workload from pinning 32KB on every open connection. */
+#  define TLS_SPILL_POOL_MAX       64
 typedef struct {
     ptls_context_t               ctx;
     ptls_openssl_sign_certificate_t sign_cert;
@@ -227,6 +233,8 @@ typedef struct {
     bool          tls_enabled;
     void         *tls_wbuf_pool;      /* free list of TLS_WBUF_SIZE blocks, linked through their first word */
     int           tls_wbuf_pool_n;
+    void         *tls_spill_pool;     /* same, for TLS_SPILL_SIZE read-overflow blocks */
+    int           tls_spill_pool_n;
 #endif
 
     /* ASGI mode (runtime-selected; zero-init = WSGI) */
