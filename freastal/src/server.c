@@ -591,11 +591,31 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
     uint8_t plain_small[4096];
     ptls_buffer_t plain;
     ptls_buffer_init(&plain, plain_small, sizeof(plain_small));
-    size_t inlen = nread;
-    if (ptls_receive(c->tls, &plain, data, &inlen) != 0) {
-        ptls_buffer_dispose(&plain);
-        uv_close((uv_handle_t *)&c->handle, on_close);
-        return;
+    /*
+     * ptls_receive() stops as soon as it has decrypted one record's worth of
+     * application data and reports how much of the input that consumed, so a
+     * read carrying several records needs several calls.  Two pipelined
+     * requests that the peer flushed separately arrive exactly that way -
+     * two small records in one segment - and decrypting only the first
+     * silently discards the second, leaving the client waiting for a
+     * response that is never sent.  The handshake branch above already
+     * drains its residual; this one has to as well.
+     *
+     * Each call appends to the same buffer, so all of the read's plaintext
+     * lands in read_buf together and the pipelined requests behind the first
+     * are dispatched from there by on_write, exactly as on the plaintext
+     * path.
+     */
+    size_t off = 0;
+    while (off < nread) {
+        size_t inlen = nread - off;
+        if (ptls_receive(c->tls, &plain, data + off, &inlen) != 0) {
+            ptls_buffer_dispose(&plain);
+            uv_close((uv_handle_t *)&c->handle, on_close);
+            return;
+        }
+        if (unlikely(inlen == 0)) break;   /* no progress; nothing left to parse */
+        off += inlen;
     }
     if (plain.off == 0) { ptls_buffer_dispose(&plain); return; }
     if (c->read_len + (int)plain.off > READ_BUF_SIZE) {
