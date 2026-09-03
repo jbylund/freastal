@@ -128,12 +128,15 @@ def _resolve_openssl():
 OPENSSL, OPENSSL_REAL = _resolve_openssl()
 
 
-@pytest.fixture(scope="module")
-def certpair():
-    if OPENSSL is None:
-        pytest.skip("openssl not available to mint a test certificate")
-    d = tempfile.mkdtemp()
-    cert, key = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
+def mint_certpair(directory):
+    """Mint a self-signed localhost cert/key pair into `directory`.
+
+    Split out of the fixture below so test_tls_ticket_ring.py can have a
+    certificate without importing this fixture: pytest registers a fixture
+    under the name it is bound to in the importing module, and a `certpair`
+    bound there would shadow every test's own parameter of that name.
+    """
+    cert, key = os.path.join(directory, "c.pem"), os.path.join(directory, "k.pem")
     subprocess.run(
         [
             OPENSSL,
@@ -154,7 +157,15 @@ def certpair():
         capture_output=True,
         check=True,
     )
-    yield cert, key
+    return cert, key
+
+
+@pytest.fixture(scope="module")
+def certpair():
+    if OPENSSL is None:
+        pytest.skip("openssl not available to mint a test certificate")
+    d = tempfile.mkdtemp()
+    yield mint_certpair(d)
     shutil.rmtree(d, ignore_errors=True)
 
 

@@ -4,7 +4,23 @@
 #include <stddef.h>
 /* Forward declaration only — avoids circular include with server.h */
 typedef struct client_s client_t;
-int  tls_server_init(const char *certfile, const char *keyfile);
+/* ring_fd, if >= 0, is a read-only descriptor for the shared session-ticket
+ * ring the process that called serve() created.  The worker maps it and mints
+ * no keys of its own.  The descriptor stays the caller's to close. */
+int  tls_server_init(const char *certfile, const char *keyfile, int ring_fd);
+
+/* --- the shared session-ticket ring, owner side --------------------------
+ * Called from the process that calls serve() with workers > 1, which never
+ * runs tls_server_init().  All three set a Python exception on failure. */
+/* Create the ring, mint its first key, and hand back the READ-ONLY descriptor
+ * to pass to the workers.  The caller owns that descriptor. */
+int  tls_ticket_ring_create(int *ro_fd_out);
+/* Advance the shared ring one step.  The owner is the only writer. */
+int  tls_ticket_ring_rotate_owned(void);
+/* Zeroize, unmap and close.  Idempotent; safe when no ring was created. */
+void tls_ticket_ring_destroy(void);
+/* The owning pid, or -1 when this process owns no ring. */
+int  tls_ticket_ring_owner_pid(void);
 void tls_conn_init(client_t *c);
 void tls_conn_free(client_t *c);
 
@@ -28,5 +44,10 @@ void  tls_spill_put(void *block);
 void  tls_release_spill(client_t *c);
 #endif /* FREASTAL_TLS */
 
-/* Test hook: advance the ticket key ring one step. */
+/* Advance the process-local ticket key ring one step. */
 void tls_ticket_rotate_once(void);
+/* Test/ops hook: advance whichever ring this process is actually using, and
+ * do not return until this process can see the result.  Owner and workers=1
+ * rotate in place; a worker asks the owner and waits for the new key to show
+ * up through the shared mapping.  0, or -1 with a Python exception set. */
+int  tls_ticket_rotate_hook(void);

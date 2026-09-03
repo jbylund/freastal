@@ -600,7 +600,8 @@ int server_reuseport_supported(void) {
 }
 
 int server_init(PyObject *app, const char *host, int port, bool reuse_port,
-                const char *certfile, const char *keyfile, int listen_fd) {
+                const char *certfile, const char *keyfile, int listen_fd,
+                int ticket_ring_fd) {
 #ifndef FREASTAL_TLS
     /* This build has no picotls, so a certfile cannot be honoured.  Accepting
      * it and carrying on is a silent downgrade: the server comes up in
@@ -730,9 +731,11 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
 
 #ifdef FREASTAL_TLS
     if (certfile && keyfile) {
-        if (tls_server_init(certfile, keyfile) < 0)
+        if (tls_server_init(certfile, keyfile, ticket_ring_fd) < 0)
             return -1;
     }
+#else
+    (void)ticket_ring_fd;
 #endif
 
     return 0;
