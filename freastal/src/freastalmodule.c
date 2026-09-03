@@ -79,7 +79,42 @@ static PyObject *py_serve_asgi(PyObject *self, PyObject *args, PyObject *kwargs)
     Py_RETURN_NONE;
 }
 
+/* ---- freastal.tls_buffer_stats() ---- */
+
+/*
+ * The TLS write path's two invariants -- every encryption buffer is released
+ * exactly once, and a steady stream of same-size responses allocates nothing
+ * -- are invisible from the wire and would not show up in a short test run.
+ * Exposing the counters lets the test suite assert them directly instead.
+ *
+ * Must be called from the loop thread (i.e. from inside the app callback),
+ * which is the only thread that touches these.
+ */
+static PyObject *py_tls_buffer_stats(PyObject *self, PyObject *args) {
+    (void)self; (void)args;
+#ifdef FREASTAL_TLS
+    return Py_BuildValue(
+        "{s:k,s:k,s:k,s:i}",
+        "blocks_live",   g_server.tls_wbuf_live,
+        "bigbufs_live",  g_server.tls_bigbuf_live,
+        "mallocs",       g_server.tls_wbuf_mallocs,
+        "pool_free",     g_server.tls_wbuf_pool_n
+    );
+#else
+    Py_RETURN_NONE;
+#endif
+}
+
 static PyMethodDef freastal_methods[] = {
+    {
+        "tls_buffer_stats",
+        py_tls_buffer_stats,
+        METH_NOARGS,
+        "tls_buffer_stats()\n\n"
+        "Internal: counters for the TLS encryption-buffer pool.  Returns a dict\n"
+        "with blocks_live, bigbufs_live, mallocs and pool_free, or None if the\n"
+        "extension was built without TLS.  Call from inside the app callback."
+    },
     {
         "serve",
         (PyCFunction)(void(*)(void))py_serve,
