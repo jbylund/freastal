@@ -12,7 +12,18 @@
 #ifdef FREASTAL_TLS
 #  include <picotls.h>
 #  include <picotls/openssl.h>
-#  define TLS_ENC_BUF_SIZE READ_BUF_SIZE
+/* Ciphertext handed to picotls in one read.
+ *
+ * Sized to a whole maximal record rather than to read_buf.  A record picotls
+ * cannot see the end of is copied into tls->recvbuf.rec and reassembled there
+ * -- a malloc, a copy and a free per record -- and at READ_BUF_SIZE that is
+ * not an edge case but the steady state for a peer sending full-size records,
+ * because a maximal record is 16645 wire bytes and the buffer offered was
+ * 16384.  The extra 261 bytes per connection buy the whole of that back.
+ *
+ * This is the read-side twin of the write path's TLS_WBUF_SIZE, which is a
+ * maximal record plus its framing for the same reason. */
+#  define TLS_ENC_BUF_SIZE         (5 + TLS_MAX_ENC_RECORD)
 /* Recycled encryption-output block.  TLS 1.3 caps a record's plaintext at
  * 16KB and frames it with 22 bytes, so one block of this size holds the
  * ciphertext of a whole maximal record with room to spare -- enough that a
@@ -40,7 +51,7 @@
  * -- the largest overflow seen while developing this was around 14KB -- so
  * tls_spill_stash() still range-checks rather than trusting its argument. */
 #  define TLS_MAX_ENC_RECORD       (16384 + 256)
-#  define TLS_SPILL_SIZE           (2 * TLS_MAX_ENC_RECORD)
+#  define TLS_SPILL_SIZE           (TLS_ENC_BUF_SIZE + TLS_MAX_ENC_RECORD)
 /* Spill blocks are recycled through a free list, like the encryption blocks
  * above, and handed back the moment one drains.  The high-water mark is then
  * the number of connections overflowing at the same instant rather than the
