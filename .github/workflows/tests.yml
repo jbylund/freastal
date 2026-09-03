@@ -42,6 +42,11 @@ jobs:
   no-tls:
     name: Build without OpenSSL
     runs-on: ubuntu-latest
+    # Job-level, not per-step: the build needs it to omit TLS, and the tests
+    # need it to know the omission was deliberate rather than a TLS build that
+    # has quietly lost its OpenSSL.
+    env:
+      FREASTAL_NO_TLS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -54,7 +59,7 @@ jobs:
       # can build TLS produces that configuration by accident, so it went
       # untested; FREASTAL_NO_TLS forces it.
       - name: Install freastal without TLS
-        run: FREASTAL_NO_TLS=1 pip install -e . pytest httpx
+        run: pip install -e . pytest httpx
       - name: TLS is genuinely absent from this build
         run: python -c "import freastal; assert freastal.has_tls is False"
       - name: A certfile is refused, not silently downgraded
