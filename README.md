@@ -6,27 +6,73 @@ A fast WSGI/ASGI server for Python, built as a C extension on top of [libuv](htt
 
 ## Performance
 
-Benchmarked against gunicorn+uvicorn (the most common production Python stack) as baseline. 30-second runs, `wrk -t4 -c40`, 4 worker processes, ARM64 Linux.
+Regenerate with `bench/compare/run.sh`, which runs every server in a Linux
+container under identical conditions and writes this table plus a JSON record.
+See [bench/compare/README.md](bench/compare/README.md) for the method.
+
+| | |
+|---|---|
+| Platform | aarch64, Debian GNU/Linux 13 (trixie) (kernel 7.0.12-linuxkit) |
+| CPU | Apple M5 Max, 18 available |
+| Python | 3.12.14 |
+| libuv | 1.52.1 |
+| Load | `wrk -t4 -c40`, 30s x 3 rounds (median), loopback |
+| Versions | gunicorn 23.0.0, uvicorn 0.34.0 (uvloop + httptools), bjoern 3.2.2 |
+| freastal | b1b4b69 |
+
 
 ### 500B response
 
-| Server | Protocol | Req/s | p50 | p99 | vs baseline |
-|--------|----------|------:|----:|----:|------------:|
-| **gunicorn+uvicorn** | **ASGI** | **~225k** | **156µs** | **476µs** | **1.00×** |
-| bjoern | WSGI | ~370k | 90µs | 390µs | 1.65× |
-| freastal | WSGI | ~424k | 78µs | 312µs | 1.88× |
-| freastal | ASGI | ~408k | 81µs | 317µs | 1.81× |
-| freastal | TLS 1.3 | ~421k | 78µs | 342µs | 1.87× |
+| Server | Protocol | TLS | Workers | Req/s | p50 | p99 | vs baseline | between | within |
+|--------|----------|:---:|--------:|------:|----:|----:|------------:|--------:|-------:|
+| **gunicorn+uvicorn** | **ASGI** | **no** | **1** | **~112k** | **318us** | **672us** | **1.00x** | **6%** | **4%** |
+| bjoern | WSGI | no | 1 | ~256k | 150us | 249us | 2.28x | 2% | 3% |
+| freastal | WSGI | no | 1 | ~357k | 103us | 215us | 3.18x | 4% | 10% |
+| freastal | ASGI | no | 1 | ~277k | 133us | 271us | 2.48x | 3% | 8% |
+| freastal | WSGI | yes | 1 | ~302k | 123us | 244us | 2.70x | 5% | 8% |
+| freastal | ASGI | yes | 1 | ~238k | 158us | 292us | 2.13x | 3% | 9% |
+| **gunicorn+uvicorn** | **ASGI** | **no** | **4** | **~374k** | **94us** | **225us** | **1.00x** | **3%** | **7%** |
+| bjoern | WSGI | no | 4 | ~786k | 39us | 123us | 2.10x | 6% | 5% |
+| freastal | WSGI | no | 4 | ~856k | 34us | 122us | 2.29x | 2% | 4% |
+| freastal | ASGI | no | 4 | ~799k | 39us | 126us | 2.14x | 10% | 5% |
+| freastal | WSGI | yes | 4 | ~778k | 40us | 129us | 2.08x | 7% | 5% |
+| freastal | ASGI | yes | 4 | ~762k | 40us | 125us | 2.04x | 3% | 5% |
 
 ### 12KB response
 
-| Server | Protocol | Req/s | p50 | p99 | vs baseline |
-|--------|----------|------:|----:|----:|------------:|
-| **gunicorn+uvicorn** | **ASGI** | **~201k** | **173µs** | **524µs** | **1.00×** |
-| bjoern | WSGI | ~293k | 120µs | 360µs | 1.46× |
-| freastal | WSGI | ~299k | 114µs | 391µs | 1.49× |
-| freastal | ASGI | ~295k | 115µs | 409µs | 1.47× |
-| freastal | TLS 1.3 | ~279k | 121µs | 555µs | 1.39× |
+| Server | Protocol | TLS | Workers | Req/s | p50 | p99 | vs baseline | between | within |
+|--------|----------|:---:|--------:|------:|----:|----:|------------:|--------:|-------:|
+| **gunicorn+uvicorn** | **ASGI** | **no** | **1** | **~106k** | **334us** | **714us** | **1.00x** | **4%** | **7%** |
+| bjoern | WSGI | no | 1 | ~220k | 176us | 260us | 2.08x | 2% | 2% |
+| freastal | WSGI | no | 1 | ~319k | 114us | 241us | 3.01x | 3% | 10% |
+| freastal | ASGI | no | 1 | ~261k | 143us | 286us | 2.47x | 6% | 9% |
+| freastal | WSGI | yes | 1 | ~190k | 200us | 405us | 1.79x | 2% | 8% |
+| freastal | ASGI | yes | 1 | ~163k | 233us | 444us | 1.54x | 2% | 12% |
+| **gunicorn+uvicorn** | **ASGI** | **no** | **4** | **~353k** | **101us** | **219us** | **1.00x** | **5%** | **6%** |
+| bjoern | WSGI | no | 4 | ~621k | 51us | 141us | 1.76x | 2% | 5% |
+| freastal | WSGI | no | 4 | ~802k | 39us | 108us | 2.27x | 8% | 4% |
+| freastal | ASGI | no | 4 | ~757k | 42us | 126us | 2.14x | 4% | 7% |
+| freastal | WSGI | yes | 4 | ~512k | 65us | 157us | 1.45x | 8% | 4% |
+| freastal | ASGI | yes | 4 | ~508k | 66us | 176us | 1.44x | 5% | 3% |
+
+**How to read this.** `between` is the spread across the three interleaved
+rounds, `within` is wrk's own per-thread variation inside a run. Both are
+published because a median over scattered samples looks more precise than it
+is. At one worker every row above is cleanly separated. At four workers the
+middle of the pack is not: freastal ASGI, bjoern, and both TLS variants all
+land within a few percent of each other at 500B, and their per-round ranges
+overlap, so treat their ordering as unresolved rather than as shown.
+
+These are comparative figures on one host over loopback, not absolute capacity.
+`wrk` saturates the server rather than holding a fixed rate, so the latency
+columns are queueing latencies under overload.
+
+The application sets `Content-Length` explicitly and uvicorn is installed with
+its `[standard]` extras (uvloop + httptools). Both matter: without the header
+bjoern falls back to chunked encoding and collapses to ~1k rps, and without the
+extras uvicorn runs on plain asyncio and h11 at roughly a third of its real
+throughput. Benchmarking either misconfiguration would flatter freastal by a
+large factor.
 
 ## Installation
 
