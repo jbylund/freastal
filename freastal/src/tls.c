@@ -5,6 +5,46 @@
 #include <openssl/evp.h>
 #include <stdio.h>
 
+/*
+ * picotls' own default, ptls_openssl_key_exchanges[], holds secp256r1 and
+ * nothing else.  Chrome and Firefox do list P-256 in supported_groups, but
+ * neither ever sends a P-256 key share -- they guess X25519MLKEM768 and
+ * X25519 -- so a P-256-only server matches nothing in the first ClientHello
+ * and has to answer with a HelloRetryRequest.  That is an extra round trip on
+ * every new browser connection, plus a keygen both ends then discard, before
+ * settling on the slower of the two curves anyway.
+ *
+ * Membership, not order, is what fixes it.  Both selection sites in picotls
+ * iterate the *client's* list on the outside and ours on the inside:
+ * select_key_share() walks the client's key_share entries and assigns
+ * *selected only while it is still NULL, and select_negotiated_group() walks
+ * the client's supported_groups and returns on its first hit.  The client's
+ * preference decides; the order below is documentation.
+ *
+ * secp384r1 and secp521r1 are deliberately absent.  RFC 8446 makes secp256r1
+ * mandatory for conformant TLS 1.3 clients, so P-256 is already the universal
+ * floor and the larger curves buy no interop -- what they would buy is a
+ * client-chosen cost, since an unauthenticated peer listing secp521r1 first
+ * would make us do a P-521 ECDH per handshake for no security X25519 does not
+ * already give us.  ptls_openssl_key_exchanges_all[] is nearly this list but
+ * also carries the bare mlkem512/768/1024 groups, which have no classical
+ * component; the hybrid keeps X25519 underneath as a floor.
+ *
+ * Both macros below are always defined by picotls/openssl.h, to 0 when the
+ * algorithm is unavailable, and secp256r1 is unconditional -- so OpenSSL < 3.5
+ * degrades to {x25519, secp256r1} and LibreSSL, which has neither, lands back
+ * on today's {secp256r1}.
+ */
+static ptls_key_exchange_algorithm_t *freastal_key_exchanges[] = {
+#if PTLS_OPENSSL_HAVE_X25519MLKEM768
+    &ptls_openssl_x25519mlkem768,
+#endif
+#if PTLS_OPENSSL_HAVE_X25519
+    &ptls_openssl_x25519,
+#endif
+    &ptls_openssl_secp256r1,
+    NULL};
+
 int tls_server_init(const char *certfile, const char *keyfile) {
     tls_server_t *ts = &g_server.tls;
     memset(ts, 0, sizeof(*ts));
@@ -30,7 +70,20 @@ int tls_server_init(const char *certfile, const char *keyfile) {
 
     ts->ctx.random_bytes     = ptls_openssl_random_bytes;
     ts->ctx.get_time         = &ptls_get_time;
-    ts->ctx.key_exchanges    = ptls_openssl_key_exchanges;
+    ts->ctx.key_exchanges    = freastal_key_exchanges;
+    /*
+     * ptls_openssl_cipher_suites[] names AES-256-GCM-SHA384 first, which reads
+     * like a misordering but is not, and is left alone on purpose.  The memset
+     * above leaves ctx.server_cipher_preference at 0, so select_cipher()
+     * honors the *client's* order and this list is only a membership filter:
+     * browsers on AES-capable hardware ask for AES-128-GCM-SHA256 first and
+     * get it, browsers without AES instructions ask for ChaCha20-Poly1305
+     * first and get that.  Both are the right answer for the peer that asked,
+     * and choosing for them here would only make one of the two cases worse.
+     * The SHA384 suite leads the array for picotls' own reason: it reads
+     * cipher_suites[0]->hash when it needs a digest before a suite has been
+     * negotiated, as in the cookie signature on the retry path.
+     */
     ts->ctx.cipher_suites    = ptls_openssl_cipher_suites;
     ts->ctx.sign_certificate = &ts->sign_cert.super;
 
