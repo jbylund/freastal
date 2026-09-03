@@ -1127,9 +1127,9 @@ def test_a_broken_record_layer_closes_without_close_notify(sized_tls_server):
 #
 # The handshake above is the expensive one: a fresh certificate signature on
 # every connection.  A NewSessionTicket lets the next connection skip it, and
-# picotls mints one only when ctx.encrypt_ticket is set.  freastal leaves it
-# NULL (#29), so a client is given nothing to resume with and every reconnect
-# pays for the signature again -- invisible to every test above, and to a
+# picotls mints one only when ctx.encrypt_ticket is set.  Until #29 freastal
+# left it NULL, so a client was given nothing to resume with and every
+# reconnect repeated the signature -- invisible to every test above, and to a
 # keep-alive benchmark, which reconnects never.
 #
 # Python's ssl module drives this rather than s_client, whose -sess_out races
@@ -1163,18 +1163,12 @@ def request_over_new_connection(port, ctx, session=None):
         return sock.session, sock.session_reused, b"".join(chunks)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#29: ctx.encrypt_ticket is NULL, so picotls issues no ticket",
-)
 def test_session_ticket_is_issued_and_resumes(tls_server):
     """A ticket is issued, and offering it back actually resumes.
 
     Two assertions rather than one because a server can do the first without
     the second: minting tickets it then declines to accept resumes nothing
     and still costs a round of ticket encryption.
-
-    When #29 lands, drop the xfail -- strict, so it will say so by failing.
     """
     _proto, port = tls_server
     # One context for both connections: an SSLSession cannot be offered to a
@@ -1192,6 +1186,59 @@ def test_session_ticket_is_issued_and_resumes(tls_server):
     _session, resumed, body = request_over_new_connection(port, ctx, session=session)
     assert resumed, "the server issued a ticket and then would not resume from it"
     assert body.endswith(BODY), body[-200:]
+
+
+# RFC 8446 4.6.1: "Servers MUST NOT use any value greater than 604800 seconds
+# (7 days)."  The hint is what a client caches against, so a server that
+# oversells it hands out tickets it will refuse.
+RFC8446_MAX_TICKET_LIFETIME = 7 * 24 * 60 * 60
+
+
+def test_ticket_lifetime_hint_is_within_the_spec_ceiling(tls_server):
+    _proto, port = tls_server
+    session, _reused, _body = request_over_new_connection(port, tls_context())
+    assert 0 < session.ticket_lifetime_hint <= RFC8446_MAX_TICKET_LIFETIME, (
+        session.ticket_lifetime_hint
+    )
+
+
+def test_ticket_from_another_process_falls_back_to_a_full_handshake(
+    tls_server, certpair
+):
+    """A ticket this process cannot open costs a handshake, never a failure.
+
+    That is the --workers N case with the kernel's choice taken out of it.
+    The ticket key ring is per process, so with SO_REUSEPORT a resuming client
+    lands on the worker that issued its ticket about 1/N of the time and
+    otherwise offers a ticket whose key name nobody holds.  A second server on
+    a port of its own is exactly that situation, made deterministic.
+
+    What must not happen is the connection dying, or the request failing: an
+    unopenable ticket has to degrade to the full handshake the client would
+    have done anyway, which is what freastal did for every connection before
+    #29.  Resumption *across* workers is not covered; see the "Multiple
+    workers" note in freastal/src/tls.c for why it is not attempted.
+    """
+    proto, port = tls_server
+    other_proc, other_port = start(proto, certpair)
+    try:
+        # One context throughout: an SSLSession cannot be offered to a context
+        # other than the one that produced it.  The *server* is what differs.
+        ctx = tls_context()
+        session, _reused, _body = request_over_new_connection(other_port, ctx)
+        assert session is not None and session.ticket_lifetime_hint > 0
+
+        _session, resumed, body = request_over_new_connection(
+            port, ctx, session=session
+        )
+        assert not resumed, (
+            "a ticket sealed by a different process resumed - the two rings "
+            "agree on a key they should not share"
+        )
+        assert body.endswith(BODY), body[-200:]
+    finally:
+        other_proc.kill()
+        other_proc.wait(timeout=10)
 
 
 # TLS 1.3 caps a record's plaintext at 16KB and frames it with 22 bytes: a

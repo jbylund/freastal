@@ -155,9 +155,81 @@ _Static_assert(TLS_WBUF_SIZE >= TLS_MAX_RECORD_PLAINTEXT + 64,
                "a maximal TLS record must fit in one block, or the chain "
                "walk in tls_write_response_impl() cannot make progress");
 
+/*
+ * Session-ticket sealing keys.
+ *
+ * A ticket carries the session's resumption secret, sealed under a key this
+ * process holds, and hands it back to the client to keep.  Whoever holds the
+ * sealing key can open every ticket ever sealed under it, so the key's
+ * lifetime -- not the ticket's -- is what bounds the damage from a later
+ * compromise of the process.  A key minted once at startup and held for the
+ * process lifetime makes that bound the uptime: a month-old server hands an
+ * attacker a month of tickets.  So the key is rotated, and the retired ones
+ * are zeroized rather than kept "just in case".
+ *
+ * The ring is what makes rotation invisible to clients.  The newest key seals;
+ * every key still in the ring can unseal.  A ticket names its key (the 16-byte
+ * label in the clear at the front), so the lookup is by name, not by trial
+ * decryption, and rotation costs nothing on the resumption path.
+ *
+ * The three numbers below are one constraint, not three choices.  A key
+ * becomes current at t0 and stops sealing at t0+ROTATE; the last ticket it
+ * seals is accepted until t0+ROTATE+LIFETIME; the slot is reused -- and the
+ * key destroyed -- at t0+RING*ROTATE.  For no client to be told "resume with
+ * this" and then handed a full handshake for a ticket that has not expired:
+ *
+ *     LIFETIME <= (RING - 1) * ROTATE
+ *
+ * 2h/1h/3 satisfies that exactly.  LIFETIME is 2h because that is OpenSSL's
+ * own default session timeout and comfortably inside RFC 8446's 7-day ceiling,
+ * and because the workload resumption is for -- a user returning to a tab, a
+ * dropped connection reopened, a client that does not pool -- lives in minutes
+ * to a couple of hours, not in days.  The 24h the issue calls "typical" would
+ * buy a few percent more hits at the top of the tail and cost 12x the key
+ * exposure.
+ *
+ * Given LIFETIME, the constraint fixes the exposure: the oldest key in the
+ * ring is RING*ROTATE = LIFETIME*RING/(RING-1) old, so the window can never be
+ * shorter than LIFETIME itself and RING only picks the multiple -- 2x at
+ * RING=2, 1.5x at RING=3, 1.25x at RING=5.  RING=3 takes most of the drop
+ * for 243 bytes of key material and one timer an hour; going to RING=5 would
+ * halve the rotation period to shave the multiple by a further 0.25x.  So:
+ * worst case, an attacker who takes the process at time T can open tickets
+ * sealed as far back as T-3h, against "everything since boot" today.
+ *
+ * What that attacker gets is bounded further by require_dhe_on_psk (see
+ * tls_server_init): a resumed handshake still does a fresh ECDHE, so a
+ * recovered resumption secret does not decrypt recorded traffic.
+ */
+#  define TLS_TICKET_NAME_LEN   16      /* picotls' TICKET_LABEL_SIZE, fixed by the format */
+#  define TLS_TICKET_AES_LEN    32      /* AES-256-CBC */
+#  define TLS_TICKET_HMAC_LEN   32      /* HMAC-SHA256 */
+#  define TLS_TICKET_RING       3
+#  define TLS_TICKET_ROTATE_MS  (60u * 60u * 1000u)   /* 1 hour */
+#  define TLS_TICKET_LIFETIME_S (2u * 60u * 60u)      /* 2 hours */
+_Static_assert((uint64_t)TLS_TICKET_LIFETIME_S * 1000u <=
+                   (uint64_t)(TLS_TICKET_RING - 1) * TLS_TICKET_ROTATE_MS,
+               "a ticket would outlive the key that can open it: clients would "
+               "be handed a surprise full handshake inside ticket_lifetime");
+
+typedef struct {
+    uint8_t name[TLS_TICKET_NAME_LEN];
+    uint8_t aes[TLS_TICKET_AES_LEN];
+    uint8_t hmac[TLS_TICKET_HMAC_LEN];
+    /* False for a slot that has never been filled and for one just zeroized.
+     * Load-bearing, not bookkeeping: a zeroized slot's name is sixteen zero
+     * bytes under an all-zero key, all of which an attacker knows, so matching
+     * one would let anybody forge a ticket. */
+    bool    live;
+} tls_ticket_key_t;
+
 typedef struct {
     ptls_context_t               ctx;
     ptls_openssl_sign_certificate_t sign_cert;
+    ptls_encrypt_ticket_t        ticket_cb;   /* ctx.encrypt_ticket points here */
+    tls_ticket_key_t             ticket_keys[TLS_TICKET_RING];
+    int                          ticket_cur;  /* the slot that seals; the rest only unseal */
+    uv_timer_t                   ticket_timer;
 } tls_server_t;
 #endif
 

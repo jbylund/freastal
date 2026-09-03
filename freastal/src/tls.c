@@ -3,6 +3,12 @@
 #include "tls.h"
 #include <openssl/pem.h>
 #include <openssl/evp.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#  include <openssl/core_names.h>
+#  include <openssl/params.h>
+#else
+#  include <openssl/hmac.h>
+#endif
 #include <stdio.h>
 
 /*
@@ -48,6 +54,179 @@ static ptls_key_exchange_algorithm_t *freastal_key_exchanges[] = {
 #endif
     &ptls_openssl_secp256r1,
     NULL};
+
+/*
+ * ---------------------------------------------------------------------------
+ * Session tickets
+ * ---------------------------------------------------------------------------
+ *
+ * picotls does the sealing and the framing; what it wants from us is a key.
+ * Both ptls_openssl_{encrypt,decrypt}_ticket helpers take an OpenSSL-shaped
+ * key callback: on seal it writes the key name and IV into space picotls has
+ * already reserved at the front of the ticket and initializes the cipher and
+ * MAC contexts; on unseal it is handed the name and IV read off the wire and
+ * either finds that key or returns 0 to say it cannot.  Returning 0 there is
+ * not an error path -- picotls turns it into "this PSK identity did not
+ * decrypt", skips it, and the handshake proceeds as a full one.  That is the
+ * behaviour a client gets today for every connection, so a ticket sealed by a
+ * key this process no longer has costs a handshake, never a failure.
+ *
+ * Nothing here takes a lock, and nothing here needs one.  A freastal worker is
+ * a *process*, not a thread -- freastal/__init__.py starts them with
+ * multiprocessing.Process -- with one libuv loop on one thread, and libuv runs
+ * the rotation timer's callback and the handshake callbacks that read the ring
+ * one at a time on that thread.  The ring is per-process state reached only
+ * from loop callbacks.  The consequence of per-process is under
+ * "Multiple workers" at the bottom of this block.
+ */
+
+/* AES-256-CBC's block size.  picotls hands the callback EVP_MAX_IV_LENGTH
+ * bytes of room for the IV and then advances past all of it regardless of what
+ * the cipher used, so the assert is what keeps the write in bounds. */
+#define TLS_TICKET_IV_LEN 16
+_Static_assert(EVP_MAX_IV_LENGTH >= TLS_TICKET_IV_LEN,
+               "the ticket IV would not fit the space picotls reserves for it");
+
+/*
+ * OpenSSL 3 replaced HMAC_CTX with EVP_MAC_CTX and picotls carries a helper
+ * pair for each.  The pair is chosen here rather than assumed: the _evp pair
+ * is compiled only under `#if OPENSSL_VERSION_NUMBER >= 0x30000000L` in
+ * picotls/openssl.h, so naming it unconditionally would not degrade on an
+ * older OpenSSL or on LibreSSL (which reports 0x20000000L) -- it would fail to
+ * link.  The two paths differ only in how the MAC context is keyed; everything
+ * below is shared.
+ */
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+typedef EVP_MAC_CTX tls_ticket_mac_ctx_t;
+#  define tls_ticket_seal_impl   ptls_openssl_encrypt_ticket_evp
+#  define tls_ticket_unseal_impl ptls_openssl_decrypt_ticket_evp
+
+static int tls_ticket_mac_init(EVP_MAC_CTX *hctx, const uint8_t *key, size_t len) {
+    /* OSSL_PARAM_construct_utf8_string takes a mutable char *, so the digest
+     * name cannot be a string literal here. */
+    char digest[] = "SHA256";
+    OSSL_PARAM params[2] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0),
+        OSSL_PARAM_construct_end()};
+    return EVP_MAC_init(hctx, key, len, params);
+}
+#else
+typedef HMAC_CTX tls_ticket_mac_ctx_t;
+#  define tls_ticket_seal_impl   ptls_openssl_encrypt_ticket
+#  define tls_ticket_unseal_impl ptls_openssl_decrypt_ticket
+
+static int tls_ticket_mac_init(HMAC_CTX *hctx, const uint8_t *key, size_t len) {
+    return HMAC_Init_ex(hctx, key, (int)len, EVP_sha256(), NULL);
+}
+#endif
+
+/* Fill a slot with fresh key material.  ptls_openssl_random_bytes() abort()s
+ * if RAND_bytes fails rather than returning, so there is no partial key to
+ * guard against and no failure for the callers to handle. */
+static void tls_ticket_key_mint(tls_ticket_key_t *k) {
+    ptls_openssl_random_bytes(k->name, TLS_TICKET_NAME_LEN);
+    ptls_openssl_random_bytes(k->aes, TLS_TICKET_AES_LEN);
+    ptls_openssl_random_bytes(k->hmac, TLS_TICKET_HMAC_LEN);
+    k->live = true;
+}
+
+/* The name is public -- it rides in the clear at the front of every ticket --
+ * so an ordinary memcmp is the right comparison; the secret this guards is the
+ * HMAC, which picotls verifies after we hand back the key.  The `live` test is
+ * the one that matters: see tls_ticket_key_t in server.h. */
+static const tls_ticket_key_t *tls_ticket_key_by_name(const unsigned char *name) {
+    const tls_server_t *ts = &g_server.tls;
+    for (int i = 0; i < TLS_TICKET_RING; i++) {
+        const tls_ticket_key_t *k = &ts->ticket_keys[i];
+        if (k->live && memcmp(k->name, name, TLS_TICKET_NAME_LEN) == 0)
+            return k;
+    }
+    return NULL;
+}
+
+static int tls_ticket_key_cb(unsigned char *name, unsigned char *iv,
+                             EVP_CIPHER_CTX *cctx, tls_ticket_mac_ctx_t *hctx,
+                             int enc) {
+    const tls_ticket_key_t *k;
+
+    if (enc) {
+        /* Only the newest key seals.  The older ones in the ring exist so that
+         * tickets issued before the last rotation still open. */
+        k = &g_server.tls.ticket_keys[g_server.tls.ticket_cur];
+        if (unlikely(!k->live))
+            return 0;
+        memcpy(name, k->name, TLS_TICKET_NAME_LEN);
+        ptls_openssl_random_bytes(iv, TLS_TICKET_IV_LEN);
+        if (!EVP_EncryptInit_ex(cctx, EVP_aes_256_cbc(), NULL, k->aes, iv))
+            return 0;
+    } else {
+        /* No key of that name: rotated out, or minted by a different worker
+         * process.  0 means "cannot open", which costs a full handshake. */
+        if ((k = tls_ticket_key_by_name(name)) == NULL)
+            return 0;
+        if (!EVP_DecryptInit_ex(cctx, EVP_aes_256_cbc(), NULL, k->aes, iv))
+            return 0;
+    }
+    return tls_ticket_mac_init(hctx, k->hmac, TLS_TICKET_HMAC_LEN);
+}
+
+static int tls_ticket_encrypt(ptls_encrypt_ticket_t *self, ptls_t *tls,
+                              int is_encrypt, ptls_buffer_t *dst, ptls_iovec_t src) {
+    (void)self;
+    (void)tls;
+    return is_encrypt ? tls_ticket_seal_impl(dst, src, tls_ticket_key_cb)
+                      : tls_ticket_unseal_impl(dst, src, tls_ticket_key_cb);
+}
+
+static void tls_ticket_rotate(uv_timer_t *timer) {
+    tls_server_t *ts = CONTAINER_OF(timer, tls_server_t, ticket_timer);
+    int next = (ts->ticket_cur + 1) % TLS_TICKET_RING;
+
+    /* The slot about to be reused holds the ring's oldest key.  By the
+     * constraint asserted in server.h, every ticket sealed under it expired at
+     * least one rotation ago, so destroying it can cost no resumption that
+     * would otherwise have worked.
+     *
+     * Zeroizing rather than relying on the mint to overwrite the same bytes is
+     * deliberate: this line is where the key is destroyed, and that should not
+     * silently stop being true the day the struct grows a field the mint does
+     * not touch.  ptls_clear_memory is a volatile function pointer, so the
+     * compiler cannot decide the write is dead and drop it -- which is exactly
+     * what it is entitled to do to a plain memset of a struct that is written
+     * again on the next line. */
+    ptls_clear_memory(&ts->ticket_keys[next], sizeof(ts->ticket_keys[next]));
+    tls_ticket_key_mint(&ts->ticket_keys[next]);
+    ts->ticket_cur = next;
+}
+
+/*
+ * Multiple workers.
+ *
+ * With --workers N and SO_REUSEPORT the kernel picks the worker, so a client
+ * resuming lands on the issuing process about 1/N of the time and otherwise
+ * offers a ticket nobody can open -- which the callback above turns into the
+ * full handshake it would have had anyway.  So workers > 1 is no worse than
+ * today and workers = 1 is strictly better; what is missing is the last
+ * (N-1)/N of the win.
+ *
+ * The fix the issue proposes -- derive the key once and let it be inherited
+ * across the fork -- does not work here.  freastal/__init__.py starts workers
+ * with multiprocessing.Process, whose default start method is `spawn` on
+ * macOS: the child re-imports and runs tls_server_init() in a fresh
+ * interpreter with nothing inherited.  On Linux the default is fork, so that
+ * design would work on one platform and silently not on the other, which is
+ * worse than not having it.
+ *
+ * Sharing it explicitly is possible -- pass the key through the spawn pickle,
+ * or seed every worker from one master secret and derive per-epoch keys from
+ * the wall clock so rotation needs no coordination -- but both undo what this
+ * change is for.  The first puts key material in immutable Python bytes that
+ * cannot be zeroized and may be copied by the GC or paged out; the second
+ * makes a single long-lived master the thing worth stealing, and every key
+ * past and future derives from it.  Doing it properly means an operator-owned
+ * key, rotated out of band, the way nginx's ssl_session_ticket_key works.
+ * That is a deployment interface, not a line of C, and it is not this issue.
+ */
 
 int tls_server_init(const char *certfile, const char *keyfile) {
     tls_server_t *ts = &g_server.tls;
@@ -96,8 +275,77 @@ int tls_server_init(const char *certfile, const char *keyfile) {
     ts->ctx.cipher_suites    = ptls_openssl_cipher_suites;
     ts->ctx.sign_certificate = &ts->sign_cert.super;
 
+    /*
+     * Session tickets.  Without encrypt_ticket picotls mints none, so every
+     * reconnect repeats the certificate signature -- the single most expensive
+     * thing in the handshake -- and a browser reopening a connection pays it
+     * again.  ticket_lifetime is what goes on the wire as the client's
+     * lifetime hint, and picotls also enforces it on the way back in
+     * (`now - issue_at > ticket_lifetime * 1000` in the PSK loop), so a ticket
+     * older than this is refused even by a key that could still open it.
+     *
+     * One key now; the timer mints the rest.  Pre-filling the whole ring at
+     * startup would be worse, not better -- a key minted now but not sealing
+     * until (RING-1) rotations from now would sit in memory for RING rotations
+     * beyond that, which is the opposite of the point.
+     */
+    ts->ticket_cur = 0;
+    tls_ticket_key_mint(&ts->ticket_keys[0]);
+    ts->ticket_cb.cb           = tls_ticket_encrypt;
+    ts->ctx.encrypt_ticket     = &ts->ticket_cb;
+    ts->ctx.ticket_lifetime    = TLS_TICKET_LIFETIME_S;
+
+    /*
+     * Make resumption use (EC)DHE, not the ticket secret alone.
+     *
+     * Left at 0, picotls picks HANDSHAKE_MODE_PSK whenever the client offers
+     * psk_ke, and the resumed connection's traffic keys then come only from
+     * the secret inside the ticket.  Anyone who later takes the sealing key
+     * and had recorded the traffic can decrypt it: the resumed session has no
+     * forward secrecy at all, and rotating the key does nothing for sessions
+     * already on the wire.  With this set, the resumed handshake still does a
+     * fresh ECDHE, so a recovered ticket key gives an attacker the resumption
+     * secret and no plaintext.  It bounds *impersonation* within the ticket
+     * window, which is what a bounded key lifetime is for.
+     *
+     * It costs one ECDH per resumption -- the same one a full handshake does,
+     * and not the operation resumption is saving; the certificate signature
+     * is.  It is also free in interop: picotls only drops the psk_ke bit, so a
+     * client offering psk_dhe_ke (OpenSSL, BoringSSL and NSS all offer that
+     * and nothing else) is unaffected, and a hypothetical psk_ke-only client
+     * gets a full handshake rather than a failure.
+     */
+    ts->ctx.require_dhe_on_psk = 1;
+
+    /*
+     * ctx.max_early_data_size stays 0: 0-RTT is deliberately off.  Early data
+     * is replayable by design and a general-purpose WSGI/ASGI server cannot
+     * know whether the application's handlers are idempotent.  Note that this
+     * is what keeps the ticket from carrying an early_data extension in
+     * send_session_ticket(), so clients are never invited to try.
+     */
+
+    /*
+     * Rotation runs on the loop, which is the only thread that reads the ring;
+     * see the block above tls_ticket_key_mint().  g_server.loop is already set
+     * -- server_init() assigns it well before it calls us.
+     *
+     * The handle is unref'd on purpose.  An hourly repeating timer is a
+     * referenced handle that would keep uv_run() from ever returning on its
+     * own; the listening socket already has that effect today, so this changes
+     * nothing now, and stops the ticket ring from being the reason a loop that
+     * has otherwise finished will not stop.
+     */
+    uv_timer_init(g_server.loop, &ts->ticket_timer);
+    uv_unref((uv_handle_t *)&ts->ticket_timer);
+    uv_timer_start(&ts->ticket_timer, tls_ticket_rotate, TLS_TICKET_ROTATE_MS,
+                   TLS_TICKET_ROTATE_MS);
+
     g_server.tls_enabled = true;
-    fprintf(stderr, "[freastal] TLS 1.3 enabled (picotls + OpenSSL backend)\n");
+    fprintf(stderr,
+            "[freastal] TLS 1.3 enabled (picotls + OpenSSL backend); session "
+            "tickets on, %u s lifetime, key rotates every %u s\n",
+            (unsigned)TLS_TICKET_LIFETIME_S, (unsigned)(TLS_TICKET_ROTATE_MS / 1000u));
     return 0;
 }
 
