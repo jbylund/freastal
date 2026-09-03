@@ -183,5 +183,15 @@ PyMODINIT_FUNC PyInit__freastal(void) {
     }
 
     PyModule_AddStringConstant(m, "__version__", "0.0.1");
+
+    /* Whether picotls was compiled in.  This is a build-time fact, but it has
+     * to be readable at runtime: without it a caller cannot tell a TLS build
+     * from one that would quietly serve their certfile's port in plaintext,
+     * and neither can a test. */
+#ifdef FREASTAL_TLS
+    if (PyModule_AddIntConstant(m, "has_tls", 1) < 0) { Py_DECREF(m); return NULL; }
+#else
+    if (PyModule_AddIntConstant(m, "has_tls", 0) < 0) { Py_DECREF(m); return NULL; }
+#endif
     return m;
 }

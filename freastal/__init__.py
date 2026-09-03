@@ -8,8 +8,14 @@ import sys
 import time
 
 from ._freastal import __version__
+from ._freastal import has_tls as _has_tls_int
 from ._freastal import serve as _serve_single
 from ._freastal import serve_asgi as _serve_asgi_single
+
+#: True when this build can serve TLS.  A build without OpenSSL headers
+#: cannot honour certfile/keyfile and now refuses them rather than falling
+#: back to plaintext; this is how a caller checks before asking.
+has_tls = bool(_has_tls_int)
 
 __all__ = ["__version__", "serve", "serve_asgi"]
 

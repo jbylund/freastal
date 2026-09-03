@@ -38,3 +38,24 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v
+
+  no-tls:
+    name: Build without OpenSSL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system deps
+        run: sudo apt-get install -y libuv1-dev
+      # A wheel built where OpenSSL headers are missing has no TLS, and used to
+      # accept a certfile and serve the port in plaintext anyway.  Nothing that
+      # can build TLS produces that configuration by accident, so it went
+      # untested; FREASTAL_NO_TLS forces it.
+      - name: Install freastal without TLS
+        run: FREASTAL_NO_TLS=1 pip install -e . pytest httpx
+      - name: TLS is genuinely absent from this build
+        run: python -c "import freastal; assert freastal.has_tls is False"
+      - name: A certfile is refused, not silently downgraded
+        run: python -m pytest tests/test_silent_fallbacks.py -v -k "not tls_less"
