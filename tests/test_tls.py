@@ -71,15 +71,58 @@ def free_port():
     return p
 
 
+# macOS ships LibreSSL as `openssl`.  It mints a certificate fine, but its
+# s_client refuses -groups outright ("Failed to set groups") and does not print
+# the -msg transcript the key-exchange assertions read, so those tests failed
+# rather than skipped on any dev machine that had not put a real OpenSSL first
+# on PATH.  Prefer a real OpenSSL wherever one is installed alongside it, so the
+# tests actually run there; FREASTAL_OPENSSL overrides the search.
+_OPENSSL_PREFIXES = (
+    "/opt/homebrew/opt/openssl@3/bin/openssl",
+    "/usr/local/opt/openssl@3/bin/openssl",
+)
+
+
+def _is_real_openssl(path):
+    """True when `path version` reports OpenSSL rather than LibreSSL."""
+    try:
+        proc = subprocess.run(
+            [path, "version"], capture_output=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.stdout.startswith(b"OpenSSL")
+
+
+def _resolve_openssl():
+    """Return (an openssl to mint certs with, a real OpenSSL or None).
+
+    FREASTAL_OPENSSL pins the binary outright, so a machine with only LibreSSL
+    can be reproduced on one that also has OpenSSL.
+    """
+    override = os.environ.get("FREASTAL_OPENSSL")
+    if override:
+        candidates = [override]
+    else:
+        candidates = [shutil.which("openssl")]
+        candidates += [p for p in _OPENSSL_PREFIXES if os.path.exists(p)]
+    candidates = [c for c in candidates if c]
+    real = next((c for c in candidates if _is_real_openssl(c)), None)
+    return (candidates[0] if candidates else None), real
+
+
+OPENSSL, OPENSSL_REAL = _resolve_openssl()
+
+
 @pytest.fixture(scope="module")
 def certpair():
-    if shutil.which("openssl") is None:
+    if OPENSSL is None:
         pytest.skip("openssl not available to mint a test certificate")
     d = tempfile.mkdtemp()
     cert, key = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
     subprocess.run(
         [
-            "openssl",
+            OPENSSL,
             "req",
             "-x509",
             "-newkey",
@@ -773,10 +816,15 @@ GROUP_CASES = [
 
 def s_client(port, args):
     """Run one `openssl s_client` handshake, returning its whole transcript."""
-    if shutil.which("openssl") is None:
+    if OPENSSL is None:
         pytest.skip("openssl s_client not available")
+    if OPENSSL_REAL is None:
+        pytest.skip(
+            f"{OPENSSL} is not OpenSSL; its s_client cannot be told which "
+            "groups to offer, nor print what it exchanged"
+        )
     proc = subprocess.run(
-        ["openssl", "s_client", "-connect", f"127.0.0.1:{port}", *args],
+        [OPENSSL_REAL, "s_client", "-connect", f"127.0.0.1:{port}", *args],
         input=b"",
         capture_output=True,
         timeout=S_CLIENT_TIMEOUT,
