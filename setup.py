@@ -164,10 +164,19 @@ ssl_ldflags = pkg_config("--libs-only-L", "openssl")
 ssl_inc = [f[2:] for f in ssl_includes if f.startswith("-I")]
 ssl_lib = [f[2:] for f in ssl_ldflags if f.startswith("-L")]
 
-# Verify we can actually find OpenSSL headers before enabling TLS
-has_openssl = bool(ssl_inc) or any(
-    os.path.exists(os.path.join(d, "openssl", "ssl.h"))
-    for d in ["/usr/include", "/usr/local/include", "/opt/homebrew/include"]
+# Verify we can actually find OpenSSL headers before enabling TLS.
+#
+# FREASTAL_NO_TLS=1 forces the TLS-less build a machine without OpenSSL headers
+# would get.  That configuration is otherwise unreachable on a developer box or
+# in CI, which is how it went untested: the guard that stops a certfile turning
+# into a plaintext listener could not be exercised on any machine that could
+# build TLS in the first place.
+has_openssl = os.environ.get("FREASTAL_NO_TLS") != "1" and (
+    bool(ssl_inc)
+    or any(
+        os.path.exists(os.path.join(d, "openssl", "ssl.h"))
+        for d in ["/usr/include", "/usr/local/include", "/opt/homebrew/include"]
+    )
 )
 
 if has_openssl:

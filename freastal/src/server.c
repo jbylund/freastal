@@ -481,6 +481,23 @@ static int init_wsgi_keys(void) {
 
 int server_init(PyObject *app, const char *host, int port, bool reuse_port,
                 const char *certfile, const char *keyfile) {
+#ifndef FREASTAL_TLS
+    /* This build has no picotls, so a certfile cannot be honoured.  Accepting
+     * it and carrying on is a silent downgrade: the server comes up in
+     * plaintext on the port the caller meant to be TLS, serves every request
+     * in the clear, and reports nothing.  Whether OpenSSL was present is a
+     * build-time fact, but it has to be visible at runtime or it turns into
+     * that. */
+    if (certfile != NULL || keyfile != NULL) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "freastal: this build has no TLS support, so certfile/keyfile "
+            "cannot be honoured -- serving would fall back to plaintext on "
+            "the port you meant to be TLS. Rebuild with OpenSSL headers "
+            "available, or install a wheel from PyPI. freastal.has_tls "
+            "reports what this build can do.");
+        return -1;
+    }
+#endif
     memset(&g_server, 0, sizeof(g_server));
 
     Py_INCREF(app);
@@ -523,7 +540,19 @@ int server_init(PyObject *app, const char *host, int port, bool reuse_port,
     uv_tcp_init(g_server.loop, &g_server.handle);
 
     struct sockaddr_in addr;
-    uv_ip4_addr(host, port, &addr);
+    /* uv_ip4_addr() fills in the family and the port before it parses the
+     * address, so a failure it does not report leaves a well-formed sockaddr
+     * for 0.0.0.0 on the requested port.  serve(host="localhost") therefore
+     * used to listen on every interface, on the right port, and behave
+     * correctly in every visible way -- which is why it went unnoticed.  A
+     * caller asking for loopback got a public listener. */
+    if (uv_ip4_addr(host, port, &addr) != 0) {
+        PyErr_Format(PyExc_ValueError,
+            "freastal: host must be a dotted-quad IPv4 address, not %s -- "
+            "freastal does not resolve names. Use 127.0.0.1 for loopback, "
+            "or 0.0.0.0 for every interface.", host);
+        return -1;
+    }
 
     /* UV_TCP_REUSEPORT availability is probed at build time by setup.py */
 #ifdef FREASTAL_REUSEPORT
