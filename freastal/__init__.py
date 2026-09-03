@@ -87,9 +87,11 @@ def _resolve_reuse_port(reuse_port, workers):
                 "reuse_port=True was requested but this freastal was built "
                 "against a libuv without UV_TCP_REUSEPORT, so there is no "
                 "SO_REUSEPORT flag to pass -- whatever the running kernel could "
-                "do.  Rebuild against a libuv that defines it (1.48 does not, "
-                "1.52 does), or leave reuse_port unset and freastal shares one "
-                "bound listening socket across the workers instead."
+                "do.  UV_TCP_REUSEPORT arrived in libuv 1.49.0, and Ubuntu "
+                "24.04 LTS still ships 1.48 -- so rebuild against 1.49 or newer, "
+                "or leave reuse_port unset and freastal shares one bound "
+                "listening socket across the workers instead, which works on "
+                "any libuv."
             )
         raise ValueError(
             f"reuse_port=True cannot be honoured on {sys.platform}: SO_REUSEPORT "

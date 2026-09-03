@@ -210,6 +210,12 @@ PyMODINIT_FUNC PyInit__freastal(void) {
     /* Whether this build can pass UV_TCP_REUSEPORT to uv_tcp_bind at all.
      * Without it the C layer used to drop a reuse_port=True request on the
      * floor; exporting the flag lets serve() refuse instead of pretending. */
+    /* Which libuv this is actually linked against. UV_TCP_REUSEPORT arrived in
+     * 1.49.0, and whether it is present changes how workers>1 binds -- so when
+     * someone reports "multi-worker is slow", this is the first thing to ask
+     * for, and a build log is usually long gone by then. */
+    PyModule_AddStringConstant(m, "libuv_version", uv_version_string());
+
 #ifdef FREASTAL_REUSEPORT
     /* Retained only to say whether the *flag exists* in the uv.h this was
      * compiled against. Whether it will be honoured is a runtime question and

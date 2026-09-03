@@ -138,8 +138,16 @@ if sys.platform.startswith("linux") and "uv" in libraries:
             libraries = [lib for lib in libraries if lib != "uv"]
             break
 
-# Probe for UV_TCP_REUSEPORT (added in libuv 1.44, but not always present in
-# distro packages even when the version number suggests otherwise).
+# Probe for UV_TCP_REUSEPORT, added in libuv 1.49.0 (2024-10; verified absent
+# in 1.47/1.48 and present from 1.49). Ubuntu 24.04 LTS ships 1.48, so this is
+# not an exotic case -- it is a mainstream deployment target.
+#
+# The probe answers "does the enum exist in the uv.h we are compiling against",
+# which is NOT the same question as "will this flag be honoured at run time":
+# macOS compiles it and then fails every REUSEPORT bind with ENOTSUP, and a
+# wheel built here runs elsewhere. freastal.reuse_port_supported() answers the
+# runtime question by attempting the bind. This macro only says whether there
+# is a flag to pass at all.
 has_uv_reuseport = probe_symbol(
     "#include <uv.h>\nint x = UV_TCP_REUSEPORT;\n",
     extra_include_dirs=include_dirs,
@@ -148,9 +156,12 @@ has_uv_reuseport = probe_symbol(
 define_macros = []
 if has_uv_reuseport:
     define_macros.append(("FREASTAL_REUSEPORT", "1"))
-    print("freastal: UV_TCP_REUSEPORT available – SO_REUSEPORT ENABLED")
+    print("freastal: libuv has UV_TCP_REUSEPORT (workers may bind their own sockets)")
 else:
-    print("freastal: UV_TCP_REUSEPORT not available – SO_REUSEPORT DISABLED")
+    print(
+        "freastal: libuv has no UV_TCP_REUSEPORT (needs 1.49+); workers>1 will "
+        "share one bound listening socket instead"
+    )
 vendor_sources = []
 
 # ---------- OpenSSL + vendored picotls (optional, enables TLS 1.3) ----------
