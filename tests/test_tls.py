@@ -865,6 +865,80 @@ def test_cipher_follows_client_order(tls_server, ciphersuites, expected):
     )
 
 
+# --------------------------------------------------------------------------
+# Session resumption.
+#
+# The handshake above is the expensive one: a fresh certificate signature on
+# every connection.  A NewSessionTicket lets the next connection skip it, and
+# picotls mints one only when ctx.encrypt_ticket is set.  freastal leaves it
+# NULL (#29), so a client is given nothing to resume with and every reconnect
+# pays for the signature again -- invisible to every test above, and to a
+# keep-alive benchmark, which reconnects never.
+#
+# Python's ssl module drives this rather than s_client, whose -sess_out races
+# the ticket: with stdin at EOF it can send close_notify before the ticket
+# arrives, and whether it does varies by release.  Reading an HTTP response
+# to EOF cannot race it.
+#
+# Note that an SSLSession object is not the signal.  A TLS 1.3 client always
+# has the handshake's own session; what a ticket adds is a non-zero lifetime
+# hint and the ability to resume, so those are what get asserted.
+# --------------------------------------------------------------------------
+
+CLOSE_REQUEST = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+
+def request_over_new_connection(port, ctx, session=None):
+    """One request on a connection of its own, read to EOF.
+
+    Returns the session the client came away holding, whether the server
+    agreed to resume, and the body bytes.  Reaching EOF is the point: a
+    NewSessionTicket arrives after the handshake, so a client that stops
+    reading at the end of the response may never see it.
+    """
+    raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+    with ctx.wrap_socket(raw, server_hostname="localhost", session=session) as sock:
+        sock.sendall(CLOSE_REQUEST)
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return sock.session, sock.session_reused, b"".join(chunks)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="#29: ctx.encrypt_ticket is NULL, so picotls issues no ticket",
+)
+def test_session_ticket_is_issued_and_resumes(tls_server):
+    """A ticket is issued, and offering it back actually resumes.
+
+    Two assertions rather than one because a server can do the first without
+    the second: minting tickets it then declines to accept resumes nothing
+    and still costs a round of ticket encryption.
+
+    When #29 lands, drop the xfail -- strict, so it will say so by failing.
+    """
+    _proto, port = tls_server
+    # One context for both connections: an SSLSession cannot be offered to a
+    # context other than the one that produced it.
+    ctx = tls_context()
+
+    session, reused, body = request_over_new_connection(port, ctx)
+    assert not reused, "first connection resumed, with nothing yet to resume from"
+    assert body.endswith(BODY), body[-200:]
+    assert session is not None and session.ticket_lifetime_hint > 0, (
+        "no NewSessionTicket was issued, so a returning client has nothing to "
+        "resume with and every reconnect repeats the certificate signature"
+    )
+
+    _session, resumed, body = request_over_new_connection(port, ctx, session=session)
+    assert resumed, "the server issued a ticket and then would not resume from it"
+    assert body.endswith(BODY), body[-200:]
+
+
 # TLS 1.3 caps a record's plaintext at 16KB and frames it with 22 bytes: a
 # 5-byte header outside the length field, then the content-type byte and the
 # 16-byte AEAD tag inside it.
