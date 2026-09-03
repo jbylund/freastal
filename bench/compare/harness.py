@@ -129,20 +129,17 @@ def provenance(args):
 def effective_cpus():
     """`(usable cores, how to describe them)`.
 
-    A cgroup v2 quota is the real limit, not the host's core count, so a
+    A cgroup quota is the real limit, not the host's core count, so a
     `--cpus=4` run must not divide by 18 and report itself as idle. Used both
     for the recorded provenance and as the denominator of `machine_sat_pct`.
+
+    The count itself comes from `cpusample.available_cpus()` so that the
+    harness and the instrument can never disagree about how many cores are in
+    play; this adds only the human-readable half.
     """
     host = os.cpu_count() or 1
-    try:
-        with open("/sys/fs/cgroup/cpu.max") as f:
-            quota, period = f.read().split()
-        if quota != "max":
-            n = max(int(quota) // int(period), 1)
-            return n, f"{n} (cgroup limit of {host})"
-    except (OSError, ValueError):
-        pass
-    return host, str(host)
+    n = cpusample.available_cpus()
+    return n, (str(n) if n == host else f"{n} (cgroup limit of {host})")
 
 
 def free_port():

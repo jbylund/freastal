@@ -63,6 +63,13 @@ except (ValueError, AttributeError, OSError):  # pragma: no cover - not POSIX
 # instead, and the reader is sent to `srv`/`cli` themselves.
 HIGH_PCT = 80.0
 LOW_PCT = 60.0
+
+# The period the harness actually samples at. 0.5s is both cheaper and more
+# accurate than a faster rate: at 0.02s the cost is 16x higher and the peak
+# degrades into 100 Hz accounting noise, reading 1.19 cores on a 1.00-core
+# burn. Named so a test can state its budget against the rate that ships,
+# rather than against whatever rate the test found convenient to sample at.
+DEFAULT_INTERVAL = 0.5
 # Above this, the *box* is full: server and client are taking each other's
 # cores and neither number describes the software. Checked before the 2x2,
 # since co-resident wrk is exactly this benchmark's known weakness. It is a
@@ -150,6 +157,35 @@ def available():
     return os.path.isdir("/proc/self")
 
 
+def available_cpus():
+    """Cores this process may actually use.
+
+    `os.cpu_count()` reports the *host's* cores even under a cgroup quota, so a
+    CPU-limited container would claim a ceiling it cannot reach - and the
+    saturation percentages, which are all divisions by this number, would come
+    out proportionally understated. A container pinned to 2 of 18 cores reads
+    11% saturated when it is pegged.
+    """
+    n = os.cpu_count() or 1
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:  # cgroup v2
+            quota, period = f.read().split()
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v1
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+            quota = int(f.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read())
+        if quota > 0 and period > 0:
+            return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+    return n
+
+
 class Sampler:
     """Sample a server process group and one client pid on a fixed period.
 
@@ -158,7 +194,7 @@ class Sampler:
     it happened before the first sample.
     """
 
-    def __init__(self, pgid, client_pid, interval=0.5, proc_root="/proc"):
+    def __init__(self, pgid, client_pid, interval=DEFAULT_INTERVAL, proc_root="/proc"):
         self.pgid = pgid
         self.client_pid = client_pid
         self.interval = interval
