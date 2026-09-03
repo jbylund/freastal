@@ -231,6 +231,9 @@ typedef struct {
     PyObject  *asgi_http_11;
     PyObject  *asgi_http_10;
     PyObject  *asgi_scheme_http;
+#ifdef FREASTAL_TLS
+    PyObject  *asgi_scheme_https;
+#endif
     PyObject  *asgi_empty_str;
     PyObject  *asgi_empty_bytes;
     PyObject  *asgi_version_dict;   /* {"version": "3.0"} */
@@ -238,6 +241,11 @@ typedef struct {
 
     /* Fully-populated scope, copied per request.  Never mutated after init. */
     PyObject  *asgi_scope_template;
+#ifdef FREASTAL_TLS
+    /* Same shape, scheme="https"; picked per request on c->tls, the way
+     * the WSGI path keeps two environ templates. */
+    PyObject  *asgi_scope_template_https;
+#endif
     asgi_keys_t asgi_keys;
 } server_t;
 

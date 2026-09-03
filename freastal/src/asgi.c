@@ -282,7 +282,13 @@ PyObject *asgi_coro_step_c(PyObject *self, PyObject *const *args,
 static PyObject *build_asgi_scope(client_t *c) {
     const asgi_keys_t *k = &g_server.asgi_keys;
 
-    PyObject *scope = PyDict_Copy(g_server.asgi_scope_template);
+#ifdef FREASTAL_TLS
+    PyObject *tmpl = c->tls ? g_server.asgi_scope_template_https
+                            : g_server.asgi_scope_template;
+#else
+    PyObject *tmpl = g_server.asgi_scope_template;
+#endif
+    PyObject *scope = PyDict_Copy(tmpl);
     if (unlikely(!scope)) return NULL;
 
 #define SS(key, v) do { \
@@ -777,6 +783,9 @@ int asgi_server_init(PyObject *loop) {
     g_server.asgi_http_11      = PyUnicode_InternFromString("1.1");
     g_server.asgi_http_10      = PyUnicode_InternFromString("1.0");
     g_server.asgi_scheme_http  = PyUnicode_InternFromString("http");
+#ifdef FREASTAL_TLS
+    g_server.asgi_scheme_https = PyUnicode_InternFromString("https");
+#endif
     g_server.asgi_empty_str    = PyUnicode_InternFromString("");
     g_server.asgi_empty_bytes  = PyBytes_FromStringAndSize("", 0);
 
@@ -794,6 +803,9 @@ int asgi_server_init(PyObject *loop) {
 
     if (!g_server.asgi_type_http   || !g_server.asgi_http_11      ||
         !g_server.asgi_http_10     || !g_server.asgi_scheme_http   ||
+#ifdef FREASTAL_TLS
+        !g_server.asgi_scheme_https ||
+#endif
         !g_server.asgi_empty_str   || !g_server.asgi_empty_bytes   ||
         !g_server.asgi_version_dict|| !g_server.asgi_server_tuple)
         return -1;
@@ -842,6 +854,19 @@ int asgi_server_init(PyObject *loop) {
         if (!k->http_version || !k->method || !k->path || !k->raw_path ||
             !k->query_string || !k->client || !k->headers)
             return -1;
+
+#ifdef FREASTAL_TLS
+        /* A TLS connection needs scheme="https": frameworks build absolute
+         * URLs from scope["scheme"], so serving it as "http" produces http://
+         * links and redirect loops behind TLS.  Copying the finished template
+         * and overwriting one value keeps both in the same key-table shape,
+         * which is what makes the per-request PyDict_Copy cheap. */
+        PyObject *ts = PyDict_Copy(t);
+        if (!ts) return -1;
+        g_server.asgi_scope_template_https = ts;
+        if (PyDict_SetItemString(ts, "scheme", g_server.asgi_scheme_https) < 0)
+            return -1;
+#endif
     }
 
     /* uv_check_t: step asyncio after each libuv I/O poll */
