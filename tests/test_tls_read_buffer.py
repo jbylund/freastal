@@ -457,7 +457,7 @@ def test_mid_range_post_bodies_are_decrypted_in_place(echo_tls_server):
     _proto, port = echo_tls_server
     with connect(port, timeout=30) as s:
         before, buf = stats(s)
-        assert before["read_zerocopy_max"] == READ_BUF_SIZE - 22, before
+        assert before["read_zerocopy_max"] == READ_BUF_SIZE, before
         for n in (4096, 5000, 6144, 8192, 10000, 12288, 14000, 16000):
             req, body = post(f"m{n}", n)
             s.sendall(req)
@@ -469,38 +469,69 @@ def test_mid_range_post_bodies_are_decrypted_in_place(echo_tls_server):
         assert buf == b""
 
 
-def test_requests_up_to_the_zero_copy_limit_never_grow(echo_tls_server):
-    """Either side of read_zerocopy_max, by total request size.
+def test_every_request_read_buf_can_hold_is_decrypted_in_place(echo_tls_server):
+    """Up to and including a request that fills read_buf exactly.
 
     The limit is a property of the *request*, not of the body, because the
     reservation is against read_buf as a whole -- so these are built to an
-    exact wire length.  Below it the decrypt must stay in place; the sizes
-    above it are here to be answered correctly, not quickly.
+    exact wire length.  The top of the range is what TLS_DECRYPT_SLACK exists
+    for: a record needs 22 bytes more capacity than the plaintext it yields,
+    so without the slack behind read_buf these last few sizes would each take
+    an allocation despite fitting.  The rule the slack buys is the simple one
+    -- read_buf takes a record whenever its plaintext fits -- and this is the
+    test that says so.
     """
     _proto, port = echo_tls_server
     with connect(port, timeout=30) as s:
         base, buf = stats(s)
         limit = base["read_zerocopy_max"]
+        assert limit == READ_BUF_SIZE, base
 
-        for total in (limit - 64, limit - 2, limit - 1, limit):
+        for total in (limit - 64, limit - 23, limit - 22, limit - 2, limit - 1, limit):
             req, body = post_of_total(f"z{total}", total)
             s.sendall(req)
             got, buf = expect_response(s, buf, f"{total}-byte request")
             assert got == fingerprint(f"z{total}", body), total
-        mid, buf = stats(s, buf)
-        assert mid["read_grows"] == base["read_grows"], (base, mid)
-
-        # The last 22 bytes of read_buf: the record's framing needs room the
-        # payload leaves nothing for, so picotls takes the buffer over.  The
-        # request is still answered, which is the whole point of detecting
-        # that rather than failing on it.
-        for total in (limit + 1, limit + 2, READ_BUF_SIZE - 1, READ_BUF_SIZE):
-            req, body = post_of_total(f"o{total}", total)
-            s.sendall(req)
-            got, buf = expect_response(s, buf, f"{total}-byte request")
-            assert got == fingerprint(f"o{total}", body), total
         end, buf = stats(s, buf)
-        assert end["read_grows"] > mid["read_grows"], (mid, end)
+        assert end["read_grows"] == base["read_grows"], (base, end)
+        assert end["read_spills"] == base["read_spills"], (base, end)
+        assert buf == b""
+
+
+def test_the_growth_fallback_is_still_reachable_and_correct(echo_tls_server):
+    """A sweep whose plaintext genuinely outruns the free space in read_buf.
+
+    Nothing that fits read_buf grows any more, and two requests flushed
+    together no longer do either -- a maximal record now arrives whole and
+    lands in place, and the second one waits for the room the response frees.
+    What is left of the fallback is a sweep that starts with read_buf already
+    part-full: an unfinished request is buffered first, then the rest of it
+    and another request behind it arrive together, and that sweep's plaintext
+    has nowhere to go.  picotls takes the buffer over, the surplus goes to the
+    spill, and both requests are answered -- which is the point of detecting
+    growth rather than failing on it.
+
+    If this stops growing, the fallback has stopped being exercised and the
+    zero-copy tests above are no longer load-bearing.
+    """
+    _proto, port = echo_tls_server
+    req_a, body_a = post("g0", 10000)
+    req_b, body_b = post("g1", 9000)
+    split = len(req_a) - 1000
+    assert split + len(req_b) + 1000 > READ_BUF_SIZE, "must outrun read_buf"
+
+    with connect(port, timeout=30) as s:
+        base, buf = stats(s)
+        s.sendall(req_a[:split])
+        time.sleep(0.3)  # let the server buffer it and go back to waiting
+        s.sendall(req_a[split:] + req_b)
+        got, buf = expect_response(s, buf, "overflowing request 1")
+        assert got == fingerprint("g0", body_a)
+        got, buf = expect_response(s, buf, "overflowing request 2")
+        assert got == fingerprint("g1", body_b)
+        end, buf = stats(s, buf)
+        assert end["read_grows"] > base["read_grows"], (base, end)
+        assert end["read_spills"] > base["read_spills"], (base, end)
         assert buf == b""
 
 

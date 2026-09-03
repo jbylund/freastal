@@ -80,12 +80,28 @@
  */
 #  define TLS_MAX_DECRYPT_RESERVE  (5 + TLS_MAX_ENC_RECORD)
 /*
- * The zero-copy guarantee, stated as a size.  Growth happens exactly when
- * read_len + plaintext + TLS_RECORD_OVERHEAD exceeds READ_BUF_SIZE, so a
- * request whose accumulated bytes never pass this never grows -- whatever the
- * peer's record sizes, and however many records or reads it is split over.
+ * Physical tail behind read_buf, so that a reservation can overhang what it
+ * will actually keep.
+ *
+ * A record needs TLS_RECORD_OVERHEAD more bytes of capacity than the plaintext
+ * it yields, so without a tail the last 22 bytes of read_buf are room no
+ * record can decrypt into, and a request sized to the end of the buffer falls
+ * onto an allocation despite fitting.  Exactly TLS_RECORD_OVERHEAD of tail
+ * closes that band and no more: a satisfied reservation leaves at most
+ *
+ *     off <= (READ_BUF_SIZE + slack) - 5 - 1 - tag == READ_BUF_SIZE
+ *
+ * so read_len still cannot pass READ_BUF_SIZE and every bound downstream that
+ * assumes so is untouched.  A wider tail would break that, not improve it.
  */
-#  define TLS_READ_ZEROCOPY_MAX    (READ_BUF_SIZE - TLS_RECORD_OVERHEAD)
+#  define TLS_DECRYPT_SLACK        TLS_RECORD_OVERHEAD
+/*
+ * The zero-copy guarantee, stated as a size.  With the slack above, a record
+ * decrypts into read_buf exactly when its plaintext fits there -- so the
+ * guarantee covers every request read_buf can hold at all, and anything past
+ * it is refused rather than copied.
+ */
+#  define TLS_READ_ZEROCOPY_MAX    READ_BUF_SIZE
 _Static_assert(TLS_RECORD_OVERHEAD == 5 + 1 + 16,
                "5-byte record header, one inner content-type byte, 16-byte "
                "AEAD tag; revisit if a suite with another tag size is added");
@@ -150,6 +166,14 @@ typedef struct {
 #define GIL_UNLOCK()  PyGILState_Release(_gilstate)
 
 #define READ_BUF_SIZE   (16 * 1024)   /* embedded per-client read buffer */
+#ifndef FREASTAL_TLS
+#  define TLS_DECRYPT_SLACK 0         /* no decrypt path: no reservation to overhang */
+#endif
+/* What read_buf actually occupies.  READ_BUF_SIZE is what may be *kept*; the
+ * slack past it is transit space a TLS reservation may overhang into.  Every
+ * bound in the server is written against READ_BUF_SIZE -- this name appears
+ * only where the array's real width is meant. */
+#define READ_BUF_ALLOC  (READ_BUF_SIZE + TLS_DECRYPT_SLACK)
 #define RESP_HDR_SIZE   (8  * 1024)   /* embedded per-client response header buffer */
 #define MAX_HEADERS     64
 #define LISTEN_BACKLOG  4096
@@ -163,9 +187,12 @@ _Static_assert(TLS_SPILL_SIZE >= TLS_ENC_BUF_SIZE + TLS_MAX_ENC_RECORD,
                "one sweep's surplus plaintext must fit the spill: the fresh "
                "ciphertext a read delivers, plus the one partial record "
                "picotls may already be holding, bound it from above");
-_Static_assert(TLS_READ_ZEROCOPY_MAX > 0 && TLS_READ_ZEROCOPY_MAX < READ_BUF_SIZE,
-               "read_buf must hold one record's framing and some plaintext, "
-               "or tls_on_read_data() has no zero-copy path at all");
+_Static_assert(TLS_READ_ZEROCOPY_MAX == READ_BUF_SIZE,
+               "the slack is what lifts the zero-copy bound to the whole of "
+               "read_buf; if it shrinks, this is the line that says so");
+_Static_assert(READ_BUF_ALLOC - TLS_DECRYPT_SLACK == READ_BUF_SIZE,
+               "the slack is transit space for a reservation, never capacity "
+               "read_len may use");
 #endif
 
 /*
@@ -238,7 +265,7 @@ typedef struct client_s {
     /* --- Large buffers; NOT cleared by client_alloc().  Keep last. --- */
     struct phr_header headers[MAX_HEADERS];
     char              resp_hdr[RESP_HDR_SIZE];
-    char              read_buf[READ_BUF_SIZE];
+    char              read_buf[READ_BUF_ALLOC];
 } client_t;
 
 /* Bytes client_alloc() clears: everything up to the first large buffer. */
@@ -256,7 +283,14 @@ _Static_assert(offsetof(client_t, headers) + MAX_HEADERS * sizeof(struct phr_hea
 _Static_assert(offsetof(client_t, resp_hdr) + RESP_HDR_SIZE
                    == offsetof(client_t, read_buf),
                "read_buf must directly follow resp_hdr");
-_Static_assert(offsetof(client_t, read_buf) + READ_BUF_SIZE == sizeof(client_t),
+/* Not an equality: READ_BUF_ALLOC carries a 22-byte TLS tail, which leaves
+ * client_t with a few bytes of alignment padding behind read_buf.  Rounding
+ * the tail up to swallow that padding would be the wrong fix -- the slack is
+ * exactly one record's framing on purpose, and widening it would let a
+ * satisfied reservation leave read_len past READ_BUF_SIZE.  So the assertion
+ * says what is actually meant: nothing but padding may follow read_buf. */
+_Static_assert(sizeof(client_t) - offsetof(client_t, read_buf) - READ_BUF_ALLOC
+                   < _Alignof(client_t),
                "read_buf must be the last field of client_t");
 
 

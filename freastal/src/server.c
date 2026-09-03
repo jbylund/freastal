@@ -764,9 +764,23 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
      * consumes a whole record without emitting a byte.  Both come back with
      * off == 0 and must leave read_buf alone, which falls out of appending.
      */
+    /*
+     * Two sizes, and the difference between them is the whole trick.  `room`
+     * is what this sweep may keep: read_buf's free space, the bound every
+     * other part of the server is written against.  The capacity handed to
+     * picotls is that plus TLS_DECRYPT_SLACK, because handle_input() reserves
+     * against a record's *wire* length and then advances off by the shorter
+     * plaintext -- so a reservation legitimately overhangs what it will keep
+     * by one record's framing.  Without the overhang the last 22 bytes of
+     * read_buf are unusable and a request that ends there takes an allocation
+     * it does not need; with exactly that much, a record decrypts in place
+     * whenever its plaintext fits, and `off` still cannot pass READ_BUF_SIZE
+     * (see TLS_DECRYPT_SLACK for the arithmetic).
+     */
     size_t room = (size_t)(READ_BUF_SIZE - c->read_len);
     ptls_buffer_t plain;
-    ptls_buffer_init(&plain, c->read_buf + c->read_len, room);
+    ptls_buffer_init(&plain, c->read_buf + c->read_len,
+                     (size_t)(READ_BUF_ALLOC - c->read_len));
     /*
      * ptls_receive() stops as soon as it has decrypted one record's worth of
      * application data and reports how much of the input that consumed, so a
@@ -800,11 +814,17 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
         /*
          * The whole sweep landed in read_buf, which is the ordinary case and
          * the point of the exercise: there is nothing to copy, nothing to
-         * free and nothing to scrub.  plain.off cannot have run past the
-         * capacity advertised above, because the only way past it is the
-         * growth branch of ptls_buffer_reserve() -- which is precisely what
-         * is_allocated reports.  The check is a cheap standing guard on that
-         * reading of picotls, not a case with a behaviour of its own.
+         * free and nothing to scrub.
+         *
+         * `produced > room` is the slack arithmetic stated as a runtime
+         * check.  A satisfied reservation can overhang room by at most the
+         * framing it accounted for and did not use, so off lands at or below
+         * READ_BUF_SIZE however many records the sweep decrypted; the only
+         * way past that is the growth branch of ptls_buffer_reserve(), which
+         * is exactly what is_allocated reports.  So this is a standing guard
+         * on that reading of picotls, not a case with a behaviour of its own
+         * -- but it is the one that would catch a slack that stopped being
+         * one record's worth.
          */
         if (unlikely(produced > room)) {
             tls_read_failed(c, stream);
