@@ -635,11 +635,15 @@ S_CLIENT_UNUSABLE = (
 # be miscounted.
 _CLIENT_HELLO = re.compile(r"^>>> TLS 1\.3, Handshake .*ClientHello", re.MULTILINE)
 
-# s_client reports the negotiated group two different ways: a hybrid KEM only
-# in the summary line, a plain curve only as the peer's temp key
-# ("Peer Temp Key: X25519, 253 bits", or "ECDH, prime256v1, 256 bits").
+# s_client reports the negotiated group two different ways, and which ones it
+# prints depends on the release: a hybrid KEM appears only in the summary
+# line, which OpenSSL 3.0 (what ubuntu-latest ships) does not print at all; a
+# plain curve appears only as the temp key, labelled "Server Temp Key" up to
+# 3.0 and "Peer Temp Key" after ("Server Temp Key: X25519, 253 bits", or
+# "ECDH, prime256v1, 256 bits").  Accept either label, or a 3.0 handshake that
+# in fact negotiated X25519 reads as no handshake at all.
 _GROUP_LINE = re.compile(r"Negotiated TLS1\.3 group:\s*(\S+)")
-_TEMP_KEY_LINE = re.compile(r"Peer Temp Key:\s*(?:ECDH,\s*)?([^,\n]+)")
+_TEMP_KEY_LINE = re.compile(r"(?:Peer|Server) Temp Key:\s*(?:ECDH,\s*)?([^,\n]+)")
 
 GROUP_CASES = [
     ("X25519MLKEM768:X25519:P-256", "X25519MLKEM768"),  # current Chrome/Firefox
