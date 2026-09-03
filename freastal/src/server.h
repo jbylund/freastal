@@ -516,8 +516,10 @@ static inline int write_uint(char *dst, int remaining, Py_ssize_t n) {
 }
 
 /* Server lifecycle */
+/* listen_fd < 0 binds host:port here; otherwise it is an already-bound
+ * listening socket the caller owns and server_init dup()s. */
 int  server_init(PyObject *app, const char *host, int port, bool reuse_port,
-                 const char *certfile, const char *keyfile);
+                 const char *certfile, const char *keyfile, int listen_fd);
 void server_run(void);
 
 /* Client pool */

@@ -121,6 +121,29 @@ freastal.serve(app, host="0.0.0.0", port=8000, workers=4,
 
 TLS requires OpenSSL headers at build time. Wheels published to PyPI include TLS support.
 
+### Workers
+
+`workers=N` starts N server processes. The listening socket is bound once, in the
+parent, and handed to every worker, so a bind failure is reported once from
+`serve()` rather than N times inside the workers.
+
+Two things follow from that:
+
+- **The app must be picklable** — in practice a module-level callable. The
+  `spawn` start method (macOS's default, and what `forkserver` does too, which
+  becomes Linux's default in 3.14) re-imports the child rather than inheriting
+  it, so the app travels to the worker as a pickled argument.
+- **`reuse_port` is a tri-state.** Unset (the default) enables `SO_REUSEPORT`
+  only where it earns its keep: more than one worker, on a kernel that
+  load-balances the group. `True` demands it and raises where it cannot be
+  honoured. `False` never uses it, and the workers share one accept queue
+  instead — which works everywhere.
+
+`SO_REUSEPORT` load-balances TCP listeners on Linux, FreeBSD, DragonFly and
+Solaris. macOS accepts the option and then delivers every connection to a
+single socket in the group, which is why libuv refuses `UV_TCP_REUSEPORT`
+there and why `reuse_port=True` is an error rather than a no-op.
+
 ## Architecture
 
 - **libuv** — cross-platform event loop; io\_uring-ready on Linux (libuv ≥ 1.45 batches syscalls automatically)
@@ -131,9 +154,9 @@ TLS requires OpenSSL headers at build time. Wheels published to PyPI include TLS
 - Slab allocator for per-connection state — no per-request malloc on the hot path
 - Pre-interned Python strings for all WSGI/ASGI environ keys
 - GIL released for the duration of the libuv event loop; acquired only when calling the WSGI/ASGI application and touching Python response objects
-- `SO_REUSEPORT` (`UV_TCP_REUSEPORT`) for kernel-level load balancing across worker processes
+- `SO_REUSEPORT` (`UV_TCP_REUSEPORT`) for kernel-level load balancing across worker processes, where the kernel supports it
 
-**Multi-process model:** `workers=N` forks N independent OS processes, each with its own libuv loop and Python interpreter (and therefore its own GIL). The kernel distributes incoming connections across workers via `SO_REUSEPORT`.
+**Multi-process model:** `workers=N` starts N independent OS processes, each with its own libuv loop and Python interpreter (and therefore its own GIL). Where `SO_REUSEPORT` load-balances, each worker gets its own accept queue; elsewhere the workers share the single listening socket the parent bound. See [Workers](#workers).
 
 **ASGI event loop bridge (libuv ↔ asyncio):**
 
