@@ -1543,6 +1543,76 @@ def test_blocks_released_when_a_large_response_is_abandoned(sized_tls_server):
         conn.close()
 
 
+BAD_REQUEST = b"\x01\x02 not a request \r\n\r\n"
+
+
+def test_bad_request_over_tls_is_encrypted(sized_tls_server):
+    """The 400 an HTTPS client gets is a 400, not a record-layer failure.
+
+    This is the one response freastal writes without going through
+    write_response(), and it used to be written to the socket exactly as it
+    was built: in the clear, on a connection the peer believes is
+    confidential.  OpenSSL rejects a record whose first byte is 'H', so what
+    an HTTPS client saw for a malformed request was a broken connection and no
+    explanation at all.
+
+    Both routes into that branch are covered.  A bad request on its own is
+    parsed from tls_on_read_data(); one pipelined behind a good request is
+    parsed from on_write, after the first response has been written -- which
+    is the case that reuses c->write_req from inside its own callback.
+    """
+    _proto, port = sized_tls_server
+    for prefix in (b"", b"GET /n/8 HTTP/1.1\r\nHost: localhost\r\n\r\n"):
+        raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+        with tls_context().wrap_socket(
+            raw, server_hostname="localhost", suppress_ragged_eofs=False
+        ) as sock:
+            sock.sendall(prefix + BAD_REQUEST)
+            resp = b""
+            while True:
+                chunk = sock.recv(65536)  # a bare EOF here would raise
+                if not chunk:
+                    break
+                resp += chunk
+        assert b"HTTP/1.1 400 Bad Request" in resp, resp[:200]
+        if prefix:
+            assert resp.startswith(b"HTTP/1.1 200"), resp[:200]
+            assert expected_body(8) in resp, resp[:200]
+
+
+def test_bad_request_over_tls_never_reaches_the_wire_in_the_clear(
+    sized_tls_server,
+):
+    """Read off the wire rather than through a decrypting client.
+
+    A client that rejects the connection cannot say what it rejected, so the
+    regression this pins -- a response written past the record layer -- is
+    only visible in the raw bytes.  Every record a TLS 1.3 server sends after
+    the handshake carries outer content type 23, whatever is inside it; the
+    old 400 opened with 'H'.
+    """
+    _proto, port = sized_tls_server
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as raw:
+        sock, _incoming, outgoing = _handshake_over_bio(raw, tls_context())
+        sock.write(BAD_REQUEST)
+        raw.sendall(outgoing.read())
+        wire = b""
+        with contextlib.suppress(OSError):
+            while True:
+                chunk = raw.recv(65536)
+                if not chunk:
+                    break
+                wire += chunk
+
+    assert wire, "the server closed without answering at all"
+    # _tls_records() also asserts the capture ends on a record boundary, which
+    # a plaintext response would not.
+    assert {content_type for content_type, _len in _tls_records(wire)} == {
+        CONTENT_TYPE_APPDATA
+    }, wire[:80]
+    assert not wire.startswith(b"HTTP/"), wire[:80]
+
+
 def test_bad_request_over_tls_releases_cleanly(sized_tls_server):
     """The 400 path closes without going through on_write, so tls_conn_free()
     is the only release the connection gets.  Preceding it with a segmented
@@ -1558,9 +1628,8 @@ def test_bad_request_over_tls_releases_cleanly(sized_tls_server):
             assert body == expected_body(65536)
             # No request line at all: phr_parse_request fails, the server
             # answers 400 and closes.
-            s.sendall(b"\x01\x02 not a request \r\n\r\n")
-            with contextlib.suppress(OSError, ssl.SSLError):
-                s.recv(4096)
+            s.sendall(BAD_REQUEST)
+            assert s.recv(4096).startswith(b"HTTP/1.1 400 Bad Request")
         finally:
             s.close()
 
