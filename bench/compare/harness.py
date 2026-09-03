@@ -19,6 +19,7 @@ produces plausible-looking numbers for the wrong binary.
 
 import argparse
 import json
+import math
 import os
 import platform
 import re
@@ -28,6 +29,8 @@ import statistics
 import subprocess
 import sys
 import time
+
+import cpusample
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -85,22 +88,13 @@ def provenance(args):
                         break
         except OSError:
             pass
-    nproc = os.cpu_count()
-    try:
-        # cgroup v2 quota, so a container-limited run does not claim the host's cores
-        with open("/sys/fs/cgroup/cpu.max") as f:
-            quota, period = f.read().split()
-            if quota != "max":
-                nproc = f"{int(quota) // int(period)} (cgroup limit of {nproc})"
-    except (OSError, ValueError):
-        pass
     return {
         "arch": platform.machine(),
         "os": f"{platform.system()} {platform.release()}",
         "distro": sh("bash", "-c", ". /etc/os-release 2>/dev/null && echo $PRETTY_NAME")
         or "unknown",
         "cpu": cpu or "unknown",
-        "cpus_available": str(nproc),
+        "cpus_available": effective_cpus()[1],
         "python": platform.python_version(),
         "libuv": os.environ.get(
             "BENCH_LIBUV_VERSION", sh("pkg-config", "--modversion", "libuv")
@@ -126,7 +120,29 @@ def provenance(args):
         "wrk_connections": args.connections,
         "rounds": args.rounds,
         "loopback": True,
+        "cpu_sample_interval_s": args.cpu_interval,
+        "cpu_saturated_pct": cpusample.SATURATED,
+        "cpu_machine_full_pct": cpusample.MACHINE_FULL,
     }
+
+
+def effective_cpus():
+    """`(usable cores, how to describe them)`.
+
+    A cgroup v2 quota is the real limit, not the host's core count, so a
+    `--cpus=4` run must not divide by 18 and report itself as idle. Used both
+    for the recorded provenance and as the denominator of `machine_sat_pct`.
+    """
+    host = os.cpu_count() or 1
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            n = max(int(quota) // int(period), 1)
+            return n, f"{n} (cgroup limit of {host})"
+    except (OSError, ValueError):
+        pass
+    return host, str(host)
 
 
 def free_port():
@@ -284,6 +300,53 @@ def parse_wrk(out):
     return res
 
 
+def measured_wrk(scheme, port, pgid, workers, args):
+    """Run the measured `wrk` and sample both sides' CPU for its lifetime.
+
+    Popen rather than run(), because the sampler needs `wrk`'s pid. The main
+    thread then spends the whole measured run blocked in `communicate()` with
+    the GIL released, which is what lets an in-process sampling thread be cheap
+    enough to be honest about. Sampling starts here and not around the warmup,
+    so the warmup is excluded by construction rather than subtracted later.
+    """
+    wrk = subprocess.Popen(
+        [
+            "wrk",
+            f"-t{args.threads}",
+            f"-c{args.connections}",
+            f"-d{args.duration}s",
+            "--latency",
+            f"{scheme}://127.0.0.1:{port}/",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    sampler = None
+    if args.cpu_interval > 0 and cpusample.available():
+        sampler = cpusample.Sampler(pgid, wrk.pid, interval=args.cpu_interval)
+        sampler.start()
+    try:
+        out, _ = wrk.communicate()
+    finally:
+        # Unconditional: a sampler left running after a failed round would poll
+        # a dead pgid for the rest of the matrix, one leaked thread per failure.
+        if sampler is not None:
+            sampler.stop()
+    if sampler is None:
+        return out, None
+    cpu = cpusample.summarize(
+        sampler.samples,
+        workers=workers,
+        ncpu=effective_cpus()[0],
+        client_threads=args.threads,
+        thread_cpu_s=sampler.thread_cpu_s,
+    )
+    if cpu is not None and sampler.error:
+        cpu["error"] = sampler.error
+    return out, cpu
+
+
 def measure_one(kind, body, tls, workers, args):
     port = free_port()
     proc, log, pgid = launch(kind, port, body, workers, args)
@@ -304,29 +367,67 @@ def measure_one(kind, body, tls, workers, args):
             capture_output=True,
             check=False,
         )
-        out = subprocess.run(
-            [
-                "wrk",
-                f"-t{args.threads}",
-                f"-c{args.connections}",
-                f"-d{args.duration}s",
-                "--latency",
-                f"{scheme}://127.0.0.1:{port}/",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout
+        out, cpu = measured_wrk(scheme, port, pgid, workers, args)
         r = parse_wrk(out)
         if r is None:
             raise RuntimeError(f"{kind}: unusable wrk output:\n{out}")
+        r["cpu"] = cpu
         return r
     finally:
         kill(proc, log, pgid)
 
 
+def _med(vals):
+    """Median of the usable values, or nan. None and nan are dropped, because
+    one round where the sampler could not see a pid must not poison the rest."""
+    clean = [v for v in vals if v is not None and not math.isnan(v)]
+    return statistics.median(clean) if clean else float("nan")
+
+
+def median_cpu(cpus):
+    """Per-config CPU figures: the median of each field across rounds.
+
+    The verdict is recomputed from the median saturations rather than voted on
+    across rounds, so it can never disagree with the numbers printed beside it.
+    """
+    got = [c for c in cpus if c]
+    if not got:
+        return None
+    out = {
+        k: round(_med([c.get(k) for c in got]), 3)
+        for k in (
+            "server_cores",
+            "server_sat_pct",
+            "server_peak_cores",
+            "client_cores",
+            "client_sat_pct",
+            "machine_sat_pct",
+            "worker_imbalance_pct",
+            "ramp_s",
+            "sampler_cpu_pct_of_core",
+        )
+    }
+    # Per-worker cores, taken rank by rank: the median of the busiest worker
+    # across rounds, then of the second busiest, and so on. One worker at 100%
+    # and three at 20% is a load-distribution bug that server_cores hides.
+    ranks = max(len(c.get("worker_cores") or ()) for c in got)
+    out["worker_cores"] = [
+        round(_med([(c.get("worker_cores") or [None] * ranks)[i] for c in got]), 3)
+        for i in range(ranks)
+    ]
+    out["verdict"] = cpusample.verdict(
+        out["server_sat_pct"], out["client_sat_pct"], out["machine_sat_pct"]
+    )
+    out["n"] = len(got)
+    return out
+
+
 def fmt_k(rps):
     return f"~{rps / 1000:.0f}k"
+
+
+def fmt_pct(v):
+    return "n/a" if v is None or math.isnan(v) else f"{v:.0f}%"
 
 
 def main():
@@ -343,6 +444,13 @@ def main():
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--connections", type=int, default=40)
     p.add_argument("--bodies", default="500,12000")
+    p.add_argument(
+        "--cpu-interval",
+        dest="cpu_interval",
+        type=float,
+        default=0.5,
+        help="seconds between CPU samples during the measured run; 0 disables",
+    )
     p.add_argument("--cert", default="/tmp/bench-cert.pem")
     p.add_argument("--key", default="/tmp/bench-key.pem")
     p.add_argument("--json", default="/out/results.json")
@@ -412,6 +520,10 @@ def main():
                 if len(used) > 1
                 else float("nan")
             ),
+            # Every round's raw CPU record, so a surprising median can be
+            # traced back to the round that produced it.
+            "cpu_all": [r.get("cpu") for r in rs],
+            "cpu": median_cpu([r.get("cpu") for r in used]),
         }
 
     # ---- markdown ----
@@ -440,11 +552,11 @@ def main():
         out.append(f"\n### {label} response\n")
         out.append(
             "| Server | Protocol | TLS | Workers | Req/s | p50 | p99 "
-            "| vs baseline | between | within |"
+            "| vs baseline | between | within | srv | cli |"
         )
         out.append(
             "|--------|----------|:---:|--------:|------:|----:|----:"
-            "|------------:|--------:|-------:|"
+            "|------------:|--------:|-------:|----:|----:|"
         )
         for workers in worker_counts:
             base = rows.get((body, workers, "gunicorn+uvicorn", "ASGI", False))
@@ -454,7 +566,7 @@ def main():
                 if r is None:
                     out.append(
                         f"| {slabel} | {proto} | {tls_cell} | {workers} "
-                        f"| n/a | n/a | n/a | n/a | n/a | n/a |"
+                        f"| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
                     )
                     continue
                 ratio = "n/a"
@@ -462,6 +574,7 @@ def main():
                     ratio = f"{r['rps'] / base['rps']:.2f}x"
                 bold = slabel == "gunicorn+uvicorn"
                 w = (lambda t: f"**{t}**") if bold else (lambda t: t)
+                cpu = r.get("cpu") or {}
                 cells = [
                     w(slabel),
                     w(proto),
@@ -473,8 +586,19 @@ def main():
                     w(ratio),
                     w("n/a" if r["n"] < 2 else f"{r['spread_pct']:.0f}%"),
                     w(f"{r['within_cv_pct']:.0f}%"),
+                    w(fmt_pct(cpu.get("server_sat_pct"))),
+                    w(fmt_pct(cpu.get("client_sat_pct"))),
                 ]
                 out.append("| " + " | ".join(cells) + " |")
+    out.append(
+        "\n`srv` is the server's CPU over the measured run as a percentage of "
+        "its worker count; `cli` is `wrk`'s own CPU as a percentage of the "
+        "cores it could use. High `srv` with low `cli` is a capacity number. "
+        "Low `srv` with high `cli` is a property of the harness, not the "
+        "server. Both low means the load shape, not either side, was the "
+        "limit; both high means this config is measurable but a larger one is "
+        "not, without more client threads. See bench/compare/README.md."
+    )
     md = "\n".join(out) + "\n"
 
     print("\n" + md)
