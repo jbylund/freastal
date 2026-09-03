@@ -692,6 +692,35 @@ static void tls_read_flow(client_t *c, uv_stream_t *stream) {
     }
 }
 
+/*
+ * Release a decrypt buffer -- and only the part of it picotls owns.
+ *
+ * ptls_buffer_dispose() is the wrong call on this path.  It runs
+ * ptls_clear_memory(base, off) unconditionally, and base is read_buf, so
+ * disposing would zero the request that was just decrypted: silently, after
+ * the fact, and only for the sizes that reached this far.
+ *
+ * is_allocated is picotls's own ownership flag and answers the question
+ * exactly.  ptls_buffer_init() clears it; ptls_buffer_reserve_aligned() is the
+ * only writer, and it sets the flag in the same statement in which it replaces
+ * base with an allocation of its own.  So the flag is set if and only if there
+ * is something to free -- and, on the paths that keep the plaintext, if and
+ * only if the plaintext is somewhere other than read_buf.
+ *
+ * Worth being explicit that is_allocated = 0 does NOT stop picotls growing the
+ * buffer, which is the assumption the write side's tls_release_wbuf() is also
+ * careful not to make: ptls_buffer_reserve_aligned() mallocs, copies, and only
+ * then consults the flag, to decide whether the old base should be freed as
+ * well as scrubbed.  A fixed-capacity buffer is therefore not a hard limit
+ * that fails loudly; it is a threshold above which picotls quietly takes the
+ * buffer over.  Detecting that is the whole job of this function and of the
+ * branch in tls_on_read_data().
+ */
+static inline void tls_plain_release(ptls_buffer_t *plain) {
+    if (unlikely(plain->is_allocated))
+        ptls_buffer_dispose(plain);
+}
+
 static void tls_on_read_data(client_t *c, uv_stream_t *stream,
                               const char *data, size_t nread) {
     if (!c->tls_hs_done) {
@@ -710,9 +739,48 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
         }
         return;
     }
-    uint8_t plain_small[4096];
+    /*
+     * Decrypt straight into read_buf's free tail.
+     *
+     * ptls_receive() appends to the buffer it is handed and honours whatever
+     * off it already carries, so pointing that buffer at read_buf + read_len
+     * puts the plaintext exactly where phr_parse_request() wants it: no
+     * staging buffer, no memcpy, no allocation and no ptls_clear_memory()
+     * sweep over the request body.  The two branches after the loop are what
+     * makes that safe; see tls_plain_release() and the growth case below.
+     *
+     * What lands past read_len is not always request bytes.  handle_input()
+     * decrypts every record in place at base + off and only advances off for
+     * application data, so a KeyUpdate or an encrypted alert is decrypted into
+     * read_buf's tail and then left there as scratch.  That is harmless --
+     * read_len is what bounds the request, and client_reset() slides only
+     * within it -- and it is not a new exposure either: the request body has
+     * always been left in read_buf, which client_alloc() deliberately does not
+     * clear.  What is gone is the *second* copy the old staging buffer made,
+     * scrubbed or not.
+     *
+     * A sweep can also produce nothing at all: a record split across reads
+     * leaves picotls holding a fragment in recvbuf.rec, and a KeyUpdate
+     * consumes a whole record without emitting a byte.  Both come back with
+     * off == 0 and must leave read_buf alone, which falls out of appending.
+     */
+    /*
+     * Two sizes, and the difference between them is the whole trick.  `room`
+     * is what this sweep may keep: read_buf's free space, the bound every
+     * other part of the server is written against.  The capacity handed to
+     * picotls is that plus TLS_DECRYPT_SLACK, because handle_input() reserves
+     * against a record's *wire* length and then advances off by the shorter
+     * plaintext -- so a reservation legitimately overhangs what it will keep
+     * by one record's framing.  Without the overhang the last 22 bytes of
+     * read_buf are unusable and a request that ends there takes an allocation
+     * it does not need; with exactly that much, a record decrypts in place
+     * whenever its plaintext fits, and `off` still cannot pass READ_BUF_SIZE
+     * (see TLS_DECRYPT_SLACK for the arithmetic).
+     */
+    size_t room = (size_t)(READ_BUF_SIZE - c->read_len);
     ptls_buffer_t plain;
-    ptls_buffer_init(&plain, plain_small, sizeof(plain_small));
+    ptls_buffer_init(&plain, c->read_buf + c->read_len,
+                     (size_t)(READ_BUF_ALLOC - c->read_len));
     /*
      * ptls_receive() stops as soon as it has decrypted one record's worth of
      * application data and reports how much of the input that consumed, so a
@@ -732,27 +800,63 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
     while (off < nread) {
         size_t inlen = nread - off;
         if (ptls_receive(c->tls, &plain, data + off, &inlen) != 0) {
-            ptls_buffer_dispose(&plain);
+            tls_plain_release(&plain);
             tls_read_failed(c, stream);
             return;
         }
         if (unlikely(inlen == 0)) break;   /* no progress; nothing left to parse */
         off += inlen;
     }
-    if (plain.off == 0) { ptls_buffer_dispose(&plain); return; }
 
-    /* Take what fits; the rest waits in the spill until a response completes
-     * and makes room.  Overflowing here is not an error and not a large
-     * request -- two ordinary pipelined requests that happen to straddle the
-     * end of read_buf do it. */
-    size_t room = (size_t)(READ_BUF_SIZE - c->read_len);
-    size_t take = plain.off < room ? plain.off : room;
-    memcpy(c->read_buf + c->read_len, plain.base, take);
-    c->read_len += (int)take;
-    int stashed = 0;
-    if (unlikely(take < plain.off))
-        stashed = tls_spill_stash(c, plain.base + take, plain.off - take);
-    ptls_buffer_dispose(&plain);
+    size_t produced = plain.off;
+    int    stashed  = 0;
+    if (likely(!plain.is_allocated)) {
+        /*
+         * The whole sweep landed in read_buf, which is the ordinary case and
+         * the point of the exercise: there is nothing to copy, nothing to
+         * free and nothing to scrub.
+         *
+         * `produced > room` is the slack arithmetic stated as a runtime
+         * check.  A satisfied reservation can overhang room by at most the
+         * framing it accounted for and did not use, so off lands at or below
+         * READ_BUF_SIZE however many records the sweep decrypted; the only
+         * way past that is the growth branch of ptls_buffer_reserve(), which
+         * is exactly what is_allocated reports.  So this is a standing guard
+         * on that reading of picotls, not a case with a behaviour of its own
+         * -- but it is the one that would catch a slack that stopped being
+         * one record's worth.
+         */
+        if (unlikely(produced > room)) {
+            tls_read_failed(c, stream);
+            return;
+        }
+        c->read_len += (int)produced;
+    } else {
+        /*
+         * picotls needed more capacity than read_buf's tail had and moved the
+         * buffer into an allocation of its own, copying what was already
+         * there along with it.  Nothing is lost -- plain.base holds the whole
+         * sweep -- but the plaintext is no longer in read_buf, so it has to
+         * be put back the way the pre-#38 code always did it.
+         *
+         * Two situations reach here, and neither is an error.  A request in
+         * the top TLS_RECORD_OVERHEAD bytes of read_buf: the record's framing
+         * needs room the payload leaves nothing for.  And a read whose
+         * plaintext genuinely overruns read_buf, which is ordinary pipelining
+         * -- two requests straddling the end of the buffer -- and is what the
+         * spill exists for.
+         */
+        g_server.tls_read_grows++;
+        size_t take = produced < room ? produced : room;
+        memcpy(c->read_buf + c->read_len, plain.base, take);
+        c->read_len += (int)take;
+        if (unlikely(take < produced)) {
+            g_server.tls_read_spills++;
+            stashed = tls_spill_stash(c, plain.base + take, produced - take);
+        }
+        ptls_buffer_dispose(&plain);        /* picotls owns it; free and scrub */
+    }
+    if (produced == 0) return;              /* a partial record, or a KeyUpdate */
     if (unlikely(stashed < 0)) {
         tls_read_failed(c, stream);
         return;

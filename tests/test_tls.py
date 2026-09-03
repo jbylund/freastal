@@ -150,8 +150,16 @@ def start(proto, certpair):
             return proc, port
         except (OSError, ssl.SSLError, http.client.HTTPException):
             time.sleep(0.25)
+    # Still running, but never answered.  That is not "this build has no TLS"
+    # -- a build without it exits at startup and is caught above -- it is a
+    # server that came up and does not serve, which every one of these tests
+    # would otherwise report as a skip and CI would read as green.
+    still_running = proc.poll() is None
+    err = server_stderr()
     proc.kill()
-    pytest.skip(f"{proto} over TLS never became reachable; build likely lacks picotls")
+    if not still_running:
+        pytest.skip(f"{proto} server exited; build probably lacks TLS:\n{err[-300:]}")
+    pytest.fail(f"{proto} over TLS came up but never answered:\n{err[-500:]}")
 
 
 @pytest.fixture(scope="module", params=["wsgi", "asgi"])
@@ -335,8 +343,15 @@ def start_sized(proto, certpair):
             return proc, port
         except (OSError, ssl.SSLError, http.client.HTTPException):
             time.sleep(0.25)
+    # Still running, but never answered.  That is not "this build has no TLS"
+    # -- a build without it exits at startup and is caught above -- it is a
+    # server that came up and does not serve, which every one of these tests
+    # would otherwise report as a skip and CI would read as green.
+    still_running = proc.poll() is None
     proc.kill()
-    pytest.skip(f"{proto} sized server never became reachable")
+    if not still_running:
+        pytest.skip(f"{proto} sized server exited; build probably lacks TLS")
+    pytest.fail(f"{proto} sized server came up but never answered")
 
 
 @pytest.fixture(scope="module", params=["wsgi", "asgi"])
