@@ -623,8 +623,9 @@ S_CLIENT_TIMEOUT = 30
 
 # s_client refuses an option it does not have, or a group name this build does
 # not know, before it ever connects.  Both mean "this openssl is too old for
-# this assertion", not "the server is wrong".  Matched case-insensitively,
-# since the capitalization varies between releases.
+# this assertion", not "the server is wrong".  Compared against a lowercased
+# transcript so the match does not hinge on the exact capitalization, which
+# has not been checked across releases.
 S_CLIENT_UNUSABLE = (
     "call to ssl_conf_cmd",  # e.g. -groups X25519MLKEM768 on OpenSSL < 3.5
     "unknown option",
@@ -635,13 +636,16 @@ S_CLIENT_UNUSABLE = (
 # be miscounted.
 _CLIENT_HELLO = re.compile(r"^>>> TLS 1\.3, Handshake .*ClientHello", re.MULTILINE)
 
-# s_client reports the negotiated group two different ways, and which ones it
-# prints depends on the release: a hybrid KEM appears only in the summary
-# line, which OpenSSL 3.0 (what ubuntu-latest ships) does not print at all; a
-# plain curve appears only as the temp key, labelled "Server Temp Key" up to
-# 3.0 and "Peer Temp Key" after ("Server Temp Key: X25519, 253 bits", or
-# "ECDH, prime256v1, 256 bits").  Accept either label, or a 3.0 handshake that
-# in fact negotiated X25519 reads as no handshake at all.
+# s_client reports the negotiated group two different ways, and which one it
+# prints varies by release.  A hybrid KEM appears only in the summary line
+# ("Negotiated TLS1.3 group: X25519MLKEM768"), which 3.0 does not print at
+# all.  A plain curve appears only as the temp key, and the label differs:
+# 3.0.13 says "Server Temp Key: X25519, 253 bits" where 3.6.3 says "Peer Temp
+# Key" (with an "ECDH, " prefix for the NIST curves: "ECDH, prime256v1, 256
+# bits").  Those are the two releases actually observed -- where in between
+# the rename landed is not known, so accept both spellings rather than
+# switching on a version.  Miss one and a 3.0 handshake that did negotiate
+# X25519 reads as no handshake at all, which is what CI first caught.
 _GROUP_LINE = re.compile(r"Negotiated TLS1\.3 group:\s*(\S+)")
 _TEMP_KEY_LINE = re.compile(r"(?:Peer|Server) Temp Key:\s*(?:ECDH,\s*)?([^,\n]+)")
 

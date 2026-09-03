@@ -24,16 +24,20 @@
  * secp384r1 and secp521r1 are deliberately absent.  RFC 8446 makes secp256r1
  * mandatory for conformant TLS 1.3 clients, so P-256 is already the universal
  * floor and the larger curves buy no interop -- what they would buy is a
- * client-chosen cost, since an unauthenticated peer listing secp521r1 first
- * would make us do a P-521 ECDH per handshake for no security X25519 does not
- * already give us.  ptls_openssl_key_exchanges_all[] is nearly this list but
- * also carries the bare mlkem512/768/1024 groups, which have no classical
- * component; the hybrid keeps X25519 underneath as a floor.
+ * client-chosen cost, since an unauthenticated peer that offers secp521r1 --
+ * as a key share, or first in supported_groups on the retry path -- would
+ * make us do a P-521 ECDH per handshake for no security X25519 does not
+ * already give us.  ptls_openssl_key_exchanges_all[] is not the answer
+ * either: on top of those two curves it carries the bare mlkem512/768/1024
+ * groups, which have no classical component at all, whereas the hybrid keeps
+ * X25519 underneath as a floor.
  *
  * Both macros below are always defined by picotls/openssl.h, to 0 when the
- * algorithm is unavailable, and secp256r1 is unconditional -- so OpenSSL < 3.5
- * degrades to {x25519, secp256r1} and LibreSSL, which has neither, lands back
- * on today's {secp256r1}.
+ * algorithm is unavailable, and secp256r1 is unconditional, so every
+ * combination yields a valid list.  OpenSSL < 3.5 degrades to
+ * {x25519, secp256r1}; CI builds that path and the tests confirm it
+ * negotiates X25519 without a retry.  LibreSSL sets neither macro and would
+ * land back on today's {secp256r1} -- read off the header, not built here.
  */
 static ptls_key_exchange_algorithm_t *freastal_key_exchanges[] = {
 #if PTLS_OPENSSL_HAVE_X25519MLKEM768
@@ -80,9 +84,14 @@ int tls_server_init(const char *certfile, const char *keyfile) {
      * get it, browsers without AES instructions ask for ChaCha20-Poly1305
      * first and get that.  Both are the right answer for the peer that asked,
      * and choosing for them here would only make one of the two cases worse.
-     * The SHA384 suite leads the array for picotls' own reason: it reads
-     * cipher_suites[0]->hash when it needs a digest before a suite has been
-     * negotiated, as in the cookie signature on the retry path.
+     * Entry 0 is not wholly arbitrary -- cipher_suites[0]->hash is the one
+     * fixed position picotls reads, as the HMAC hash for stateless-retry
+     * cookies (calc_cookie_signature, plus the two sites that size and verify
+     * that signature), and that path needs a hash before any suite has been
+     * negotiated.  But picotls.h documents no ordering rule for the list, and
+     * we pass no handshake properties, so cookies are never enabled here.
+     * picotls annotates its own array "ciphers used with sha384 (must be
+     * first)"; whatever that is for, the vendored order is left as it is.
      */
     ts->ctx.cipher_suites    = ptls_openssl_cipher_suites;
     ts->ctx.sign_certificate = &ts->sign_cert.super;
