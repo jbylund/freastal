@@ -72,11 +72,13 @@ def test_stat_fields_survives_a_comm_full_of_parens_and_spaces(cs):
 
 
 def test_read_pid_and_scan_pgid_against_a_fake_proc(cs, tmp_path):
-    def write(pid, pgrp, utime, stime):
+    def write(pid, pgrp, utime, stime, starttime=7):
         d = tmp_path / str(pid)
         d.mkdir()
+        # Fields through 22 (starttime); comm is deliberately parenthesised.
         (d / "stat").write_text(
-            f"{pid} (srv) S 1 {pgrp} {pgrp} 0 -1 0 1 2 3 4 {utime} {stime} 0 0\n"
+            f"{pid} (srv) S 1 {pgrp} {pgrp} 0 -1 0 1 2 3 4 {utime} {stime} "
+            f"0 0 0 0 1 0 {starttime}\n"
         )
 
     write(100, 100, 30, 20)  # group leader
@@ -84,9 +86,10 @@ def test_read_pid_and_scan_pgid_against_a_fake_proc(cs, tmp_path):
     write(200, 200, 99, 99)  # someone else entirely
     (tmp_path / "self").mkdir()  # a non-numeric entry must be ignored
 
-    assert cs.read_pid(101, str(tmp_path)) == (100, 15)
+    assert cs.read_pid(101, str(tmp_path)) == (100, 7, 15)
     assert cs.read_pid(999, str(tmp_path)) is None
-    assert cs.scan_pgid(100, str(tmp_path)) == {100: 50, 101: 15}
+    # Keyed by (pid, starttime), so a recycled pid is a different process.
+    assert cs.scan_pgid(100, str(tmp_path)) == {(100, 7): 50, (101, 7): 15}
 
 
 # ---------------------------------------------------------------------------
@@ -190,14 +193,20 @@ def test_a_short_trailing_sample_cannot_invent_a_peak(cs):
 @pytest.mark.parametrize(
     ("srv", "cli", "machine", "want"),
     [
-        (95.0, 20.0, 40.0, "server-limited"),
-        (30.0, 95.0, 40.0, "client-limited"),
-        (30.0, 30.0, 40.0, "neither"),
+        (95.0, 20.0, 40.0, "server-bound"),
+        (30.0, 95.0, 40.0, "client-bound"),
+        (30.0, 30.0, 40.0, "unsaturated"),
         # Both sides on their own budget with the box two thirds idle is not a
         # machine limit; only the box actually being full is.
-        (95.0, 95.0, 50.0, "both-saturated"),
+        (95.0, 95.0, 50.0, "contended"),
         (50.0, 50.0, 95.0, "machine-limited"),
         (50.0, float("nan"), float("nan"), "unknown"),
+        # The dead band. 79.4/79.1 and 80.1/20.0 are not meaningfully
+        # different measurements, so only the second gets a label.
+        (79.4, 20.0, 40.0, "unclear"),
+        (80.1, 20.0, 40.0, "server-bound"),
+        (95.0, 70.0, 50.0, "unclear"),
+        (65.0, 65.0, 40.0, "unclear"),
     ],
 )
 def test_verdicts(cs, srv, cli, machine, want):
@@ -259,8 +268,11 @@ def test_median_cpu_takes_workers_rank_by_rank(harness):
     assert m["worker_cores"] == [1.6, 0.2, 0.15, 0.15]
     assert m["ramp_s"] == 0.5  # the None round is dropped, not treated as zero
     assert m["n"] == 3
-    # Recomputed from the medians printed beside it, never voted on.
-    assert m["verdict"] == "client-limited"
+    # The rounds do not agree - round 1 is unsaturated (50/25), rounds 2 and 3
+    # are client-bound - so the config reports "mixed" rather than a label the
+    # medians happen to land on. Classifying the median (52.5/90 -> client-
+    # bound) would launder the round that measured something else entirely.
+    assert m["verdict"] == "mixed"
 
 
 def test_median_cpu_is_none_when_nothing_was_sampled(harness):
@@ -387,3 +399,57 @@ def test_the_sampler_costs_almost_nothing(cs):
     )
     assert len(s.samples) > 20
     assert out["sampler_cpu_pct_of_core"] < 5.0
+
+
+def test_a_config_keeps_its_verdict_only_when_every_round_agrees(harness):
+    """Unanimity, not a vote and not a reclassified median.
+
+    Two rounds that both measured a client-bound number keep that verdict; one
+    dissenting round makes the whole config "mixed", which is a finding rather
+    than a failure and sends the reader to cpu_all.
+    """
+
+    def rnd(srv, cli, machine):
+        return {
+            "server_cores": 1.0,
+            "server_sat_pct": srv,
+            "server_peak_cores": 1.0,
+            "client_cores": 1.0,
+            "client_sat_pct": cli,
+            "machine_sat_pct": machine,
+            "worker_imbalance_pct": 0.0,
+            "ramp_s": 0.0,
+            "sampler_cpu_pct_of_core": 0.01,
+            "worker_cores": [1.0],
+        }
+
+    agree = [rnd(30.0, 95.0, 40.0), rnd(35.0, 92.0, 40.0)]
+    assert harness.median_cpu(agree)["verdict"] == "client-bound"
+
+    disagree = [rnd(30.0, 95.0, 40.0), rnd(95.0, 20.0, 40.0)]
+    assert harness.median_cpu(disagree)["verdict"] == "mixed"
+
+
+def test_a_recycled_pid_is_not_charged_to_its_predecessor(cs, tmp_path):
+    """(pid, starttime) identity: same pid, new process, separate accounting.
+
+    Without it a pid reused inside the run differences against the counter of
+    whatever held it before, which reads as a wildly negative delta or - worse -
+    a plausible small one.
+    """
+
+    def write(pid, pgrp, utime, stime, starttime):
+        d = tmp_path / str(pid)
+        d.mkdir(exist_ok=True)
+        (d / "stat").write_text(
+            f"{pid} (srv) S 1 {pgrp} {pgrp} 0 -1 0 1 2 3 4 {utime} {stime} "
+            f"0 0 0 0 1 0 {starttime}\n"
+        )
+
+    write(100, 100, 500, 100, starttime=7)
+    assert cs.scan_pgid(100, str(tmp_path)) == {(100, 7): 600}
+
+    # Same pid, different process: a distinct key, so the old counter is not a
+    # baseline for the new one.
+    write(100, 100, 5, 1, starttime=9999)
+    assert cs.scan_pgid(100, str(tmp_path)) == {(100, 9999): 6}

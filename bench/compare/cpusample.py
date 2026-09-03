@@ -45,17 +45,24 @@ import time
 _F_PGRP = 5
 _F_UTIME = 14
 _F_STIME = 15
+_F_STARTTIME = 22
 
 try:
     CLK_TCK = os.sysconf("SC_CLK_TCK")
 except (ValueError, AttributeError, OSError):  # pragma: no cover - not POSIX
     CLK_TCK = 100
 
-# A side that is using at least this fraction of the cores it could use is
-# "saturated" for the purpose of the verdict. 0.8 rather than 0.95 because a
-# real server never reaches 100% of its worker budget - it also blocks on the
-# socket - and because the reading is a mean over the run.
-SATURATED = 80.0
+# Two thresholds, not one, with a deliberate dead band between them.
+#
+# 0.8 rather than 0.95 for "high" because a real server never reaches 100% of
+# its worker budget - it also blocks on the socket - and because the reading is
+# a mean over the run. But a single line at 80 makes 79.4% and 80.1% different
+# verdicts, which is a distinction the measurement cannot support: the
+# published `between` column runs 2-10%, so a row could change its label on
+# round-to-round noise alone. Anything landing in the band is named "unclear"
+# instead, and the reader is sent to `srv`/`cli` themselves.
+HIGH_PCT = 80.0
+LOW_PCT = 60.0
 # Above this, the *box* is full: server and client are taking each other's
 # cores and neither number describes the software. Checked before the 2x2,
 # since co-resident wrk is exactly this benchmark's known weakness. It is a
@@ -81,12 +88,18 @@ def stat_fields(raw):
 
 
 def read_pid(pid, proc_root="/proc"):
-    """Return ``(pgrp, ticks)`` for one pid, or ``None`` if it is gone.
+    """Return ``(pgrp, starttime, ticks)`` for one pid, or ``None`` if it is gone.
 
     ``ticks`` is ``utime + stime`` - CPU burned by the process itself, summed
     over all its threads. Children are deliberately excluded: every server here
     forks its workers into the same process group, so they are counted as
     separate pids and can be reported individually.
+
+    ``starttime`` is carried so that processes can be keyed by ``(pid,
+    starttime)`` rather than by pid alone. Over a 30s run at a 0.5s period the
+    kernel can recycle a pid, and a recycled pid differenced against its
+    predecessor's counter reads as a wildly negative delta - or, worse, a
+    plausible small one.
     """
     try:
         with open(f"{proc_root}/{pid}/stat") as f:
@@ -94,11 +107,12 @@ def read_pid(pid, proc_root="/proc"):
     except (OSError, ValueError):
         return None
     fields = stat_fields(raw)
-    if fields is None or len(fields) < _F_STIME - 2:
+    if fields is None or len(fields) < _F_STARTTIME - 2:
         return None
     try:
         return (
             int(fields[_F_PGRP - 3]),
+            int(fields[_F_STARTTIME - 3]),
             int(fields[_F_UTIME - 3]) + int(fields[_F_STIME - 3]),
         )
     except ValueError:  # pragma: no cover - truncated read
@@ -125,7 +139,9 @@ def scan_pgid(pgid, proc_root="/proc"):
             continue
         got = read_pid(name, proc_root)
         if got is not None and got[0] == pgid:
-            out[int(name)] = got[1]
+            # Keyed by (pid, starttime): a recycled pid is a different process,
+            # not a negative delta against its predecessor's counter.
+            out[(int(name), got[1])] = got[2]
     return out
 
 
@@ -156,7 +172,7 @@ class Sampler:
     def _sample(self):
         server = scan_pgid(self.pgid, self.proc_root)
         client = read_pid(self.client_pid, self.proc_root)
-        return (time.monotonic(), server, None if client is None else client[1])
+        return (time.monotonic(), server, None if client is None else client[2])
 
     def _run(self):
         t0 = time.thread_time()
@@ -297,26 +313,65 @@ def summarize(samples, workers, ncpu, client_threads, thread_cpu_s=0.0):
     }
 
 
-def verdict(server_sat, client_sat, machine_sat):
-    """One of five readings. See bench/compare/README.md for what to do next.
+def _band(pct):
+    """Which side of the dead band a saturation figure falls on."""
+    if pct is None or math.isnan(pct):
+        return None
+    if pct >= HIGH_PCT:
+        return "high"
+    if pct <= LOW_PCT:
+        return "low"
+    return "mid"
 
-    A label is a threshold on a continuous quantity, so a row sitting on the
-    line should be read from `srv` and `cli` themselves rather than from this
-    word. It exists so that an obviously client-bound row cannot be published
-    as a capacity number without someone noticing.
+
+# Only the four corners get a name. Anything touching the 60-80% band is
+# "unclear" on purpose: the value of this instrument is that a reader can trust
+# the label, and a label handed out on a 1% margin is worth less than no label.
+_VERDICTS = {
+    # a real capacity measurement of the server
+    ("high", "low"): "server-bound",
+    # a property of the harness; the server was never asked for its limit
+    ("low", "high"): "client-bound",
+    # both busy: the server may be at its limit, but it is sharing cores with
+    # the load generator, so read the number as a floor rather than a capacity
+    ("high", "high"): "contended",
+    # neither side is the limit - the load shape is. The case that produced the
+    # wrong conclusions in #50, and the one this instrument exists to surface.
+    ("low", "low"): "unsaturated",
+}
+
+
+def verdict(server_sat, client_sat, machine_sat):
+    """One word for what a single round's number actually measured.
+
+    A label is a threshold on a continuous quantity, so a row in the dead band
+    is reported as "unclear" and should be read from `srv` and `cli` directly.
+    This exists so that an obviously client-bound row cannot be published as a
+    capacity number without someone noticing.
     """
     if math.isnan(machine_sat):  # the client pid was never readable
         return "unknown"
     if machine_sat >= MACHINE_FULL:
+        # Checked before the 2x2: when the box itself is full, server and
+        # client are taking each other's cores and neither number describes the
+        # software. Deliberately not the same test as both sides being
+        # individually saturated - at `-w4 -t4` on an 18-core host both can sit
+        # on their own budget with two thirds of the machine idle.
         return "machine-limited"
-    srv, cli = server_sat >= SATURATED, client_sat >= SATURATED
-    if srv and cli:
-        # The server used its whole worker budget, so the row is a real number
-        # for *this* config - but the client used its whole thread budget too,
-        # so a larger config cannot be measured without more `-t`.
-        return "both-saturated"
-    if srv:
-        return "server-limited"
-    if cli:
-        return "client-limited"
-    return "neither"
+    return _VERDICTS.get((_band(server_sat), _band(client_sat)), "unclear")
+
+
+def reduce_verdicts(per_round):
+    """The verdict for a config, from its rounds' verdicts.
+
+    A median saturation classified after the fact would launder a round that
+    was client-bound in among two that were not: the median is a number, and
+    the thing being reduced here is a claim. So the config keeps a verdict only
+    when every round agrees, and otherwise reports "mixed" - which is a
+    finding, not a failure, and points at the per-round figures in
+    results.json.
+    """
+    vs = [v for v in per_round if v]
+    if not vs:
+        return "n/a"
+    return vs[0] if len(set(vs)) == 1 else "mixed"

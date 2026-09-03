@@ -117,20 +117,29 @@ limit but not what was:
 
 | srv | cli | reading | what to do |
 |---|---|---|---|
-| high | low | **server-limited** | a real capacity number; trust the row |
-| low | high | **client-limited** | a property of the harness; the server has headroom the table is not showing |
-| low | low | **neither** | too few requests in flight, or the loopback path is the limit; raise `-c` |
-| high | high | **both-saturated** | valid for *this* config, but the client has no headroom left, so a larger worker count cannot be measured without raising `-t` |
+| high | low | **server-bound** | a real capacity number; trust the row |
+| low | high | **client-bound** | a property of the harness; the server has headroom the table is not showing |
+| low | low | **unsaturated** | too few requests in flight, or the loopback path is the limit; raise `-c` |
+| high | high | **contended** | valid for *this* config, but the client has no headroom left, so a larger worker count cannot be measured without raising `-t`; read the number as a floor |
 
 `machine-limited` is a separate check, not "both of them at once": it fires only
 when server plus client exceed 90% of the cores the container may use. At
 `-w4 -t4` on an 18-core host both sides can sit on their own budget with two
-thirds of the machine idle, which is `both-saturated`, not a machine limit.
+thirds of the machine idle, which is `contended`, not a machine limit.
 
-These are thresholds - 80% of a side's own budget, 90% of the box - on a
-continuous quantity. A row that lands on the line should be read from `srv` and
-`cli` themselves; the word exists so an obviously client-bound row cannot be
-published as a capacity number without someone noticing.
+**High is >= 80%, low is <= 60%, and nothing in between is labelled.** A single
+line would make 79.4% and 80.1% different verdicts, which is a distinction the
+measurement cannot support: the `between` column on the published table runs
+2-10%, so a row could change its label on round-to-round noise alone. Anything
+touching the band reads `unclear`, and should be read from `srv` and `cli`
+directly. A label handed out on a 1% margin is worth less than no label.
+
+A config's verdict is **not** its median saturation classified after the fact.
+Each round is judged on its own figures and the config keeps a verdict only
+when every round agrees; otherwise it reads `mixed`. Reclassifying the median
+would launder a round that measured something else entirely - the median is a
+number, and a verdict is a claim. `mixed` is a finding: go and look at
+`cpu_all`.
 
 `results.json` carries more, as a per-config median under `cpu` and per round
 under `cpu_all`, so a surprising median can be traced to the round that made it:

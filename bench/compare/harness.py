@@ -387,8 +387,12 @@ def _med(vals):
 def median_cpu(cpus):
     """Per-config CPU figures: the median of each field across rounds.
 
-    The verdict is recomputed from the median saturations rather than voted on
-    across rounds, so it can never disagree with the numbers printed beside it.
+    The numbers are medians; the verdict is not. Classifying the median
+    saturation after the fact would launder a round that was client-bound in
+    among two that were not - the median is a number, and a verdict is a claim.
+    So each round is classified on its own figures and the config keeps a
+    verdict only when every round agrees, reporting "mixed" otherwise. "mixed"
+    is a finding, and points at cpu_all in results.json.
     """
     got = [c for c in cpus if c]
     if not got:
@@ -415,8 +419,15 @@ def median_cpu(cpus):
         round(_med([(c.get("worker_cores") or [None] * ranks)[i] for c in got]), 3)
         for i in range(ranks)
     ]
-    out["verdict"] = cpusample.verdict(
-        out["server_sat_pct"], out["client_sat_pct"], out["machine_sat_pct"]
+    out["verdict"] = cpusample.reduce_verdicts(
+        [
+            cpusample.verdict(
+                c.get("server_sat_pct"),
+                c.get("client_sat_pct"),
+                c.get("machine_sat_pct"),
+            )
+            for c in got
+        ]
     )
     out["n"] = len(got)
     return out
