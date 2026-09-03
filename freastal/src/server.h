@@ -30,7 +30,13 @@
  * caps at 5 + PTLS_MAX_ENCRYPTED_RECORD_SIZE (vendor/picotls/lib/picotls.c).
  * Every record costs at least 22 bytes of framing, so the plaintext a single
  * ptls_receive() sweep can emit is strictly below the sum of the two; two
- * whole encrypted records is comfortably above it. */
+ * whole encrypted records is comfortably above it.  Only one sweep's surplus
+ * is ever held, because tls_read_flow() stops reading while the spill is
+ * non-empty, so the bound does not accumulate across reads.
+ *
+ * This is a derivation, not a measurement: nothing exercises the bound at its
+ * limit, and the largest overflow seen while developing this was around 14KB.
+ * tls_spill_stash() range-checks against it rather than trusting the argument. */
 #  define TLS_MAX_ENC_RECORD       (16384 + 256)
 #  define TLS_SPILL_SIZE           (2 * TLS_MAX_ENC_RECORD)
 /* Spill blocks are recycled through a free list, like the encryption blocks
@@ -129,8 +135,8 @@ typedef struct client_s {
     bool          tls_hs_done;
     ptls_buffer_t tls_wbuf;  /* encrypted response buf; alive until on_write */
     void         *tls_wblock; /* pooled block backing tls_wbuf, or NULL if picotls owns it */
-    char         *tls_spill;  /* decrypted overflow, NULL until a read first overruns read_buf */
-    int           tls_spill_len;              /* bytes held in tls_spill */
+    char         *tls_spill;                  /* pooled overflow block, held only while tls_spill_len > 0 */
+    int           tls_spill_len;              /* bytes held in tls_spill; 0 means no block is held */
 #endif
 
     /* --- Large buffers; NOT cleared by client_alloc().  Keep last. --- */

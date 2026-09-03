@@ -141,11 +141,13 @@ void tls_conn_init(client_t *c) {
 
 void tls_conn_free(client_t *c) {
     free(c->tls_enc); c->tls_enc = NULL;
-    tls_release_spill(c);
-    if (c->tls) { ptls_free(c->tls); c->tls = NULL; }
     /* Reached on every close path, including the ones that never wrote a
      * response (400 Bad Request, handshake failure) and plaintext connections,
-     * for which this is a no-op. */
+     * for which both releases are a no-op.  The spill is normally handed back
+     * by tls_spill_drain() as soon as it empties; this catches a connection
+     * torn down while one was still held. */
+    tls_release_spill(c);
+    if (c->tls) { ptls_free(c->tls); c->tls = NULL; }
     tls_release_wbuf(c);
     c->tls_hs_done = false;
 }
