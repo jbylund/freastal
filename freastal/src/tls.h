@@ -27,3 +27,6 @@ void  tls_spill_put(void *block);
  * overflowed, and on plaintext connections. */
 void  tls_release_spill(client_t *c);
 #endif /* FREASTAL_TLS */
+
+/* Test hook: advance the ticket key ring one step. */
+void tls_ticket_rotate_once(void);

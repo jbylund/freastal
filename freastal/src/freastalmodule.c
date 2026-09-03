@@ -124,7 +124,34 @@ static PyObject *py_reuse_port_supported(PyObject *self, PyObject *args) {
     return PyBool_FromLong(server_reuseport_supported());
 }
 
+#ifdef FREASTAL_TLS
+/* ---- freastal._rotate_ticket_key() ---- */
+
+static PyObject *py_rotate_ticket_key(PyObject *self, PyObject *args) {
+    (void)self; (void)args;
+    if (!g_server.tls_enabled) {
+        PyErr_SetString(PyExc_RuntimeError, "freastal: TLS is not enabled");
+        return NULL;
+    }
+    tls_ticket_rotate_once();
+    Py_RETURN_NONE;
+}
+#endif
+
 static PyMethodDef freastal_methods[] = {
+#ifdef FREASTAL_TLS
+    {
+        "_rotate_ticket_key",
+        py_rotate_ticket_key,
+        METH_NOARGS,
+        "_rotate_ticket_key()\n\n"
+        "Advance the session-ticket key ring one step, as the hourly timer\n"
+        "would. Test hook: the ring's contract -- a retired key still opens\n"
+        "tickets until the lifetime constraint says it cannot -- is not\n"
+        "otherwise reachable without an hour of wall clock. Rotating early is\n"
+        "always safe, so this is harmless if called in anger.",
+    },
+#endif
     {
         "reuse_port_supported",
         py_reuse_port_supported,

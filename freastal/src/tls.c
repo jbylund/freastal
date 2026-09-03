@@ -178,25 +178,22 @@ static int tls_ticket_encrypt(ptls_encrypt_ticket_t *self, ptls_t *tls,
                       : tls_ticket_unseal_impl(dst, src, tls_ticket_key_cb);
 }
 
-static void tls_ticket_rotate(uv_timer_t *timer) {
-    tls_server_t *ts = CONTAINER_OF(timer, tls_server_t, ticket_timer);
+/* Advance the ring by one step.  Split out of the timer callback so a test
+ * can drive rotation without waiting an hour of wall clock: the ring's whole
+ * contract -- a retired key still opens tickets until the constraint says it
+ * cannot -- is otherwise unexercised code, which is precisely the
+ * silent-degradation failure this feature is prone to. */
+void tls_ticket_rotate_once(void) {
+    tls_server_t *ts = &g_server.tls;
     int next = (ts->ticket_cur + 1) % TLS_TICKET_RING;
-
-    /* The slot about to be reused holds the ring's oldest key.  By the
-     * constraint asserted in server.h, every ticket sealed under it expired at
-     * least one rotation ago, so destroying it can cost no resumption that
-     * would otherwise have worked.
-     *
-     * Zeroizing rather than relying on the mint to overwrite the same bytes is
-     * deliberate: this line is where the key is destroyed, and that should not
-     * silently stop being true the day the struct grows a field the mint does
-     * not touch.  ptls_clear_memory is a volatile function pointer, so the
-     * compiler cannot decide the write is dead and drop it -- which is exactly
-     * what it is entitled to do to a plain memset of a struct that is written
-     * again on the next line. */
     ptls_clear_memory(&ts->ticket_keys[next], sizeof(ts->ticket_keys[next]));
     tls_ticket_key_mint(&ts->ticket_keys[next]);
     ts->ticket_cur = next;
+}
+
+static void tls_ticket_rotate(uv_timer_t *timer) {
+    (void)timer;
+    tls_ticket_rotate_once();
 }
 
 /*
@@ -323,7 +320,22 @@ int tls_server_init(const char *certfile, const char *keyfile) {
      * know whether the application's handlers are idempotent.  Note that this
      * is what keeps the ticket from carrying an early_data extension in
      * send_session_ticket(), so clients are never invited to try.
+     *
+     * The memset() at the top of this function is what zeroes it; there is
+     * deliberately no assignment here, because an assignment is exactly what
+     * a future edit would overwrite.  What is here instead is a check, run
+     * after every other field is set, so that a line anywhere above it that
+     * turns early data on is caught before the listener ever answers.  It
+     * costs one branch at startup and turns a silent behaviour change into a
+     * server that refuses to start and says why.
      */
+    if (ts->ctx.max_early_data_size != 0) {
+        fprintf(stderr,
+                "[freastal] TLS: refusing to start with 0-RTT early data "
+                "enabled; early data is replayable and freastal cannot know "
+                "whether your handlers are idempotent\n");
+        return -1;
+    }
 
     /*
      * Rotation runs on the loop, which is the only thread that reads the ring;

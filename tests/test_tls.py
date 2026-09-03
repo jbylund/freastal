@@ -9,6 +9,7 @@ build time), detected by the handshake failing rather than by a build flag,
 since the module exposes none.
 """
 
+import base64
 import contextlib
 import hashlib
 import http.client
@@ -33,11 +34,20 @@ PROTO = sys.argv[1]
 PORT = int(sys.argv[2])
 CERT, KEY = sys.argv[3], sys.argv[4]
 import freastal
+from freastal._freastal import _rotate_ticket_key
 
 BODY = b"tls-body"
 
+# Rotation has to happen in THIS process: the test process has its own
+# g_server, so rotating there would prove nothing about this server's ring.
+ROTATE_PATH = "/rotate-ticket-key"
+
 if PROTO == "asgi":
     async def app(scope, receive, send):
+        body = BODY
+        if scope["path"] == ROTATE_PATH:
+            _rotate_ticket_key()
+            body = b"rotated"
         await send({
             "type": "http.response.start",
             "status": 200,
@@ -46,17 +56,21 @@ if PROTO == "asgi":
                 [b"x-scheme", scope.get("scheme", "?").encode()],
             ],
         })
-        await send({"type": "http.response.body", "body": BODY})
+        await send({"type": "http.response.body", "body": body})
 
     freastal.serve_asgi(app, host="127.0.0.1", port=PORT, workers=1,
                         reuse_port=False, certfile=CERT, keyfile=KEY)
 else:
     def app(environ, start_response):
+        body = BODY
+        if environ["PATH_INFO"] == ROTATE_PATH:
+            _rotate_ticket_key()
+            body = b"rotated"
         start_response("200 OK", [
             ("Content-Type", "text/plain"),
             ("X-Scheme", environ.get("wsgi.url_scheme", "?")),
         ])
-        return [BODY]
+        return [body]
 
     freastal.serve(app, host="127.0.0.1", port=PORT, workers=1,
                    reuse_port=False, certfile=CERT, keyfile=KEY)
@@ -309,7 +323,7 @@ PROTO = sys.argv[1]
 PORT = int(sys.argv[2])
 CERT, KEY = sys.argv[3], sys.argv[4]
 import freastal
-from freastal._freastal import tls_buffer_stats
+from freastal._freastal import tls_buffer_stats, _rotate_ticket_key
 
 _cache = {}
 
@@ -331,6 +345,11 @@ if PROTO == "asgi":
     async def app(scope, receive, send):
         if scope["path"] == "/stats":
             body = json.dumps(tls_buffer_stats()).encode()
+        elif scope["path"] == "/rotate-ticket-key":
+            # Rotation has to happen in the SERVER process; the test process
+            # has its own g_server and rotating there would prove nothing.
+            _rotate_ticket_key()
+            body = b"rotated"
         else:
             body = body_for(size_of(scope["path"]))
         await send({
@@ -346,6 +365,11 @@ else:
     def app(environ, start_response):
         if environ["PATH_INFO"] == "/stats":
             body = json.dumps(tls_buffer_stats()).encode()
+        elif environ["PATH_INFO"] == "/rotate-ticket-key":
+            # Rotation has to happen in the SERVER process; the test process
+            # has its own g_server and rotating there would prove nothing.
+            _rotate_ticket_key()
+            body = b"rotated"
         else:
             body = body_for(size_of(environ["PATH_INFO"]))
         start_response("200 OK", [
@@ -825,8 +849,13 @@ GROUP_CASES = [
 ]
 
 
-def s_client(port, args):
-    """Run one `openssl s_client` handshake, returning its whole transcript."""
+def s_client(port, args, stdin=b""):
+    """Run one `openssl s_client` handshake, returning its whole transcript.
+
+    `stdin` is what s_client forwards down the connection once it is up; the
+    key-exchange tests want nothing there, the resumption ones want a request,
+    so that the server answers and the transcript shows it.
+    """
     if OPENSSL is None:
         pytest.skip("openssl s_client not available")
     if OPENSSL_REAL is None:
@@ -836,7 +865,7 @@ def s_client(port, args):
         )
     proc = subprocess.run(
         [OPENSSL_REAL, "s_client", "-connect", f"127.0.0.1:{port}", *args],
-        input=b"",
+        input=stdin,
         capture_output=True,
         timeout=S_CLIENT_TIMEOUT,
         check=False,
@@ -1127,9 +1156,9 @@ def test_a_broken_record_layer_closes_without_close_notify(sized_tls_server):
 #
 # The handshake above is the expensive one: a fresh certificate signature on
 # every connection.  A NewSessionTicket lets the next connection skip it, and
-# picotls mints one only when ctx.encrypt_ticket is set.  Until #29 freastal
-# left it NULL, so a client was given nothing to resume with and every
-# reconnect repeated the signature -- invisible to every test above, and to a
+# picotls mints one only when ctx.encrypt_ticket is set.  freastal leaves it
+# NULL (#29), so a client is given nothing to resume with and every reconnect
+# pays for the signature again -- invisible to every test above, and to a
 # keep-alive benchmark, which reconnects never.
 #
 # Python's ssl module drives this rather than s_client, whose -sess_out races
@@ -1188,57 +1217,586 @@ def test_session_ticket_is_issued_and_resumes(tls_server):
     assert body.endswith(BODY), body[-200:]
 
 
-# RFC 8446 4.6.1: "Servers MUST NOT use any value greater than 604800 seconds
-# (7 days)."  The hint is what a client caches against, so a server that
-# oversells it hands out tickets it will refuse.
-RFC8446_MAX_TICKET_LIFETIME = 7 * 24 * 60 * 60
+# --------------------------------------------------------------------------
+# Resumption, past the happy path.
+#
+# The test above proves a ticket is issued and that offering it back resumes.
+# That is one route through a feature with several, and the ones it leaves
+# uncovered are the ones that fail quietly:
+#
+#   * A server can say it resumed and send the certificate anyway.  "Resumed"
+#     is a flag the client reports; what resumption is *for* is the signature
+#     that did not happen, and the only place that is visible is the size of
+#     the server's handshake flight.
+#   * A ticket the server cannot decrypt -- minted by another process, or from
+#     before a restart, or corrupt in transit -- has to read as "no ticket was
+#     offered" and fall through to a full handshake.  Reading as an error
+#     instead takes down every returning client on the next deploy.
+#   * A client resumes over and over.  Every handshake has to leave it holding
+#     a ticket that still works, or resumption quietly stops after the second
+#     connection.
+#   * The lifetime the ticket advertises has to be the one the server will
+#     actually honour, not merely non-zero.
+#
+# For the first of those the wire is the oracle, not the client's opinion of
+# it, so these drive the memory BIOs rather than a wrapped socket.
+# --------------------------------------------------------------------------
+
+TLS_SOURCE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "freastal", "src"
+)
+
+# RFC 8446 section 4.6.1: a ticket_lifetime above 7 days MUST NOT be sent.
+MAX_TICKET_LIFETIME = 7 * 24 * 60 * 60
 
 
-def test_ticket_lifetime_hint_is_within_the_spec_ceiling(tls_server):
+def tls_source(name):
+    """Read one of the server's C sources, or skip if they are not here.
+
+    A few assertions below are about what the server was *configured* with
+    rather than about what it did, and the configuration is a compile-time
+    constant with no runtime accessor.  Reading the source that sets it beats
+    restating the number here: a literal repeated in the test only proves the
+    two literals match.
+    """
+    path = os.path.join(TLS_SOURCE_DIR, name)
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError as exc:  # installed from a wheel, sources not alongside
+        pytest.skip(f"cannot read {path}: {exc}")
+
+
+def configured_ticket_lifetime():
+    """ctx.ticket_lifetime, in seconds, as server.h defines it."""
+    src = tls_source("server.h")
+    # The value is written as an expression -- (2u * 60u * 60u) reads as two
+    # hours, 7200 does not -- so evaluate it rather than grabbing the first
+    # integer, which would silently make this test assert 2 seconds.
+    m = re.search(
+        r"#\s*define\s+TLS_TICKET_LIFETIME_S\s+(.+?)(?:/\*|$)", src, re.MULTILINE
+    )
+    assert m is not None, (
+        "freastal/src/server.h defines no TLS_TICKET_LIFETIME_S, so nothing "
+        "sets ctx.ticket_lifetime and picotls mints no ticket at all (#29)"
+    )
+    expr = m.group(1).strip().rstrip(")").lstrip("(")
+    expr = re.sub(r"\b(\d+)[uU][lL]*\b", r"\1", expr)
+    assert re.fullmatch(r"[0-9*+\s()]+", expr), (
+        f"unexpected lifetime expression: {expr!r}"
+    )
+    lifetime = eval(expr)
+    assert 0 < lifetime <= MAX_TICKET_LIFETIME, (
+        f"TLS_TICKET_LIFETIME_S is {lifetime}s; RFC 8446 4.6.1 forbids sending "
+        f"a ticket_lifetime above {MAX_TICKET_LIFETIME}s, and 0 disables "
+        f"tickets outright"
+    )
+    return lifetime
+
+
+def drain_session_ticket(raw, sock, incoming, deadline=2.0):
+    """Consume the server's NewSessionTicket, so a record capture starts clean.
+
+    The ticket is a post-handshake message: it arrives in an application-data
+    record of its own, after do_handshake() has returned and before the client
+    has asked for anything.  The captures below settle each response's share
+    of the records by plaintext accounting, so a ticket record left sitting in
+    front of the first response is charged to that response and the accounting
+    -- rightly -- refuses to report a count.
+
+    Bytes read here go straight into the BIO and never reach the capture, so
+    the whole record has to be taken: half of one would leave the remainder to
+    be counted later.  Waiting on ticket_lifetime_hint rather than on a byte
+    count is what makes that whole-record.
+
+    Returns True once the client holds a ticket.  Against a server that issues
+    none, two silent poll slices end the wait and the caller measures exactly
+    what it measured before there were tickets.
+    """
+    slice_s = 0.25
+    end = time.time() + deadline
+    silent = 0
+    while time.time() < end and silent < 2:
+        session = sock.session
+        if session is not None and session.ticket_lifetime_hint > 0:
+            return True
+        raw.settimeout(min(slice_s, max(0.01, end - time.time())))
+        try:
+            chunk = raw.recv(65536)
+        except TimeoutError:
+            silent += 1
+            continue
+        if not chunk:
+            return False
+        silent = 0
+        incoming.write(chunk)
+        with contextlib.suppress(ssl.SSLWantReadError):
+            sock.read(65536)
+    session = sock.session
+    return session is not None and session.ticket_lifetime_hint > 0
+
+
+class MeasuredConnection:
+    """One connection over memory BIOs, with the server's handshake counted.
+
+    Everything the server sends before do_handshake() returns is its
+    ServerHello..Finished flight and nothing else -- in TLS 1.3 the
+    NewSessionTicket is a post-handshake message -- so that byte count is a
+    clean measure of the flight.  It is also the only measure available: the
+    certificate and its signature travel encrypted, so their absence can be
+    seen only as bytes that did not arrive.
+    """
+
+    def __init__(self, port, ctx, session=None, timeout=15):
+        self._raw = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        self._incoming, self._outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        self._sock = self._ctx_wrap(ctx, session)
+        self.handshake_bytes = 0
+        while True:
+            try:
+                self._sock.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                self._flush()
+                chunk = self._raw.recv(65536)
+                if not chunk:
+                    raise AssertionError(
+                        "the server closed the connection during the "
+                        f"handshake, after sending {self.handshake_bytes} bytes"
+                    ) from None
+                self.handshake_bytes += len(chunk)
+                self._incoming.write(chunk)
+        self._flush()
+        self.reused = self._sock.session_reused
+
+    def _ctx_wrap(self, ctx, session):
+        return ctx.wrap_bio(
+            self._incoming,
+            self._outgoing,
+            server_hostname="localhost",
+            session=session,
+        )
+
+    def _flush(self):
+        pending = self._outgoing.read()
+        if pending:
+            self._raw.sendall(pending)
+
+    def request_to_eof(self):
+        """Send one `Connection: close` request and read the reply to EOF.
+
+        Reading to EOF is what guarantees the NewSessionTicket has been seen:
+        it arrives after the handshake, so a client that stops at the end of
+        the response body may never process it.
+        """
+        self._sock.write(CLOSE_REQUEST)
+        self._flush()
+        out = bytearray()
+        while True:
+            try:
+                data = self._sock.read(65536)
+            except ssl.SSLWantReadError:
+                data = None
+            except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+                break
+            if data:
+                out += data
+                continue
+            if data == b"":
+                break
+            chunk = self._raw.recv(65536)
+            if not chunk:
+                break
+            self._incoming.write(chunk)
+        return bytes(out)
+
+    @property
+    def session(self):
+        return self._sock.session
+
+    def close(self):
+        self._raw.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+@pytest.fixture(scope="module")
+def other_tls_server(certpair):
+    """A second freastal process, holding the same certificate.
+
+    Same certificate on purpose: it leaves the ticket key as the only thing
+    that differs between the two, so a ticket one server accepts from the
+    other means the key is shared or constant, not merely that the servers
+    look alike.
+    """
+    proc, port = start("wsgi", certpair)
+    yield port
+    proc.kill()
+    proc.wait(timeout=10)
+
+
+def test_ticket_advertises_the_lifetime_the_server_configured(tls_server):
+    """The hint on the wire is the lifetime picotls will actually enforce.
+
+    try_psk_handshake() drops any ticket older than ctx.ticket_lifetime, so a
+    hint that disagrees with it is a lie in one of two directions: too high
+    and clients keep tickets the server has already stopped taking, paying a
+    wasted PSK offer on every reconnect; too low and they throw away tickets
+    it would still have honoured.  Asserting merely that the hint is non-zero
+    -- which is all the test above needs -- catches neither.
+    """
     _proto, port = tls_server
-    session, _reused, _body = request_over_new_connection(port, tls_context())
-    assert 0 < session.ticket_lifetime_hint <= RFC8446_MAX_TICKET_LIFETIME, (
-        session.ticket_lifetime_hint
+    want = configured_ticket_lifetime()
+    session, reused, body = request_over_new_connection(port, tls_context())
+    assert not reused, "first connection resumed, with nothing yet to resume from"
+    assert body.endswith(BODY), body[-200:]
+    assert session is not None, "no session at all after a completed handshake"
+    assert session.ticket_lifetime_hint == want, (
+        f"the ticket advertises a lifetime of "
+        f"{session.ticket_lifetime_hint}s, but server.h sets "
+        f"TLS_TICKET_LIFETIME={want}s and that is the age picotls enforces"
     )
 
 
-def test_ticket_from_another_process_falls_back_to_a_full_handshake(
-    tls_server, certpair
-):
-    """A ticket this process cannot open costs a handshake, never a failure.
+def test_resumption_actually_skips_the_certificate(tls_server, certpair):
+    """The point of a ticket is the signature that does not happen.
 
-    That is the --workers N case with the kernel's choice taken out of it.
-    The ticket key ring is per process, so with SO_REUSEPORT a resuming client
-    lands on the worker that issued its ticket about 1/N of the time and
-    otherwise offers a ticket whose key name nobody holds.  A second server on
-    a port of its own is exactly that situation, made deterministic.
+    session_reused is the client repeating what the server implied; it says
+    nothing about what the server did.  A server that accepted the ticket and
+    then emitted its certificate chain and a CertificateVerify anyway would
+    set that flag and save nothing -- which is the whole cost #29 is about,
+    since the signature is the most expensive operation in the handshake.
 
-    What must not happen is the connection dying, or the request failing: an
-    unopenable ticket has to degrade to the full handshake the client would
-    have done anyway, which is what freastal did for every connection before
-    #29.  Resumption *across* workers is not covered; see the "Multiple
-    workers" note in freastal/src/tls.c for why it is not attempted.
+    Both are encrypted, so neither can be read off the wire directly.  What
+    can be read is how much smaller the server's flight got, and the
+    certificate's own DER is the honest floor to compare against: skipping it
+    has to save at least its own size.  In practice the saving is larger,
+    because the CertificateVerify goes with it.
     """
-    proto, port = tls_server
-    other_proc, other_port = start(proto, certpair)
-    try:
-        # One context throughout: an SSLSession cannot be offered to a context
-        # other than the one that produced it.  The *server* is what differs.
-        ctx = tls_context()
-        session, _reused, _body = request_over_new_connection(other_port, ctx)
-        assert session is not None and session.ticket_lifetime_hint > 0
+    _proto, port = tls_server
+    cert, _key = certpair
+    with open(cert) as f:
+        cert_der_len = len(ssl.PEM_cert_to_DER_cert(f.read()))
 
-        _session, resumed, body = request_over_new_connection(
-            port, ctx, session=session
-        )
-        assert not resumed, (
-            "a ticket sealed by a different process resumed - the two rings "
-            "agree on a key they should not share"
+    # One context for both connections: a session cannot be offered to a
+    # context other than the one that produced it.
+    ctx = tls_context()
+
+    with MeasuredConnection(port, ctx) as first:
+        assert not first.reused, "first connection resumed out of nowhere"
+        assert first.request_to_eof().endswith(BODY)
+        full = first.handshake_bytes
+        session = first.session
+
+    assert session is not None and session.ticket_lifetime_hint > 0, (
+        "no NewSessionTicket was issued, so there is nothing to resume with"
+    )
+    assert full > cert_der_len, (
+        f"a full handshake sent only {full} bytes, less than the {cert_der_len} "
+        f"byte certificate it must contain - the measurement is wrong, not "
+        f"the server"
+    )
+
+    with MeasuredConnection(port, ctx, session=session) as second:
+        assert second.reused, "the server issued a ticket and would not resume"
+        assert second.request_to_eof().endswith(BODY)
+        resumed = second.handshake_bytes
+
+    assert full - resumed >= cert_der_len, (
+        f"the resumed handshake saved {full - resumed} bytes ({resumed} vs "
+        f"{full}), less than the {cert_der_len} byte certificate alone - so "
+        f"the server reported a resumption and sent the certificate and its "
+        f"signature anyway, which is the cost resumption exists to avoid"
+    )
+
+
+def test_resumption_survives_a_run_of_reconnects(tls_server):
+    """Five reconnects in a row, each carrying the last one's ticket forward.
+
+    picotls mints a fresh ticket on every handshake, resumed ones included,
+    precisely so that a ticket is never offered twice.  A server that issues
+    one only on a full handshake still passes a two-connection test and then
+    stops resuming from the third connection on -- for every client, silently,
+    with a full signature each time.
+    """
+    _proto, port = tls_server
+    ctx = tls_context()
+    session, reused, _body = request_over_new_connection(port, ctx)
+    assert not reused, "first connection resumed, with nothing yet to resume from"
+    assert session is not None and session.ticket_lifetime_hint > 0, (
+        "no ticket on the first connection, so there is nothing to chain"
+    )
+
+    for attempt in range(1, 6):
+        session, reused, body = request_over_new_connection(port, ctx, session=session)
+        assert reused, (
+            f"reconnect {attempt} of 5 fell back to a full handshake; the "
+            f"ticket the previous handshake handed out was not accepted"
         )
         assert body.endswith(BODY), body[-200:]
-    finally:
-        other_proc.kill()
-        other_proc.wait(timeout=10)
+        assert session is not None and session.ticket_lifetime_hint > 0, (
+            f"reconnect {attempt} of 5 resumed but was issued no fresh ticket, "
+            f"so the chain ends here and every later reconnect is a full "
+            f"handshake"
+        )
+
+
+def test_a_ticket_from_another_server_is_declined_without_erroring(
+    tls_server, other_tls_server
+):
+    """A ticket is sealed under the process's key, not under its certificate.
+
+    Two freastal processes have independent ticket keys, so a ticket minted by
+    one is undecryptable to the other.  That has to read as "the client
+    offered no usable ticket" and fall through to a full handshake.  picotls
+    treats a failed decryption exactly that way -- try_psk_handshake()
+    `continue`s past the identity -- but only if the decrypt callback declines
+    rather than reporting something the handshake propagates as an alert.
+
+    It is the same path every client takes after a restart or a deploy, so
+    getting it wrong is not a corner case: it is an outage for exactly the
+    clients that came back.
+
+    That it is declined at all is the other half.  A ticket key that was a
+    constant, or shared by construction, would let a completely unrelated
+    process resume a session it never established.
+    """
+    _proto, port = tls_server
+    ctx = tls_context()
+    session, _reused, _body = request_over_new_connection(port, ctx)
+    assert session is not None and session.ticket_lifetime_hint > 0, (
+        "no ticket was issued, so there is nothing to offer the other server"
+    )
+
+    _session, reused, body = request_over_new_connection(
+        other_tls_server, ctx, session=session
+    )
+    assert not reused, (
+        "a second, unrelated freastal process resumed from a ticket it never "
+        "issued - the ticket key is a constant, or is shared between processes"
+    )
+    assert body.endswith(BODY), (
+        f"the unusable ticket did not fall back to a full handshake cleanly; "
+        f"the reply was {body[-200:]!r}"
+    )
+
+
+# --- A ticket the server cannot open, corrupted rather than foreign --------
+#
+# The test above offers a ticket sealed under a key the server never had, which
+# its decrypt callback declines by name.  A ticket whose *name* it recognises
+# and whose body has been altered takes a different route out: picotls checks
+# the MAC after the callback has installed the keys, and rejects it there.
+# Both have to end at a full handshake rather than at a dead connection, and
+# only one of them is reachable through the callback.
+#
+# Getting an edited ticket in front of the server needs a client that will
+# write its session out and read one back, which is `openssl s_client
+# -sess_out/-sess_in`; Python's ssl module keeps sessions opaque.  The earlier
+# note about -sess_out racing the ticket applies to a client with nothing to
+# say, which exits at once -- feeding it a request and -ign_eof keeps the
+# connection open well past the ticket's arrival.
+
+SESSION_PEM_HEAD = "-----BEGIN SSL SESSION PARAMETERS-----"
+SESSION_PEM_TAIL = "-----END SSL SESSION PARAMETERS-----"
+# ticket [10] EXPLICIT OCTET STRING, in OpenSSL's SSL_SESSION ASN.1: context
+# class, constructed, number 10.
+SESSION_TICKET_TAG = 0xAA
+
+
+def _der_length(blob, i):
+    """Decode the DER length that starts at blob[i]; return (length, body)."""
+    first = blob[i]
+    if first < 0x80:
+        return first, i + 1
+    count = first & 0x7F
+    return int.from_bytes(blob[i + 1 : i + 1 + count], "big"), i + 1 + count
+
+
+def _session_ticket_span(blob):
+    """Where the ticket sits inside a DER-encoded SSL_SESSION.
+
+    Walks the top-level SEQUENCE looking for the ticket's tag and decodes
+    nothing else: the fields in front of it (version, cipher, session id,
+    master key) are only obstacles to step over, and the point of the exercise
+    is a byte offset to corrupt.
+    """
+    assert blob[0] == 0x30, f"not a SEQUENCE: first byte {blob[0]:#04x}"
+    total, i = _der_length(blob, 1)
+    end = i + total
+    while i < end:
+        tag = blob[i]
+        length, body = _der_length(blob, i + 1)
+        if tag == SESSION_TICKET_TAG:
+            assert blob[body] == 0x04, (
+                f"the ticket field holds tag {blob[body]:#04x}, not an OCTET "
+                f"STRING - this is not the structure s_client wrote"
+            )
+            inner, inner_body = _der_length(blob, body + 1)
+            return inner_body, inner_body + inner
+        i = body + length
+    raise AssertionError(
+        "the saved session carries no ticket, so the server issued none and "
+        "there is nothing here to corrupt"
+    )
+
+
+def _read_session_pem(path):
+    with open(path) as f:
+        text = f.read()
+    assert SESSION_PEM_HEAD in text, f"s_client wrote no session to {path}"
+    body = "".join(line for line in text.splitlines() if not line.startswith("-----"))
+    return bytearray(base64.b64decode(body))
+
+
+def _write_session_pem(path, blob):
+    body = base64.b64encode(bytes(blob)).decode()
+    wrapped = "\n".join(body[i : i + 64] for i in range(0, len(body), 64))
+    with open(path, "w") as f:
+        f.write(f"{SESSION_PEM_HEAD}\n{wrapped}\n{SESSION_PEM_TAIL}\n")
+
+
+def _resumption_verdict(trace):
+    """ "Reused" or "New" from an s_client transcript, or None if it never got
+    that far."""
+    for line in trace.splitlines():
+        if line.startswith("Reused,"):
+            return "Reused"
+        if line.startswith("New,"):
+            return "New"
+    return None
+
+
+@pytest.mark.parametrize("corrupt", ["key-name", "sealed-body"])
+def test_a_corrupted_ticket_falls_back_to_a_full_handshake(
+    tls_server, tmp_path, corrupt
+):
+    """One flipped bit anywhere in the ticket costs a signature, not the request.
+
+    The two offsets are two different rejections.  A bit in the key name means
+    the server does not recognise the key at all and its callback declines; a
+    bit in the sealed body means the name matched, the keys were installed,
+    and the MAC picotls appended no longer agrees.  A decrypt path that
+    reported either as an error rather than as "no usable ticket" would turn
+    a stale or mangled ticket into a failed connection - and clients hold
+    tickets across restarts, so that is not a rare input.
+
+    The untouched round is the control.  Without it a run in which no ticket
+    was ever issued would see "New" every time and pass while proving nothing.
+    """
+    _proto, port = tls_server
+    request = CLOSE_REQUEST
+    saved = str(tmp_path / "session.pem")
+
+    trace = s_client(port, ["-sess_out", saved, "-ign_eof"], stdin=request)
+    assert b"tls-body" in trace.encode(), f"the first request failed:\n{trace[-800:]}"
+
+    original = _read_session_pem(saved)
+    start, stop = _session_ticket_span(original)
+
+    control = str(tmp_path / "control.pem")
+    _write_session_pem(control, original)
+    trace = s_client(port, ["-sess_in", control, "-ign_eof"], stdin=request)
+    assert _resumption_verdict(trace) == "Reused", (
+        f"the untouched ticket did not resume, so the corrupted ones below "
+        f"would prove nothing:\n{trace[-800:]}"
+    )
+
+    edited = bytearray(original)
+    offset = start if corrupt == "key-name" else (start + stop) // 2
+    edited[offset] ^= 0x01
+    mangled = str(tmp_path / "mangled.pem")
+    _write_session_pem(mangled, edited)
+
+    trace = s_client(port, ["-sess_in", mangled, "-ign_eof"], stdin=request)
+    verdict = _resumption_verdict(trace)
+    assert verdict == "New", (
+        f"a ticket with one bit flipped in its {corrupt} was answered with "
+        f"{verdict!r}; the server either resumed from a ticket it cannot have "
+        f"opened, or failed the handshake instead of falling back to a full "
+        f"one:\n{trace[-800:]}"
+    )
+    assert b"tls-body" in trace.encode(), (
+        f"the full handshake behind the rejected ticket never served the "
+        f"request:\n{trace[-800:]}"
+    )
+
+
+def test_a_resumed_connection_still_keeps_alive_and_pipelines(tls_server):
+    """Everything behind the handshake has to be unmoved by resumption.
+
+    A resumed connection reaches the application-data state by a different
+    route: no certificate, and a key schedule extracted from the PSK rather
+    than from a bare zero secret.  Keep-alive reuse and two requests arriving
+    in one segment are covered above only for connections that got there the
+    full way round.
+    """
+    _proto, port = tls_server
+    ctx = tls_context()
+    session, _reused, _body = request_over_new_connection(port, ctx)
+    assert session is not None and session.ticket_lifetime_hint > 0, (
+        "no ticket was issued, so no connection here can be a resumed one"
+    )
+
+    raw = socket.create_connection(("127.0.0.1", port), timeout=15)
+    with ctx.wrap_socket(raw, server_hostname="localhost", session=session) as sock:
+        assert sock.session_reused, (
+            "the connection under test did not resume, so it proves nothing "
+            "about the resumed request path"
+        )
+        buf = b""
+        for i in range(1, 4):
+            sock.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            _head, body, buf = _read_full_response(sock, buf)
+            assert body == BODY, f"keep-alive request {i} on a resumed connection"
+
+        # Both requests written before either response is read, and small
+        # enough that OpenSSL emits them as one record.
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" * 2)
+        for i in range(1, 3):
+            _head, body, buf = _read_full_response(sock, buf)
+            assert body == BODY, f"pipelined response {i} on a resumed connection"
+        assert buf == b"", f"unread bytes after the pipelined pair: {buf[:200]!r}"
+
+
+# ctx.max_early_data_size is the single switch that turns 0-RTT on, and #29 is
+# explicit that it stays 0: early data is replayable by design and a
+# general-purpose WSGI/ASGI server cannot know whether an application's
+# handlers are idempotent.  A comment saying so is not a guard; this is.
+_EARLY_DATA_SET = re.compile(r"\bmax_early_data_size\s*=[^=]")
+
+
+def test_early_data_is_never_enabled():
+    """No source line assigns ctx.max_early_data_size.
+
+    Zero is the value a zeroed ptls_context_t already has, so "it is 0" is not
+    something a handshake can be made to demonstrate: with 0-RTT off there is
+    no extension in the NewSessionTicket, and no client here can ask for one
+    to check.  The assignment is the thing that would have to appear, so the
+    absence of the assignment is what gets asserted.
+
+    A test that reads the source is a poor substitute for one that reads the
+    wire, and this is one of the few places it is the better of the two: the
+    failure being guarded against is somebody switching 0-RTT on later, and
+    that is a source edit.
+    """
+    offenders = []
+    for name in sorted(os.listdir(TLS_SOURCE_DIR)):
+        if not name.endswith((".c", ".h")):
+            continue
+        for lineno, line in enumerate(tls_source(name).splitlines(), 1):
+            if _EARLY_DATA_SET.search(line):
+                offenders.append(f"freastal/src/{name}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "max_early_data_size is assigned, so 0-RTT may be on:\n  "
+        + "\n  ".join(offenders)
+        + "\nEarly data is replayable by design; #29 keeps it at 0 and says "
+        "why.  If this is deliberate it needs its own issue, not a line here."
+    )
 
 
 # TLS 1.3 caps a record's plaintext at 16KB and frames it with 22 bytes: a
@@ -1271,6 +1829,10 @@ class _RecordCapture:
         self._sock, incoming, self._outgoing = _handshake_over_bio(
             self._raw, tls_context()
         )
+        # Before any request goes out, so the only thing the server can have
+        # sent is its NewSessionTicket.  Left in the stream it would be
+        # counted against the first response; see drain_session_ticket().
+        drain_session_ticket(self._raw, self._sock, incoming)
         self._raw.settimeout(timeout)
         self._reader = _BioReader(self._raw, self._sock, incoming)
         self._buf = b""
@@ -1797,6 +2359,9 @@ def _response_records(port, size):
     """
     with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
         sock, incoming, outgoing = _handshake_over_bio(raw, tls_context())
+        # The ticket arrives before this connection has asked for anything;
+        # taking it here keeps the capture to response records alone.
+        drain_session_ticket(raw, sock, incoming)
         sock.write(f"GET /n/{size} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
         raw.sendall(outgoing.read())
         raw.settimeout(20)
@@ -1870,3 +2435,77 @@ def test_response_at_the_segmentation_cap(sized_tls_server):
         assert after["pool_free"] >= WSEG_MAX, after
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# Key rotation.
+#
+# The ring is the part of #29 that cannot be exercised by waiting: the timer
+# fires hourly. _rotate_ticket_key() drives one step directly, which is what
+# makes the ring's actual contract testable -- a key stays usable for as many
+# rotations as the lifetime constraint in server.h promises, and no longer.
+# Without this the ring is unexercised code, and untested rotation is the
+# silent-degradation failure this feature is most prone to: it would look
+# perfect until an hour after deployment.
+# --------------------------------------------------------------------------
+
+
+def _rotate_key(port, ctx):
+    """Ask the server to advance its ring, over its own connection.
+
+    The hook lives in the server process, so it is reached the same way
+    /stats is. A fresh connection each time, so this never rides on the
+    session being measured.
+    """
+    conn = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=20)
+    try:
+        conn.request("GET", "/rotate-ticket-key")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        assert resp.read() == b"rotated"
+    finally:
+        conn.close()
+
+
+def configured_ticket_ring():
+    """TLS_TICKET_RING, as server.h defines it."""
+    m = re.search(r"#\s*define\s+TLS_TICKET_RING\s+([0-9]+)", tls_source("server.h"))
+    assert m is not None, "server.h defines no TLS_TICKET_RING"
+    return int(m.group(1))
+
+
+def test_a_ticket_survives_rotation_until_its_key_leaves_the_ring(tls_server):
+    """Rotate under a live ticket and watch exactly when it stops working.
+
+    The constraint asserted in server.h is that a ticket cannot outlive the key
+    that opens it. Concretely: with a ring of N slots, a ticket keeps resuming
+    across N-1 rotations, because that is how many happen before its slot is
+    reused. The Nth destroys the key and the client must fall back -- cleanly,
+    to a full handshake, not to an error.
+    """
+    _proto, port = tls_server
+    ring = configured_ticket_ring()
+    ctx = tls_context()
+
+    session, reused, body = request_over_new_connection(port, ctx)
+    assert not reused
+    assert body.endswith(BODY)
+    assert session is not None and session.ticket_lifetime_hint > 0
+
+    for step in range(ring - 1):
+        _rotate_key(port, ctx)
+        session2, reused, body = request_over_new_connection(port, ctx, session=session)
+        assert reused, (
+            f"a ticket stopped resuming after {step + 1} rotation(s), but the "
+            f"ring holds {ring} keys, so it should survive {ring - 1}"
+        )
+        assert body.endswith(BODY)
+        if session2 is not None:
+            session = session2
+
+    # One more rotation reuses the slot the original key lived in.
+    for _ in range(ring):
+        _rotate_key(port, ctx)
+    _s, reused, body = request_over_new_connection(port, ctx, session=session)
+    assert not reused, "a key destroyed by rotation still opened a ticket"
+    assert body.endswith(BODY), "falling back must still serve the request"
