@@ -56,12 +56,19 @@ void *tls_wbuf_get(void) {
     if (likely(block != NULL)) {
         g_server.tls_wbuf_pool = *(void **)block;
         g_server.tls_wbuf_pool_n--;
+        g_server.tls_wbuf_live++;
         return block;
     }
-    return malloc(TLS_WBUF_SIZE);
+    block = malloc(TLS_WBLOCK_SIZE);
+    if (likely(block != NULL)) {
+        g_server.tls_wbuf_mallocs++;
+        g_server.tls_wbuf_live++;
+    }
+    return block;
 }
 
 void tls_wbuf_put(void *block) {
+    g_server.tls_wbuf_live--;
     if (unlikely(g_server.tls_wbuf_pool_n >= TLS_WBUF_POOL_MAX)) {
         free(block);
         return;
@@ -72,7 +79,56 @@ void tls_wbuf_put(void *block) {
 }
 
 /*
- * Ownership of tls_wbuf is decided by tls_wblock, not by is_allocated.
+ * A response past TLS_WSEG_MAX blocks does not segment; it takes one buffer of
+ * its own.  Handing that to picotls with is_allocated = 1 -- which is what the
+ * pre-segmentation code did at every size over 16,739 bytes -- would make
+ * ptls_buffer_dispose() responsible for it, and ptls_buffer__release_memory()
+ * memsets buf->off bytes before freeing.  There is nothing there to scrub:
+ * ptls_send() encrypts straight from the caller's plaintext into this buffer
+ * and never stages a plaintext copy in it, so every byte of it has already
+ * gone out on the wire in the clear.
+ *
+ * So freastal owns this one too, and keeps one per loop rather than returning
+ * it to malloc every time.  A single slot is enough: it is held only between
+ * write_response() and on_write(), and responses this large are rare enough
+ * that two in flight at once is not the case worth sizing for -- the second
+ * just allocates.  The slot ratchets up to the largest size seen, so a run of
+ * them settles on one buffer instead of walking through malloc sizes, and
+ * anything past TLS_BIGBUF_KEEP_MAX is freed rather than pinned per worker.
+ */
+void *tls_bigbuf_get(size_t need, size_t *cap_out) {
+    void *buf = g_server.tls_bigbuf;
+    if (buf != NULL && g_server.tls_bigbuf_cap >= need) {
+        g_server.tls_bigbuf     = NULL;
+        *cap_out                = g_server.tls_bigbuf_cap;
+        g_server.tls_bigbuf_cap = 0;
+        g_server.tls_bigbuf_live++;
+        return buf;
+    }
+    *cap_out = need;
+    buf = malloc(need);
+    if (likely(buf != NULL)) {
+        g_server.tls_wbuf_mallocs++;
+        g_server.tls_bigbuf_live++;
+    }
+    return buf;
+}
+
+void tls_bigbuf_put(void *buf, size_t cap) {
+    g_server.tls_bigbuf_live--;
+    if (unlikely(cap > TLS_BIGBUF_KEEP_MAX)) { free(buf); return; }
+    if (g_server.tls_bigbuf != NULL) {
+        /* Keep whichever is larger; the smaller one would never be picked. */
+        if (cap <= g_server.tls_bigbuf_cap) { free(buf); return; }
+        free(g_server.tls_bigbuf);
+    }
+    g_server.tls_bigbuf     = buf;
+    g_server.tls_bigbuf_cap = cap;
+}
+
+/*
+ * Ownership of each segment's buffer is decided by comparing its base against
+ * the block it was opened on, not by is_allocated.
  *
  * When the block came from the pool picotls was handed a buffer it does not
  * own (is_allocated = 0), so ptls_buffer_dispose() would neither free it nor
@@ -80,23 +136,49 @@ void tls_wbuf_put(void *block) {
  * record for nothing, since ptls_send() encrypts straight from the caller's
  * plaintext into this buffer and so it only ever holds ciphertext.
  *
- * picotls can still swap the block out from under us -- a KeyUpdate record, or
- * any reservation the size estimate failed to anticipate -- in which case base
- * no longer points at the pooled block and the replacement is picotls-owned
- * and must be freed.  Checking base rather than trusting the estimate is what
- * keeps that from being either a leak or a double free.
+ * picotls can still swap a block out from under us -- a KeyUpdate record, or
+ * any reservation the sizing failed to anticipate -- in which case base no
+ * longer points at the pooled block and the replacement is picotls-owned and
+ * must be freed.  Checking base rather than trusting the sizing is what keeps
+ * that from being either a leak or a double free, and it is also how the
+ * oversize path is released: there the block carries only the chain node and
+ * the ciphertext lives in an allocation picotls was given up front.
+ *
+ * Every segment of the chain is released, which matters because a response is
+ * one uv_write over all of them: they live and die together.
  */
 void tls_release_wbuf(client_t *c) {
     void *block = c->tls_wblock;
-    if (block != NULL) {
-        c->tls_wblock = NULL;
-        if (unlikely((void *)c->tls_wbuf.base != block))
-            ptls_buffer_dispose(&c->tls_wbuf);      /* picotls outgrew the block */
-        else
-            memset(&c->tls_wbuf, 0, sizeof(c->tls_wbuf));
+    void *big   = c->tls_wbig;
+    bool  big_returned = false;
+
+    c->tls_wblock = NULL;
+    c->tls_wbig   = NULL;
+
+    while (block != NULL) {
+        tls_wseg_t *seg  = TLS_WSEG_OF(block);
+        void       *next = seg->next;
+        void       *base = (void *)seg->buf.base;
+        if (unlikely(base != block)) {
+            if (likely(big != NULL && base == big)) {
+                tls_bigbuf_put(big, seg->buf.capacity);
+                big_returned = true;
+            } else {
+                ptls_buffer_dispose(&seg->buf);     /* picotls owns what it points at */
+            }
+        }
         tls_wbuf_put(block);
-    } else if (c->tls_wbuf.base != NULL) {
-        ptls_buffer_dispose(&c->tls_wbuf);
+        block = next;
+    }
+
+    /* The oversized buffer is normally returned by the walk above.  It is not
+     * only when picotls outgrew it and swapped in an allocation of its own,
+     * which dispose has just freed -- ours is still live, and its capacity is
+     * no longer recorded anywhere, so it goes back to malloc rather than to
+     * the retained slot. */
+    if (unlikely(big != NULL && !big_returned)) {
+        g_server.tls_bigbuf_live--;
+        free(big);
     }
 }
 
@@ -105,7 +187,7 @@ void tls_conn_init(client_t *c) {
     c->tls         = ptls_new(&g_server.tls.ctx, 1 /* is_server */);
     c->tls_hs_done = false;
     c->tls_wblock  = NULL;
-    memset(&c->tls_wbuf, 0, sizeof(c->tls_wbuf));
+    c->tls_wbig    = NULL;
 }
 
 void tls_conn_free(client_t *c) {

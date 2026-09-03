@@ -636,6 +636,27 @@ static inline size_t tls_encrypted_size(size_t len, size_t rec_overhead) {
     return len + (len / TLS_MAX_RECORD_PLAINTEXT + 1) * rec_overhead;
 }
 
+/* Records ptls_send() splits a plaintext run of len into.  Zero for an empty
+ * run, which it turns into no record at all -- unlike tls_encrypted_size(),
+ * which deliberately over-counts so that it can be used to size a buffer. */
+static inline size_t tls_record_count(size_t len) {
+    return (len + TLS_MAX_RECORD_PLAINTEXT - 1) / TLS_MAX_RECORD_PLAINTEXT;
+}
+
+/* Take a block for this response and point its trailer at its own data area.
+ * The caller has already linked the block into the chain, so a failure after
+ * this point still gets it back via tls_release_wbuf(). */
+static inline tls_wseg_t *tls_wseg_open(void *block) {
+    tls_wseg_t *seg = TLS_WSEG_OF(block);
+    seg->next             = NULL;
+    seg->buf.base         = (uint8_t *)block;
+    seg->buf.capacity     = TLS_WBUF_SIZE;
+    seg->buf.off          = 0;
+    seg->buf.is_allocated = 0;
+    seg->buf.align_bits   = 0;
+    return seg;
+}
+
 static void tls_write_response_impl(client_t *c) {
     size_t      hdr_len  = (size_t)c->resp_hdr_len;
     const char *body     = NULL;
@@ -656,50 +677,97 @@ static void tls_write_response_impl(client_t *c) {
      * Above that the copy is the more expensive half, so large bodies keep
      * their own record and are encrypted straight out of the Python bytes.
      */
-    bool   coalesce = (body_len != 0 && hdr_len + body_len <= RESP_HDR_SIZE);
-    size_t rec_oh   = ptls_get_record_overhead(c->tls);
-    size_t need     = coalesce ? tls_encrypted_size(hdr_len + body_len, rec_oh)
-                               : tls_encrypted_size(hdr_len, rec_oh)
-                                 + (body_len ? tls_encrypted_size(body_len, rec_oh) : 0);
+    if (body_len != 0 && hdr_len + body_len <= RESP_HDR_SIZE) {
+        memcpy(c->resp_hdr + hdr_len, body, body_len);
+        hdr_len += body_len;
+        body     = NULL;
+        body_len = 0;
+    }
+
+    /* The plaintext to encrypt, in wire order. */
+    const uint8_t *run[2]    = { (const uint8_t *)c->resp_hdr, (const uint8_t *)body };
+    size_t         runlen[2] = { hdr_len, body_len };
+    size_t         rec_oh    = ptls_get_record_overhead(c->tls);
 
     /*
-     * tls_wbuf outlives this function -- uv_write holds a pointer into it
-     * until on_write -- so it has to be heap-backed either way.  Sizing it up
-     * front means picotls never has to grow it, which for a 12KB body used to
-     * mean a second malloc and a copy on top of the first.
+     * Every record goes in a pooled block, and blocks are chained into one
+     * uv_write, so nothing here allocates and nothing here is memset on
+     * release however large the response is.  ptls_send() would otherwise
+     * append every record of a run into one contiguous buffer, so the loop
+     * below hands it a single record's worth at a time: exactly one record per
+     * call, into a block whose remaining capacity was checked first.
      *
-     * A pooled block is handed over with is_allocated = 0: picotls must not
-     * free it, tls_release_wbuf() returns it instead.  Anything too big for a
-     * block gets its own allocation with is_allocated = 1, which is the old
-     * behaviour and leaves picotls to free it in on_write.
+     * Records pack greedily rather than one to a block.  A block holds 16896
+     * bytes and a maximal record is 16406, so a response header's record --
+     * a hundred-odd bytes on the wire -- rides in front of the first body
+     * record instead of costing a block and an iovec of its own.
+     *
+     * The one thing that does not segment is a response big enough to drain
+     * the pool: past TLS_WSEG_MAX blocks it takes a single picotls-owned
+     * allocation, in the shape tls_release_wbuf() already handles for a block
+     * picotls outgrew.  The block opened here then carries only the chain node.
      */
-    if (likely(need <= TLS_WBUF_SIZE)) {
-        c->tls_wblock = tls_wbuf_get();
-        if (unlikely(!c->tls_wblock)) { uv_close((uv_handle_t *)&c->handle, on_close); return; }
-        c->tls_wbuf.base         = (uint8_t *)c->tls_wblock;
-        c->tls_wbuf.capacity     = TLS_WBUF_SIZE;
-        c->tls_wbuf.is_allocated = 0;
-    } else {
-        c->tls_wblock = NULL;
-        c->tls_wbuf.base = (uint8_t *)malloc(need);
-        if (unlikely(!c->tls_wbuf.base)) { uv_close((uv_handle_t *)&c->handle, on_close); return; }
-        c->tls_wbuf.capacity     = need;
-        c->tls_wbuf.is_allocated = 1;
-    }
-    c->tls_wbuf.off        = 0;
-    c->tls_wbuf.align_bits = 0;
+    size_t nrec      = tls_record_count(hdr_len) + tls_record_count(body_len);
+    bool   oversized = unlikely(nrec > TLS_WSEG_MAX);
 
-    if (coalesce) {
-        memcpy(c->resp_hdr + hdr_len, body, body_len);
-        ptls_send(c->tls, &c->tls_wbuf, c->resp_hdr, hdr_len + body_len);
-    } else {
-        ptls_send(c->tls, &c->tls_wbuf, c->resp_hdr, hdr_len);
-        if (body_len)
-            ptls_send(c->tls, &c->tls_wbuf, body, body_len);
+    void *block = tls_wbuf_get();
+    if (unlikely(!block)) { uv_close((uv_handle_t *)&c->handle, on_close); return; }
+    c->tls_wblock   = block;                 /* released by on_write or tls_conn_free */
+    tls_wseg_t *seg = tls_wseg_open(block);
+    size_t      nseg = 1;
+
+    if (oversized) {
+        size_t need = tls_encrypted_size(hdr_len, rec_oh)
+                      + (body_len ? tls_encrypted_size(body_len, rec_oh) : 0);
+        size_t cap   = 0;
+        void  *whole = tls_bigbuf_get(need, &cap);
+        if (unlikely(!whole)) { uv_close((uv_handle_t *)&c->handle, on_close); return; }
+        c->tls_wbig           = whole;       /* released by tls_release_wbuf() */
+        seg->buf.base         = (uint8_t *)whole;
+        seg->buf.capacity     = cap;
+        seg->buf.is_allocated = 0;           /* ours: no free, and no memset on release */
     }
 
-    uv_buf_t uvbuf = uv_buf_init((char *)c->tls_wbuf.base, (unsigned)c->tls_wbuf.off);
-    uv_write(&c->write_req, (uv_stream_t *)&c->handle, &uvbuf, 1, on_write);
+    for (int r = 0; r < 2; r++) {
+        size_t off = 0;
+        while (off < runlen[r]) {
+            size_t chunk = runlen[r] - off;
+            if (!oversized && chunk > TLS_MAX_RECORD_PLAINTEXT)
+                chunk = TLS_MAX_RECORD_PLAINTEXT;
+
+            if (!oversized && seg->buf.off + chunk + rec_oh > TLS_WBUF_SIZE) {
+                if (unlikely(nseg == TLS_WSEG_MAX)) goto abandon;  /* unreachable: nrec bounds nseg */
+                void *nblock = tls_wbuf_get();
+                if (unlikely(!nblock)) goto abandon;
+                seg->next = nblock;
+                seg       = tls_wseg_open(nblock);
+                nseg++;
+            }
+
+            /* A KeyUpdate record, or an overhead this sizing did not predict,
+             * can still make picotls reserve past the block and swap in an
+             * allocation of its own.  That stays correct: the uv_buf below is
+             * built from buf.base, and release compares it against the block. */
+            if (unlikely(ptls_send(c->tls, &seg->buf, run[r] + off, chunk) != 0))
+                goto abandon;
+            off += chunk;
+        }
+    }
+
+    uv_buf_t uvbufs[TLS_WSEG_MAX];           /* uv_write copies these out */
+    unsigned nbufs = 0;
+    for (void *b = c->tls_wblock; b != NULL; b = TLS_WSEG_OF(b)->next) {
+        ptls_buffer_t *buf = &TLS_WSEG_OF(b)->buf;
+        uvbufs[nbufs++] = uv_buf_init((char *)buf->base, (unsigned)buf->off);
+    }
+    uv_write(&c->write_req, (uv_stream_t *)&c->handle, uvbufs, nbufs, on_write);
+    return;
+
+abandon:
+    /* Out of memory, or picotls refused to encrypt.  Some of the response is
+     * already encrypted and the connection's record sequence has moved on, so
+     * there is nothing to do but drop it; on_close releases every block. */
+    uv_close((uv_handle_t *)&c->handle, on_close);
 }
 
 #endif /* FREASTAL_TLS */

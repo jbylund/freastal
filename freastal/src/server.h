@@ -15,14 +15,50 @@
 #  define TLS_ENC_BUF_SIZE READ_BUF_SIZE
 /* Recycled encryption-output block.  TLS 1.3 caps a record's plaintext at
  * 16KB and frames it with 22 bytes, so one block of this size holds the
- * ciphertext of any response that fits a single record -- which is every
- * response this server emits in practice.  Larger ones fall back to a
- * per-response malloc that picotls owns, exactly as before. */
+ * ciphertext of a whole maximal record with room to spare -- enough that a
+ * response header's record rides along in front of it.  A response too large
+ * for one block is encrypted into a chain of them, one uv_write iovec each,
+ * rather than falling off onto a per-response malloc. */
 #  define TLS_MAX_RECORD_PLAINTEXT (16 * 1024)
 #  define TLS_WBUF_SIZE            (TLS_MAX_RECORD_PLAINTEXT + 512)
 /* Cap on retained blocks.  The pool's natural high-water mark is the number of
  * responses in flight at once, but a one-off burst should not pin its peak. */
 #  define TLS_WBUF_POOL_MAX        256
+/* Blocks one response may claim.  Past this it goes back to a single
+ * picotls-owned allocation: a response this large is bandwidth-bound, so the
+ * memset picotls does on release is amortised over milliseconds of wire time,
+ * whereas letting one response take half of a 256-block pool would push every
+ * connection sharing the loop onto malloc for as long as it took to drain. */
+#  define TLS_WSEG_MAX             128
+/* Largest oversized buffer worth keeping between responses.  One is retained
+ * per loop; anything above this is freed on release rather than pinned. */
+#  define TLS_BIGBUF_KEEP_MAX      (2 * 1024 * 1024)
+
+/*
+ * Trailer carried in the tail of every block, past the ciphertext.  Chaining
+ * the blocks through themselves costs client_t one head pointer instead of an
+ * array of TLS_WSEG_MAX segments -- 2KB per connection slot, over a 4096-slot
+ * pool -- and costs no allocation of its own.
+ *
+ * buf.base is what picotls actually wrote into, which is the block itself
+ * unless a reservation outgrew the capacity advertised to it, in which case
+ * picotls swapped in an allocation of its own and buf owns that.
+ */
+typedef struct tls_wseg_s {
+    void         *next;              /* next block of this response, or NULL */
+    ptls_buffer_t buf;
+} tls_wseg_t;
+
+/* What tls_wbuf_get() allocates; the first TLS_WBUF_SIZE bytes are picotls's. */
+#  define TLS_WBLOCK_SIZE     (TLS_WBUF_SIZE + sizeof(tls_wseg_t))
+#  define TLS_WSEG_OF(block)  ((tls_wseg_t *)((uint8_t *)(block) + TLS_WBUF_SIZE))
+
+_Static_assert(TLS_WBUF_SIZE % _Alignof(tls_wseg_t) == 0,
+               "the block trailer must land on its own alignment");
+_Static_assert(TLS_WBUF_SIZE >= TLS_MAX_RECORD_PLAINTEXT + 64,
+               "a maximal TLS record must fit in one block, or the chain "
+               "walk in tls_write_response_impl() cannot make progress");
+
 typedef struct {
     ptls_context_t               ctx;
     ptls_openssl_sign_certificate_t sign_cert;
@@ -111,8 +147,8 @@ typedef struct client_s {
     char         *tls_enc;                    /* heap-alloc'd on TLS accept, NULL for plain HTTP */
     ptls_t       *tls;
     bool          tls_hs_done;
-    ptls_buffer_t tls_wbuf;  /* encrypted response buf; alive until on_write */
-    void         *tls_wblock; /* pooled block backing tls_wbuf, or NULL if picotls owns it */
+    void         *tls_wblock; /* head of the encrypted response's block chain; alive until on_write */
+    void         *tls_wbig;   /* oversized buffer for a response past TLS_WSEG_MAX, or NULL */
 #endif
 
     /* --- Large buffers; NOT cleared by client_alloc().  Keep last. --- */
@@ -213,8 +249,16 @@ typedef struct {
 #ifdef FREASTAL_TLS
     tls_server_t  tls;
     bool          tls_enabled;
-    void         *tls_wbuf_pool;      /* free list of TLS_WBUF_SIZE blocks, linked through their first word */
+    void         *tls_wbuf_pool;      /* free list of TLS_WBLOCK_SIZE blocks, linked through their first word */
     int           tls_wbuf_pool_n;
+    void         *tls_bigbuf;         /* one retained oversized buffer, or NULL */
+    size_t        tls_bigbuf_cap;     /* its capacity; meaningless when tls_bigbuf is NULL */
+    /* Accounting, so that "released exactly once" and "no malloc in the
+     * steady state" are properties a test can assert rather than claims.
+     * Two integer ops per TLS response, alongside the pool counter above. */
+    unsigned long tls_wbuf_live;      /* blocks handed out and not yet returned */
+    unsigned long tls_bigbuf_live;    /* oversized buffers handed out and not yet returned */
+    unsigned long tls_wbuf_mallocs;   /* malloc() calls made by the two getters */
 #endif
 
     /* ASGI mode (runtime-selected; zero-init = WSGI) */
