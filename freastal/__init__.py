@@ -79,6 +79,18 @@ def _resolve_reuse_port(reuse_port, workers):
         return False
 
     if not _kernel_load_balances_reuse_port():
+        # Two different causes, and the fix differs, so do not report one as
+        # the other. HAS_REUSE_PORT says whether the flag existed in the uv.h
+        # this was built against; the probe says whether it is honoured here.
+        if not getattr(_freastal, "HAS_REUSE_PORT", 0):
+            raise ValueError(
+                "reuse_port=True was requested but this freastal was built "
+                "against a libuv without UV_TCP_REUSEPORT, so there is no "
+                "SO_REUSEPORT flag to pass -- whatever the running kernel could "
+                "do.  Rebuild against a libuv that defines it (1.48 does not, "
+                "1.52 does), or leave reuse_port unset and freastal shares one "
+                "bound listening socket across the workers instead."
+            )
         raise ValueError(
             f"reuse_port=True cannot be honoured on {sys.platform}: SO_REUSEPORT "
             "is accepted here but does not load-balance TCP listeners -- every "

@@ -48,6 +48,7 @@ import httpx
 import pytest
 
 import freastal
+from freastal import _freastal
 
 HOST = "127.0.0.1"
 
@@ -57,18 +58,19 @@ HOST = "127.0.0.1"
 # SO_REUSEPORT on a TCP listener and then delivers every connection to one
 # socket in the group, so a probe that only checks setsockopt+bind would say
 # "supported" and be wrong in the way that matters.
-KERNEL_LOAD_BALANCES = (
-    sys.platform.startswith("linux")
-    or sys.platform.startswith("freebsd")
-    or sys.platform.startswith("dragonfly")
-    or sys.platform.startswith("sunos")
-)
+#
+# Ask the extension, exactly as freastal does. A platform table here would be
+# the very thing the implementation stopped doing, and it is wrong on more than
+# macOS: GitHub's ubuntu runners carry a libuv with no UV_TCP_REUSEPORT at all,
+# so "linux" is not the capability either.
+KERNEL_LOAD_BALANCES = bool(_freastal.reuse_port_supported())
 
 requires_load_balancing = pytest.mark.skipif(
     not KERNEL_LOAD_BALANCES,
     reason=(
-        f"{sys.platform} has no load-balancing SO_REUSEPORT for TCP listeners; "
-        "reuse_port=True is refused there, see test_reuse_port_true_is_refused"
+        f"libuv here will not honour UV_TCP_REUSEPORT ({sys.platform}); either "
+        "the kernel does not load-balance or this libuv has no such flag. "
+        "reuse_port=True is refused, see test_reuse_port_true_is_refused"
     ),
 )
 
@@ -455,7 +457,12 @@ def test_reuse_port_true_is_refused_where_it_cannot_work(entry):
     assert result.returncode != 0, f"expected a refusal, got:\n{result.stdout}"
     err = result.stderr
     assert "reuse_port" in err, err
-    assert sys.platform in err or "SO_REUSEPORT" in err, err
+    # The refusal has to name which of the two causes it is, because the fix
+    # differs: a kernel that will not distribute connections (name the
+    # platform) versus a libuv built without the flag at all (name the flag).
+    # GitHub's ubuntu runners are the second case, which is why asserting only
+    # the first passed locally and failed there.
+    assert sys.platform in err or "REUSEPORT" in err, err
 
 
 def test_reuse_port_resolution_is_explicit_about_what_it_chose():
