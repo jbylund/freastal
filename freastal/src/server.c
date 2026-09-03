@@ -115,6 +115,8 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream, const char *data,
 static void tls_write_response_impl(client_t *c);
 static void tls_spill_drain(client_t *c);
 static void tls_read_flow(client_t *c, uv_stream_t *stream);
+static bool tls_send_close_notify(client_t *c);
+static void on_tls_close_notify_write(uv_write_t *req, int status);
 #endif
 
 /* ---- libuv I/O callbacks ---- */
@@ -333,6 +335,32 @@ static void on_write(uv_write_t *req, int status) {
     GIL_UNLOCK();
 
     if (status < 0 || !c->keep_alive) {
+#ifdef FREASTAL_TLS
+        /*
+         * The one close a TLS peer is entitled to see coming.  This branch is
+         * the whole of freastal's clean shutdown -- `Connection: close`, an
+         * HTTP/1.0 request, or a peer that went away mid-response -- and the
+         * three guards are what separate it from the closes that must stay
+         * silent.  status < 0 means the socket already refused this response,
+         * so a further write would only fail; tls_broken means the record
+         * layer is unusable and an alert encrypted with it would be garbage;
+         * !tls_hs_done means there are no application keys to encrypt it with
+         * at all (unreachable from here, since on_write runs only behind a
+         * response, but the alert is only meaningful once the keys exist and
+         * saying so is cheaper than proving it).  Every other close path --
+         * tls_read_failed(), the oversized request in tls_read_flow(), the
+         * out-of-memory bail in tls_write_response_impl() -- calls uv_close()
+         * directly and is deliberately not routed through here.
+         *
+         * Without this a client that reads to EOF cannot tell an orderly
+         * close from a truncation attack, and OpenSSL responds by discarding
+         * the session, so a NewSessionTicket issued on this connection can
+         * never be resumed from (#57).
+         */
+        if (c->tls && status >= 0 && !c->tls_broken && c->tls_hs_done &&
+            tls_send_close_notify(c))
+            return;                 /* on_tls_close_notify_write() closes */
+#endif
         uv_close((uv_handle_t *)&c->handle, on_close);
         return;
     }
@@ -785,6 +813,14 @@ static void tls_spill_drain(client_t *c) {
  * false is what makes it take that branch.
  */
 static void tls_read_failed(client_t *c, uv_stream_t *stream) {
+    /* Set on both branches, though only the deferred one can read it back:
+     * it is what stops on_write() from following the response with a
+     * close_notify.  The connection got here because picotls could not make
+     * sense of the record layer, so an alert encrypted with it is worth
+     * nothing to the peer -- and ptls_send_alert() would happily produce one,
+     * since it asks only whether the encryption keys exist.  A close with no
+     * close_notify is the honest signal here: something went wrong. */
+    c->tls_broken = true;
     if (unlikely(c->in_flight)) {
         c->keep_alive = false;
         if (c->read_armed) { uv_read_stop(stream); c->read_armed = false; }
@@ -1185,6 +1221,66 @@ abandon:
      * already encrypted and the connection's record sequence has moved on, so
      * there is nothing to do but drop it; on_close releases every block. */
     uv_close((uv_handle_t *)&c->handle, on_close);
+}
+
+static void on_tls_close_notify_write(uv_write_t *req, int status) {
+    client_t *c = CONTAINER_OF(req, client_t, write_req);
+    /* status is not consulted: the connection is going away either way, and
+     * a peer that vanished before the alert landed is exactly the case the
+     * alert could not have helped. */
+    (void)status;
+    tls_release_wbuf(c);            /* uv_write held the block until now */
+    uv_close((uv_handle_t *)&c->handle, on_close);
+}
+
+/*
+ * Encrypt a close_notify and put it on the wire, closing when it lands.
+ *
+ * The alert is one record of 24 bytes, so it borrows a pooled block through
+ * the same chain the response used -- on_write() released that chain at its
+ * top, and c->write_req is free again now that the response it carried has
+ * completed, so both are reused rather than paid for a second time.  Setting
+ * c->tls_wblock before anything can fail is what keeps the block from
+ * leaking: every return below either hands it to uv_write, whose callback
+ * releases it, or leaves it for tls_conn_free() to collect on the close the
+ * caller is about to do.
+ *
+ * Returns true when the close has become on_tls_close_notify_write()'s job.
+ * False means nothing was written and the caller must close: out of blocks,
+ * picotls declined to build the record, or uv_write failed outright and so
+ * will never call back.  An unclean close is the right fallback -- it is what
+ * the connection would have got anyway -- and none of the three is worth
+ * failing a request over.
+ */
+static bool tls_send_close_notify(client_t *c) {
+    /*
+     * Closing used to happen in this same loop turn, so nothing could arrive
+     * between deciding to close and the connection being gone.  The alert
+     * write opens exactly one turn of gap, and reading is armed across a
+     * response, so on_read can now fire on a connection that has already said
+     * goodbye.  Nothing good can come of what it would deliver -- the peer was
+     * told the connection is ending -- and letting tls_on_read_data() run
+     * there would put a second user of c->write_req behind this one.  So stop
+     * reading first and let the gap be uneventful.
+     */
+    if (c->read_armed) {
+        uv_read_stop((uv_stream_t *)&c->handle);
+        c->read_armed = false;
+    }
+
+    void *block = tls_wbuf_get();
+    if (unlikely(!block)) return false;
+    c->tls_wblock   = block;
+    tls_wseg_t *seg = tls_wseg_open(block);
+
+    if (unlikely(ptls_send_alert(c->tls, &seg->buf, PTLS_ALERT_LEVEL_WARNING,
+                                 PTLS_ALERT_CLOSE_NOTIFY) != 0))
+        return false;
+    if (unlikely(seg->buf.off == 0)) return false;
+
+    uv_buf_t b = uv_buf_init((char *)seg->buf.base, (unsigned)seg->buf.off);
+    return uv_write(&c->write_req, (uv_stream_t *)&c->handle, &b, 1,
+                    on_tls_close_notify_write) == 0;
 }
 
 #endif /* FREASTAL_TLS */

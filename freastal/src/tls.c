@@ -290,6 +290,7 @@ void tls_conn_init(client_t *c) {
     c->tls_enc     = malloc(TLS_ENC_BUF_SIZE);
     c->tls         = ptls_new(&g_server.tls.ctx, 1 /* is_server */);
     c->tls_hs_done = false;
+    c->tls_broken  = false;
     c->tls_wblock  = NULL;
     c->tls_wbig      = NULL;
     c->tls_spill     = NULL;
@@ -316,6 +317,7 @@ void tls_conn_free(client_t *c) {
     if (c->tls) { ptls_free(c->tls); c->tls = NULL; }
     tls_release_wbuf(c);
     c->tls_hs_done = false;
+    c->tls_broken  = false;
 }
 
 #endif /* FREASTAL_TLS */

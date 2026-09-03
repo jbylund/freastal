@@ -284,6 +284,7 @@ typedef struct client_s {
     bool          tls_hs_done;
     void         *tls_wblock; /* head of the encrypted response's block chain; alive until on_write */
     void         *tls_wbig;   /* oversized buffer for a response past TLS_WSEG_MAX, or NULL */
+    bool          tls_broken; /* the record layer is unusable; no close_notify may be sent */
     char         *tls_spill;                  /* pooled overflow block, held only while tls_spill_len > 0 */
     int           tls_spill_len;              /* bytes held in tls_spill; 0 means no block is held */
 #endif
