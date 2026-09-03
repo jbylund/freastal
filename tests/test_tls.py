@@ -483,8 +483,13 @@ def _read_exactly(sock, n):
     return b"".join(chunks)
 
 
-def _read_one_response(sock, buf):
-    """Pull one complete HTTP/1.1 response out of sock, returning (body, rest)."""
+def _read_full_response(sock, buf):
+    """Pull one complete HTTP/1.1 response out of sock as (head, body, rest).
+
+    `head` includes the blank line that ends it, so len(head) + len(body) is
+    exactly the plaintext the server encrypted for this response - which is
+    what decides its record framing.
+    """
     while b"\r\n\r\n" not in buf:
         b = sock.recv(65536)
         if not b:
@@ -502,7 +507,13 @@ def _read_one_response(sock, buf):
         if not b:
             raise AssertionError("connection closed mid-body")
         rest += b
-    return rest[:length], rest[length:]
+    return head + b"\r\n\r\n", rest[:length], rest[length:]
+
+
+def _read_one_response(sock, buf):
+    """Pull one complete HTTP/1.1 response out of sock, returning (body, rest)."""
+    _head, body, rest = _read_full_response(sock, buf)
+    return body, rest
 
 
 def test_pipelined_requests_over_tls(sized_tls_server):
@@ -995,41 +1006,195 @@ RECORD_INNER_OVERHEAD = 17
 CONTENT_TYPE_APPDATA = 23
 
 
-@pytest.mark.parametrize("size", [65536, 100000])
-def test_multi_block_response_keeps_maximal_record_framing(sized_tls_server, size):
-    """A response spanning several encryption blocks, seen on the wire.
+class _RecordCapture:
+    """One keep-alive TLS connection, with every record the server sends counted.
 
-    Above one block the response is encrypted a record at a time into a chain
-    of pooled blocks and sent as one writev.  What must not change is the
-    framing: one record for the response header, then the body in maximal
-    16KB records.  Splitting the body anywhere else -- at a block boundary,
-    say, or once per iovec -- still decrypts to the right bytes, so a test
-    that only checks the body cannot tell the difference.  This one can.
+    A wrapped socket hides the record framing entirely; memory BIOs do not,
+    and _BioReader already keeps every raw byte that arrives.  A TLS record's
+    type and length are in the clear, so the framing can be read off the
+    capture without decrypting anything.
+
+    Requests go one at a time, so records arrive in response order and each
+    response's share of them is settled by plaintext accounting: an
+    application-data record carries `length - RECORD_INNER_OVERHEAD` bytes of
+    plaintext, and a response's plaintext is exactly its header block plus its
+    body.  If those two numbers ever disagree the capture is not describing
+    the response, and get() says so rather than reporting a count nobody
+    should believe.
+    """
+
+    def __init__(self, port, timeout=20):
+        self._raw = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        self._sock, incoming, self._outgoing = _handshake_over_bio(
+            self._raw, tls_context()
+        )
+        self._raw.settimeout(timeout)
+        self._reader = _BioReader(self._raw, self._sock, incoming)
+        self._buf = b""
+        self._taken = 0  # records already attributed to an earlier response
+
+    def get(self, path):
+        """Send one request, returning (head, body, record plaintext lengths)."""
+        self._sock.write(f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+        self._raw.sendall(self._outgoing.read())
+        head, body, self._buf = _read_full_response(self._reader, self._buf)
+
+        records = _tls_records(bytes(self._reader.ciphertext))
+        mine = records[self._taken :]
+        self._taken = len(records)
+
+        types = sorted({t for t, _ in mine})
+        assert types == [CONTENT_TYPE_APPDATA], (
+            f"GET {path}: record content types on the wire were {types}, "
+            f"wanted only application data ({CONTENT_TYPE_APPDATA})"
+        )
+        plaintext = [ln - RECORD_INNER_OVERHEAD for _t, ln in mine]
+        assert sum(plaintext) == len(head) + len(body), (
+            f"GET {path}: the records carry {sum(plaintext)} bytes of plaintext "
+            f"but the response is {len(head) + len(body)} bytes - the capture "
+            f"and the response disagree, so no count from it can be trusted"
+        )
+        return head, body, plaintext
+
+    def close(self):
+        self._raw.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def _wanted_framing(head_len, body_len):
+    """The records a correct server emits for a response of this shape.
+
+    The header and the body are one plaintext stream cut into maximal 16KB
+    records.  Not two streams: splitting at the header/body seam buys a second
+    record header, a second AEAD pass and a second tag for nothing, and for a
+    small response that second record is most of what sending it costs.
+    """
+    total = head_len + body_len
+    return [
+        min(MAX_RECORD_PLAINTEXT, total - o)
+        for o in range(0, total, MAX_RECORD_PLAINTEXT)
+    ]
+
+
+def _framing_lines(wrong):
+    return "\n".join(
+        f"  body {n:>7}: {len(got):>3} records {got}\n"
+        f"  {'':>12}  {len(want):>3} wanted  {want}  "
+        f"(response header was {head_len} bytes)"
+        for n, head_len, got, want in wrong
+    )
+
+
+# 0 is the header alone -- no body vector at all.  8191/8192/8193 straddle the
+# old RESP_HDR_SIZE coalescing threshold, which used to decide the framing and
+# no longer has anything to do with it.  16000 is the largest body here that
+# still leaves room for the response header inside one record.
+ONE_RECORD_SIZES = [0, 1, 63, 64, 1000, 8000, 8191, 8192, 8193, 8300, 12000, 16000]
+
+
+@pytest.mark.parametrize("size", ONE_RECORD_SIZES)
+def test_one_record_per_response_that_fits_in_one(sized_tls_server, size):
+    """A response small enough for a single TLS record must be sent as one.
+
+    This is the whole point of the vectored write path: header and body reach
+    picotls as two iovecs of one record, so no size threshold in freastal --
+    RESP_HDR_SIZE least of all -- decides how many records a response costs.
     """
     _proto, port = sized_tls_server
-    with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
-        sock, incoming, outgoing = _handshake_over_bio(raw, tls_context())
-        sock.write(f"GET /n/{size} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
-        raw.sendall(outgoing.read())
-        raw.settimeout(20)
-        reader = _BioReader(raw, sock, incoming)
-        body, rest = _read_one_response(reader, b"")
+    with _RecordCapture(port) as cap:
+        head, body, records = cap.get(f"/n/{size}")
+
+    assert body == expected_body(size), f"body {size} came back wrong"
+    total = len(head) + len(body)
+    assert total <= MAX_RECORD_PLAINTEXT, (
+        f"body {size} behind a {len(head)}-byte response header is {total} "
+        f"bytes, past the {MAX_RECORD_PLAINTEXT}-byte record limit: this size "
+        f"no longer tests what it was picked to test"
+    )
+    assert records == [total], (
+        f"body {size}: the server sent {len(records)} records {records}; the "
+        f"whole {total}-byte response fits in one record, so it must be one"
+    )
+
+
+@pytest.mark.parametrize("size", [16385, 20000, 33000, 65536, 100000])
+def test_record_boundary_falls_inside_the_body(sized_tls_server, size):
+    """Past one record the split lands mid-body, not at the header/body seam.
+
+    The header and the first 16384 - len(header) bytes of the body share the
+    first record, so the record boundary falls in the middle of the body
+    iovec.  That is the case the vectored send has to get right and the one a
+    body-only assertion cannot see: splitting per iovec instead decrypts to
+    exactly the same bytes.
+    """
+    _proto, port = sized_tls_server
+    with _RecordCapture(port, timeout=30) as cap:
+        head, body, records = cap.get(f"/n/{size}")
+
+    assert body == expected_body(size), f"body {size} came back wrong"
+    want = _wanted_framing(len(head), len(body))
+    assert records == want, _framing_lines([(size, len(head), records, want)])
+    assert records[0] == MAX_RECORD_PLAINTEXT > len(head), (
+        f"body {size}: first record is {records[0]} bytes for a {len(head)}-byte "
+        f"header, so the server closed the record at the header/body seam "
+        f"instead of filling it from the body"
+    )
+
+
+def test_record_framing_across_the_size_sweep(sized_tls_server):
+    """Every boundary size, in order, down one keep-alive connection.
+
+    One connection is deliberate twice over.  The encryption blocks are
+    recycled, so a size framed wrongly tends to show up on the *next*
+    response; and every record here shares one AEAD sequence, so a miscounted
+    record would desynchronise it and the rest of the sweep would fail to
+    decrypt at all rather than merely miscount.
+
+    Every mismatch is collected before failing: one run then says which sizes
+    are wrong, instead of stopping at the first.
+    """
+    _proto, port = sized_tls_server
+    wrong = []
+    with _RecordCapture(port, timeout=30) as cap:
+        for n in BOUNDARY_SIZES:
+            head, body, records = cap.get(f"/n/{n}")
+            assert body == expected_body(n), (
+                f"size {n}: got {len(body)} bytes of body, wanted {n}"
+            )
+            want = _wanted_framing(len(head), len(body))
+            if records != want:
+                wrong.append((n, len(head), records, want))
+
+    assert not wrong, (
+        f"{len(wrong)} of {len(BOUNDARY_SIZES)} responses were cut into the "
+        f"wrong TLS records:\n" + _framing_lines(wrong)
+    )
+
+
+def test_record_framing_of_a_response_too_large_to_segment(sized_tls_server):
+    """Past the per-response block cap the whole response is handed to picotls
+    in one call, so it is picotls's own chunking that has to cross the
+    header/body boundary rather than freastal's.  Same framing either way.
+    """
+    _proto, port = sized_tls_server
+    size = 2_500_000
+    with _RecordCapture(port, timeout=60) as cap:
+        head, body, records = cap.get(f"/n/{size}")
 
     assert body == expected_body(size)
-    assert rest == b""
-
-    records = _tls_records(bytes(reader.ciphertext))
-    assert all(t == CONTENT_TYPE_APPDATA for t, _ in records), records
-
-    chunks = [
-        min(MAX_RECORD_PLAINTEXT, size - o)
-        for o in range(0, size, MAX_RECORD_PLAINTEXT)
-    ]
-    want = [n + RECORD_INNER_OVERHEAD for n in chunks]
-    assert [ln for _t, ln in records[1:]] == want
-    # The header rides in its own record in front of the first body record,
-    # not in a block of its own.
-    assert records[0][1] < 1024, records[0]
+    want = _wanted_framing(len(head), len(body))
+    if records != want:
+        differs = [i for i, (g, w) in enumerate(zip(records, want)) if g != w]
+        pytest.fail(
+            f"body {size}: {len(records)} records, wanted {len(want)}; first "
+            f"length mismatch at record "
+            f"{differs[0] if differs else min(len(records), len(want))}"
+        )
 
 
 def test_many_large_responses_in_flight_at_once(sized_tls_server):
@@ -1298,5 +1463,98 @@ def test_read_failure_while_a_segmented_response_is_writing(sized_tls_server):
         st = _stats(conn)
         assert st["blocks_live"] == 0, st
         assert st["bigbufs_live"] == 0, st
+    finally:
+        conn.close()
+
+
+# TLS_WSEG_MAX in freastal/src/server.h: blocks one response may claim before
+# it takes a single oversized buffer instead.
+WSEG_MAX = 128
+
+
+def _response_records(port, size):
+    """Ask for /n/<size> over memory BIOs; return (body, records).
+
+    A wrapped socket hides the record framing entirely.  Driving the TLS
+    session through memory BIOs keeps every raw byte, and a record's type and
+    length are in the clear, so the framing the server chose can be read off
+    without decrypting anything.
+
+    One connection per call: the capture then holds exactly this response's
+    records, with no earlier response's tail in front of it.
+    """
+    with socket.create_connection(("127.0.0.1", port), timeout=20) as raw:
+        sock, incoming, outgoing = _handshake_over_bio(raw, tls_context())
+        sock.write(f"GET /n/{size} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+        raw.sendall(outgoing.read())
+        raw.settimeout(20)
+        reader = _BioReader(raw, sock, incoming)
+        body, rest = _read_one_response(reader, b"")
+    assert rest == b""
+    records = _tls_records(bytes(reader.ciphertext))
+    assert all(t == CONTENT_TYPE_APPDATA for t, _ in records), records
+    return body, records
+
+
+def _plaintext_len(records):
+    """Plaintext the server fed picotls, recovered from the record lengths.
+
+    Each record's length field covers the payload, the content-type byte and
+    the AEAD tag, so subtracting the inner overhead per record gives back the
+    response header plus the body.  Deriving it beats hardcoding the header
+    length, which moves whenever the response header does.
+    """
+    return sum(ln - RECORD_INNER_OVERHEAD for _t, ln in records)
+
+
+# Sizes chosen against the framing, not against a buffer: 8193 and 16000 were
+# two records before header and body shared one, 16383-16385 bracket the record
+# limit itself, and everything above needs the stream split.
+# fmt: off
+
+def test_response_at_the_segmentation_cap(sized_tls_server):
+    """The exact body size where the pooled chain reaches TLS_WSEG_MAX blocks.
+
+    This is where the per-record accounting is least forgiving, and it moved
+    with this change: nrec is counted over the header and the body together,
+    because that is how ptls_send_v() cuts records.  Counting the header's
+    records separately and adding predicts one too many here, which quietly
+    sends a response that fits in exactly TLS_WSEG_MAX blocks down the
+    oversized path -- right bytes, wrong path, so only the block counters
+    notice.  Under-counting is the dangerous direction: it would run the chain
+    past the end of uvbufs[TLS_WSEG_MAX].
+
+    Every record here is maximal, so one block holds one record and the chain
+    is exactly as long as the record count.
+    """
+    _proto, port = sized_tls_server
+    cap = WSEG_MAX * MAX_RECORD_PLAINTEXT
+
+    # Learn this app's response-header length at a body with the same number of
+    # Content-Length digits, so the sizes below land on the boundary instead of
+    # near it.
+    probe = cap - 200
+    _body, records = _response_records(port, probe)
+    hdr_len = _plaintext_len(records) - probe
+    assert len(records) == WSEG_MAX, (hdr_len, len(records))
+
+    conn = http.client.HTTPSConnection(
+        "127.0.0.1", port, context=tls_context(), timeout=60
+    )
+    try:
+        # Either side of the cap, then a small one to prove the switch back.
+        for n in (cap - hdr_len - 1, cap - hdr_len, cap - hdr_len + 1, 1000):
+            conn.request("GET", f"/n/{n}")
+            resp = conn.getresponse()
+            assert resp.status == 200
+            assert resp.read() == expected_body(n), n
+
+        after = _stats(conn)
+        assert after["blocks_live"] == 0, after
+        assert after["bigbufs_live"] == 0, after
+        # A chain of exactly TLS_WSEG_MAX blocks was built and returned: had
+        # the count come out one high, the response at the cap would have taken
+        # one oversized buffer and the pool would never have grown this far.
+        assert after["pool_free"] >= WSEG_MAX, after
     finally:
         conn.close()

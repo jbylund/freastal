@@ -873,18 +873,40 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
     tls_read_flow(c, stream);
 }
 
-/* Bytes ptls_send() will append for a plaintext run of len: the payload plus
+/* Bytes ptls_send_v() will append for a plaintext run of len: the payload plus
  * one lot of record framing (5-byte header, content-type byte, AEAD tag) for
  * each 16KB record it is split into.  Rounds up, and never under-counts. */
 static inline size_t tls_encrypted_size(size_t len, size_t rec_overhead) {
     return len + (len / TLS_MAX_RECORD_PLAINTEXT + 1) * rec_overhead;
 }
 
-/* Records ptls_send() splits a plaintext run of len into.  Zero for an empty
+/* Records ptls_send_v() splits a plaintext run of len into.  Zero for an empty
  * run, which it turns into no record at all -- unlike tls_encrypted_size(),
  * which deliberately over-counts so that it can be used to size a buffer. */
 static inline size_t tls_record_count(size_t len) {
     return (len + TLS_MAX_RECORD_PLAINTEXT - 1) / TLS_MAX_RECORD_PLAINTEXT;
+}
+
+/* Cut the next `want` bytes out of the header/body vector pair, starting at
+ * the cursor (*veci, *vecoff), and write them into out[] as up to two vectors;
+ * advances the cursor.  Returns how many vectors were written.
+ *
+ * The caller has already checked that `want` bytes remain, so the cursor never
+ * runs off the end of vec[]. */
+static inline size_t tls_slice(const ptls_iovec_t *vec, size_t *veci, size_t *vecoff,
+                               size_t want, ptls_iovec_t *out) {
+    size_t n = 0;
+    while (want != 0) {
+        size_t avail = vec[*veci].len - *vecoff;
+        size_t take  = avail < want ? avail : want;
+        out[n++] = ptls_iovec_init(vec[*veci].base + *vecoff, take);
+        if ((*vecoff += take) == vec[*veci].len) {
+            (*veci)++;
+            *vecoff = 0;
+        }
+        want -= take;
+    }
+    return n;
 }
 
 /* Take a block for this response and point its trailer at its own data area.
@@ -911,40 +933,39 @@ static void tls_write_response_impl(client_t *c) {
     }
 
     /*
-     * One record instead of two.  A second record costs a 5-byte header, a
-     * fresh AEAD setup and a 16-byte tag, which for a ~130-byte response
-     * header is nearly all of what sending it costs.  resp_hdr is 8KB and
-     * already holds the header, so a body that fits behind it can be appended
-     * there and the two sent as a single record for the price of copying the
-     * body -- the trade lighttpd makes in chunkqueue_small_resp_optim().
+     * One record, no copy.  A second record costs a 5-byte header, a fresh
+     * AEAD setup and a 16-byte tag, which for a ~130-byte response header is
+     * nearly all of what sending it costs; every other server in this class
+     * avoids it by memcpying the body in behind the header, because its TLS
+     * library will only encrypt one contiguous buffer.  freastal used to do
+     * the same, and only up to RESP_HDR_SIZE, so 8KB was both the copy budget
+     * and -- for no reason to do with TLS -- the record-framing threshold.
      *
-     * Above that the copy is the more expensive half, so large bodies keep
-     * their own record and are encrypted straight out of the Python bytes.
+     * ptls_send_v() takes the header and the body as two vectors and encrypts
+     * them into one record straight out of the Python bytes, so neither the
+     * copy nor the threshold exists any more.  See vendor/patches/.
      */
-    if (body_len != 0 && hdr_len + body_len <= RESP_HDR_SIZE) {
-        memcpy(c->resp_hdr + hdr_len, body, body_len);
-        hdr_len += body_len;
-        body     = NULL;
-        body_len = 0;
-    }
-
-    /* The plaintext to encrypt, in wire order. */
-    const uint8_t *run[2]    = { (const uint8_t *)c->resp_hdr, (const uint8_t *)body };
-    size_t         runlen[2] = { hdr_len, body_len };
-    size_t         rec_oh    = ptls_get_record_overhead(c->tls);
+    ptls_iovec_t vec[2];
+    size_t       veccnt = 0;
+    if (hdr_len != 0)
+        vec[veccnt++] = ptls_iovec_init(c->resp_hdr, hdr_len);
+    if (body_len != 0)
+        vec[veccnt++] = ptls_iovec_init(body, body_len);
+    size_t total  = hdr_len + body_len;
+    size_t rec_oh = ptls_get_record_overhead(c->tls);
 
     /*
      * Every record goes in a pooled block, and blocks are chained into one
      * uv_write, so nothing here allocates and nothing here is memset on
-     * release however large the response is.  ptls_send() would otherwise
+     * release however large the response is.  ptls_send_v() would otherwise
      * append every record of a run into one contiguous buffer, so the loop
      * below hands it a single record's worth at a time: exactly one record per
      * call, into a block whose remaining capacity was checked first.
      *
      * Records pack greedily rather than one to a block.  A block holds 16896
-     * bytes and a maximal record is 16406, so a response header's record --
-     * a hundred-odd bytes on the wire -- rides in front of the first body
-     * record instead of costing a block and an iovec of its own.
+     * bytes and a maximal record is 16406, so a final short record -- up to
+     * 468 bytes of plaintext -- rides behind a maximal one instead of costing
+     * a block and a uv_write iovec of its own.
      *
      * The one thing that does not segment is a response big enough to drain
      * the pool: past TLS_WSEG_MAX blocks it takes a single oversized buffer
@@ -952,8 +973,18 @@ static void tls_write_response_impl(client_t *c) {
      * picotls with is_allocated = 0, exactly as a pooled block is, so it is
      * neither freed nor swept by picotls on release.  The block opened here
      * then carries only the chain node.
+     *
+     * Both counts below are taken over the whole stream, header included,
+     * because that is what ptls_send_v() cuts records out of.  Counting the
+     * header's records separately and adding -- which is what this did when
+     * the header was its own send -- predicts one record too many whenever the
+     * header fits in the slack of the body's last record.  That is enough to
+     * push a response needing exactly TLS_WSEG_MAX blocks onto the oversized
+     * path, and to reserve a record's framing more than the buffer needs.
+     * Under-counting would be the dangerous direction: it would run the chain
+     * past the end of uvbufs[TLS_WSEG_MAX].
      */
-    size_t nrec      = tls_record_count(hdr_len) + tls_record_count(body_len);
+    size_t nrec      = tls_record_count(total);
     bool   oversized = unlikely(nrec > TLS_WSEG_MAX);
 
     void *block = tls_wbuf_get();
@@ -963,8 +994,7 @@ static void tls_write_response_impl(client_t *c) {
     size_t      nseg = 1;
 
     if (oversized) {
-        size_t need = tls_encrypted_size(hdr_len, rec_oh)
-                      + (body_len ? tls_encrypted_size(body_len, rec_oh) : 0);
+        size_t need  = tls_encrypted_size(total, rec_oh);
         size_t cap   = 0;
         void  *whole = tls_bigbuf_get(need, &cap);
         if (unlikely(!whole)) { uv_close((uv_handle_t *)&c->handle, on_close); return; }
@@ -974,30 +1004,37 @@ static void tls_write_response_impl(client_t *c) {
         seg->buf.is_allocated = 0;           /* ours: no free, and no memset on release */
     }
 
-    for (int r = 0; r < 2; r++) {
-        size_t off = 0;
-        while (off < runlen[r]) {
-            size_t chunk = runlen[r] - off;
-            if (!oversized && chunk > TLS_MAX_RECORD_PLAINTEXT)
-                chunk = TLS_MAX_RECORD_PLAINTEXT;
+    /* Cursor into vec: which vector, and how far into it.  The header and the
+     * body are one plaintext stream now, so a record boundary can fall inside
+     * the body vector -- past 16KB it always does -- and tls_slice() is what
+     * splits it.  Records therefore straddle the header/body seam instead of
+     * starting over at it, which is the whole point. */
+    size_t veci = 0, vecoff = 0;
 
-            if (!oversized && seg->buf.off + chunk + rec_oh > TLS_WBUF_SIZE) {
-                if (unlikely(nseg == TLS_WSEG_MAX)) goto abandon;  /* unreachable: nrec bounds nseg */
-                void *nblock = tls_wbuf_get();
-                if (unlikely(!nblock)) goto abandon;
-                seg->next = nblock;
-                seg       = tls_wseg_open(nblock);
-                nseg++;
-            }
+    for (size_t off = 0; off < total;) {
+        size_t chunk = total - off;
+        if (!oversized && chunk > TLS_MAX_RECORD_PLAINTEXT)
+            chunk = TLS_MAX_RECORD_PLAINTEXT;
 
-            /* A KeyUpdate record, or an overhead this sizing did not predict,
-             * can still make picotls reserve past the block and swap in an
-             * allocation of its own.  That stays correct: the uv_buf below is
-             * built from buf.base, and release compares it against the block. */
-            if (unlikely(ptls_send(c->tls, &seg->buf, run[r] + off, chunk) != 0))
-                goto abandon;
-            off += chunk;
+        if (!oversized && seg->buf.off + chunk + rec_oh > TLS_WBUF_SIZE) {
+            if (unlikely(nseg == TLS_WSEG_MAX)) goto abandon;  /* unreachable: nrec bounds nseg */
+            void *nblock = tls_wbuf_get();
+            if (unlikely(!nblock)) goto abandon;
+            seg->next = nblock;
+            seg       = tls_wseg_open(nblock);
+            nseg++;
         }
+
+        ptls_iovec_t part[2];
+        size_t       partcnt = tls_slice(vec, &veci, &vecoff, chunk, part);
+
+        /* A KeyUpdate record, or an overhead this sizing did not predict,
+         * can still make picotls reserve past the block and swap in an
+         * allocation of its own.  That stays correct: the uv_buf below is
+         * built from buf.base, and release compares it against the block. */
+        if (unlikely(ptls_send_v(c->tls, &seg->buf, part, partcnt) != 0))
+            goto abandon;
+        off += chunk;
     }
 
     uv_buf_t uvbufs[TLS_WSEG_MAX];           /* uv_write copies these out */

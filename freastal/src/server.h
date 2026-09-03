@@ -185,7 +185,22 @@ typedef struct {
  * bound in the server is written against READ_BUF_SIZE -- this name appears
  * only where the array's real width is meant. */
 #define READ_BUF_ALLOC  (READ_BUF_SIZE + TLS_DECRYPT_SLACK)
-#define RESP_HDR_SIZE   (8  * 1024)   /* embedded per-client response header buffer */
+/* Embedded per-client response header buffer.
+ *
+ * This is not scratch space with slack in it: it is the largest response
+ * header block freastal will emit, and a block that does not fit is answered
+ * with a 500 rather than truncated (format_response_headers() in wsgi.c,
+ * format_response_asgi() in asgi.c).  The TLS write path used to borrow the
+ * unused tail to coalesce a small body behind the header; it hands picotls two
+ * iovecs instead now and copies nothing, so nothing borrows this any more.
+ *
+ * Which means shrinking it buys memory -- 4096 connection slots per worker, so
+ * every 1KB off is 4MB -- at the price of rejecting responses that work today.
+ * 8KB is the conventional bound (Apache's, and nginx's for request headers),
+ * and a handful of Set-Cookie headers or a long CSP gets a fair way into it,
+ * so the size stays until someone measures real header blocks rather than
+ * guessing at them. */
+#define RESP_HDR_SIZE   (8  * 1024)
 #define MAX_HEADERS     64
 #define LISTEN_BACKLOG  4096
 #define PEER_ADDR_LEN   64

@@ -51,6 +51,8 @@
 
 #define PTLS_MAX_PLAINTEXT_RECORD_SIZE 16384
 #define PTLS_MAX_ENCRYPTED_RECORD_SIZE (16384 + 256)
+/* Number of vectors `ptls_send_v` can accept without allocating scratch space. */
+#define PTLS_SEND_MAX_INLINE_IOVECS 8
 
 #define PTLS_RECORD_VERSION_MAJOR 3
 #define PTLS_RECORD_VERSION_MINOR 3
@@ -696,12 +698,17 @@ Exit:
 
 #if PTLS_FUZZ_HANDSHAKE
 
-static size_t aead_encrypt(struct st_ptls_traffic_protection_t *ctx, void *output, const void *input, size_t inlen,
-                           uint8_t content_type)
+static size_t aead_encrypt_v(struct st_ptls_traffic_protection_t *ctx, void *output, ptls_iovec_t *invec, size_t incnt,
+                             uint8_t content_type)
 {
-    memcpy(output, input, inlen);
-    memcpy(output + inlen, &content_type, 1);
-    return inlen + 1 + 16;
+    uint8_t *dst = output;
+
+    for (size_t i = 0; i != incnt; ++i) {
+        memcpy(dst, invec[i].base, invec[i].len);
+        dst += invec[i].len;
+    }
+    memcpy(dst, &content_type, 1);
+    return (size_t)(dst - (uint8_t *)output) + 1 + 16;
 }
 
 static int aead_decrypt(struct st_ptls_traffic_protection_t *ctx, void *output, size_t *outlen, const void *input, size_t inlen)
@@ -725,14 +732,21 @@ static void build_aad(uint8_t aad[5], size_t reclen)
     aad[4] = (uint8_t)reclen;
 }
 
-static size_t aead_encrypt(struct st_ptls_traffic_protection_t *ctx, void *output, const void *input, size_t inlen,
-                           uint8_t content_type)
+/* Encrypts the concatenation of `incnt` vectors as the payload of one TLS 1.3 record. `invec` doubles as scratch space; the caller
+ * must supply room for one vector beyond `incnt`, which is filled in with the content type byte that TLS 1.3 appends to the
+ * payload. */
+static size_t aead_encrypt_v(struct st_ptls_traffic_protection_t *ctx, void *output, ptls_iovec_t *invec, size_t incnt,
+                             uint8_t content_type)
 {
-    ptls_iovec_t invec[2] = {ptls_iovec_init(input, inlen), ptls_iovec_init(&content_type, 1)};
     uint8_t aad[5];
+    size_t inlen = 0;
+
+    for (size_t i = 0; i != incnt; ++i)
+        inlen += invec[i].len;
+    invec[incnt] = ptls_iovec_init(&content_type, 1);
 
     build_aad(aad, inlen + 1 + ctx->aead->algo->tag_size);
-    ptls_aead_encrypt_v(ctx->aead, output, invec, PTLS_ELEMENTSOF(invec), ctx->seq++, aad, sizeof(aad));
+    ptls_aead_encrypt_v(ctx->aead, output, invec, incnt + 1, ctx->seq++, aad, sizeof(aad));
 
     return inlen + 1 + ctx->aead->algo->tag_size;
 }
@@ -749,6 +763,14 @@ static int aead_decrypt(struct st_ptls_traffic_protection_t *ctx, void *output, 
 }
 
 #endif /* #if PTLS_FUZZ_HANDSHAKE */
+
+static size_t aead_encrypt(struct st_ptls_traffic_protection_t *ctx, void *output, const void *input, size_t inlen,
+                           uint8_t content_type)
+{
+    ptls_iovec_t invec[2] = {ptls_iovec_init(input, inlen)};
+
+    return aead_encrypt_v(ctx, output, invec, 1, content_type);
+}
 
 static void build_tls12_aad(uint8_t *aad, uint8_t type, uint64_t seq, uint16_t length)
 {
@@ -767,15 +789,36 @@ static void build_tls12_aad(uint8_t *aad, uint8_t type, uint64_t seq, uint16_t l
         ptls_buffer_push_block((buf), 2, block);                                                                                   \
     } while (0)
 
-static int buffer_push_encrypted_records(ptls_buffer_t *buf, uint8_t type, const uint8_t *src, size_t len,
-                                         struct st_ptls_traffic_protection_t *enc)
+/* Encrypts the concatenation of `vec` into as many records as it takes. Record boundaries are determined by the total length
+ * alone and are therefore free to fall in the middle of a vector, in which case that vector is split between two records.
+ * `invec` is scratch space owned by the caller, that must have room for `veccnt + 1` vectors. */
+static int buffer_push_encrypted_records_v(ptls_buffer_t *buf, uint8_t type, ptls_iovec_t *vec, size_t veccnt,
+                                           struct st_ptls_traffic_protection_t *enc, ptls_iovec_t *invec)
 {
+    size_t len = 0, veci = 0, vecoff = 0;
     int ret = 0;
+
+    for (size_t i = 0; i != veccnt; ++i)
+        len += vec[i].len;
 
     while (len != 0) {
         size_t chunk_size = len;
         if (chunk_size > PTLS_MAX_PLAINTEXT_RECORD_SIZE)
             chunk_size = PTLS_MAX_PLAINTEXT_RECORD_SIZE;
+        /* collect the vectors covering the payload of this record, splitting the one that straddles the record boundary */
+        size_t incnt = 0;
+        for (size_t remaining = chunk_size; remaining != 0;) {
+            size_t l = vec[veci].len - vecoff;
+            if (l > remaining)
+                l = remaining;
+            if (l != 0)
+                invec[incnt++] = ptls_iovec_init(vec[veci].base + vecoff, l);
+            if ((vecoff += l) == vec[veci].len) {
+                ++veci;
+                vecoff = 0;
+            }
+            remaining -= l;
+        }
         if (enc->tls12) {
             buffer_push_record(buf, type, {
                 /* reserve memory */
@@ -797,7 +840,8 @@ static int buffer_push_encrypted_records(ptls_buffer_t *buf, uint8_t type, const
                 uint8_t aad[PTLS_TLS12_AAD_SIZE];
                 build_tls12_aad(aad, type, enc->seq, (uint16_t)chunk_size);
                 /* encrypt */
-                buf->off += ptls_aead_encrypt(enc->aead, buf->base + buf->off, src, chunk_size, nonce, aad, sizeof(aad));
+                ptls_aead_encrypt_v(enc->aead, buf->base + buf->off, invec, incnt, nonce, aad, sizeof(aad));
+                buf->off += chunk_size + enc->aead->algo->tag_size;
                 ++enc->seq;
             });
         } else {
@@ -805,15 +849,22 @@ static int buffer_push_encrypted_records(ptls_buffer_t *buf, uint8_t type, const
                 if ((ret = ptls_buffer_reserve_aligned(buf, chunk_size + enc->aead->algo->tag_size + 1,
                                                        enc->aead->algo->align_bits)) != 0)
                     goto Exit;
-                buf->off += aead_encrypt(enc, buf->base + buf->off, src, chunk_size, type);
+                buf->off += aead_encrypt_v(enc, buf->base + buf->off, invec, incnt, type);
             });
         }
-        src += chunk_size;
         len -= chunk_size;
     }
 
 Exit:
     return ret;
+}
+
+static int buffer_push_encrypted_records(ptls_buffer_t *buf, uint8_t type, const uint8_t *src, size_t len,
+                                         struct st_ptls_traffic_protection_t *enc)
+{
+    ptls_iovec_t vec = ptls_iovec_init(src, len), invec[2];
+
+    return buffer_push_encrypted_records_v(buf, type, &vec, 1, enc, invec);
 }
 
 static int buffer_encrypt_record(ptls_buffer_t *buf, size_t rec_start, struct st_ptls_traffic_protection_t *enc)
@@ -6204,8 +6255,11 @@ Exit:
     return ret;
 }
 
-int ptls_send(ptls_t *tls, ptls_buffer_t *sendbuf, const void *input, size_t inlen)
+int ptls_send_v(ptls_t *tls, ptls_buffer_t *sendbuf, ptls_iovec_t *vec, size_t veccnt)
 {
+    ptls_iovec_t smallvec[PTLS_SEND_MAX_INLINE_IOVECS + 1], *invec = smallvec;
+    int ret;
+
     assert(tls->traffic_protection.enc.aead != NULL);
 
     /* "For AES-GCM, up to 2^24.5 full-size records (about 24 million) may be encrypted on a given connection while keeping a
@@ -6217,14 +6271,29 @@ int ptls_send(ptls_t *tls, ptls_buffer_t *sendbuf, const void *input, size_t inl
         tls->needs_key_update = 1;
 
     if (tls->needs_key_update) {
-        int ret;
         if ((ret = update_send_key(tls, sendbuf, tls->key_update_send_request)) != 0)
             return ret;
         tls->needs_key_update = 0;
         tls->key_update_send_request = 0;
     }
 
-    return buffer_push_encrypted_records(sendbuf, PTLS_CONTENT_TYPE_APPDATA, input, inlen, &tls->traffic_protection.enc);
+    /* the record builder needs one scratch vector per input vector plus one for the content type byte; only a caller passing an
+     * unusually long vector list pays for an allocation */
+    if (veccnt + 1 > PTLS_ELEMENTSOF(smallvec) && (invec = malloc(sizeof(*invec) * (veccnt + 1))) == NULL)
+        return PTLS_ERROR_NO_MEMORY;
+
+    ret = buffer_push_encrypted_records_v(sendbuf, PTLS_CONTENT_TYPE_APPDATA, vec, veccnt, &tls->traffic_protection.enc, invec);
+
+    if (invec != smallvec)
+        free(invec);
+    return ret;
+}
+
+int ptls_send(ptls_t *tls, ptls_buffer_t *sendbuf, const void *input, size_t inlen)
+{
+    ptls_iovec_t vec = ptls_iovec_init(input, inlen);
+
+    return ptls_send_v(tls, sendbuf, &vec, 1);
 }
 
 int ptls_update_key(ptls_t *tls, int request_update)
