@@ -32,6 +32,7 @@ Process and port hygiene, since every test here spawns servers:
     (grandchildren of pytest) can be checked for the same thing.
 """
 
+import asyncio
 import inspect
 import multiprocessing as mp
 import os
@@ -40,7 +41,6 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
