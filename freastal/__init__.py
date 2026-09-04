@@ -175,6 +175,33 @@ def _rebuild_ticket_ring_fd(dup):
     return _TicketRingFd(dup.detach())
 
 
+def _ticket_rotate_period_s():
+    """How often the ring rotates, in seconds.
+
+    Read from C so there is one definition, and overridable so the *timer*
+    path is reachable in a test. SIGUSR1 already covers rotating on demand,
+    but a kick tests the rotation mechanism, not the schedule: without this
+    the one thing that actually runs in production -- a thread waking on its
+    own an hour later -- is the one thing never exercised, and a wrong period
+    or a wait that never returns would pass every test.
+
+    Read in the process that owns the ring, so it survives spawn: the worker
+    never consults it.
+    """
+    override = os.environ.get("FREASTAL_TICKET_ROTATE_S")
+    if override:
+        try:
+            period = float(override)
+        except ValueError:
+            raise ValueError(
+                f"FREASTAL_TICKET_ROTATE_S={override!r} is not a number"
+            ) from None
+        if period <= 0:
+            raise ValueError("FREASTAL_TICKET_ROTATE_S must be positive")
+        return period
+    return _freastal.TICKET_ROTATE_MS / 1000.0
+
+
 class _TicketKeyRotator(threading.Thread):
     """The one clock that rotates the shared ticket key ring.
 
@@ -387,7 +414,7 @@ def _run_workers(worker, app, host, port, workers, reuse_port, certfile, keyfile
         # held is inherited locked.  There is nothing for it to do until an
         # hour from now anyway.
         if ring is not None:
-            rotator = _TicketKeyRotator(_freastal.TICKET_ROTATE_MS / 1000.0)
+            rotator = _TicketKeyRotator(_ticket_rotate_period_s())
             rotator.start()
             # Installed after the forks for the same reason the workers reset
             # it: a fork child would otherwise inherit a handler for a thread

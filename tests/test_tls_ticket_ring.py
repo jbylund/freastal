@@ -191,16 +191,24 @@ def rotate(port, ctx):
         conn.close()
 
 
-def start_server(certpair, workers, method, tmp_path):
+def start_server(certpair, workers, method, tmp_path, rotate_period_s=None):
     cert, key = certpair
     src = tmp_path / "ring_app.py"
     src.write_text(APP_SRC)
     port = free_port()
     errf = tempfile.NamedTemporaryFile("w+", delete=False)  # noqa: SIM115
+    env = dict(os.environ)
+    if rotate_period_s is not None:
+        # Turns the production period down; read only by the process that owns
+        # the ring, so it survives spawn. This is what makes the *timer* path
+        # reachable -- /rotate exercises the rotation mechanism, not the
+        # schedule the thread actually keeps.
+        env["FREASTAL_TICKET_ROTATE_S"] = str(rotate_period_s)
     proc = subprocess.Popen(
         [sys.executable, str(src), str(port), cert, key, str(workers), method],
         stdout=errf,  # the workers announce themselves on stdout
         stderr=errf,
+        env=env,
     )
 
     def output():
@@ -968,3 +976,74 @@ def test_the_region_is_kept_out_of_core_files_and_swap():
         f"the ring's backing object still has a link somebody could open:\n{entry}"
     )
     assert re.search(r"^Swap:\s+0 kB$", entry, re.MULTILINE), entry
+
+
+# ---------------------------------------------------------------------------
+# The rotation *schedule*, as opposed to the rotation mechanism.
+#
+# Every other rotation test here reaches the ring through /rotate, which kicks
+# the owner's thread awake. That proves rotation works when asked, and proves
+# nothing about the thread waking on its own -- which is the only thing that
+# ever happens in production. A period that was wrong by a factor of a
+# thousand, a wait() that never returns, a thread that was never started, or
+# one that dies after its first pass would all pass every other test in this
+# file and then quietly stop rotating an hour after deployment.
+#
+# FREASTAL_TICKET_ROTATE_S turns the real period down so the real timer can be
+# watched. Nothing about the path under test changes: same thread, same wait,
+# same _ticket_ring_rotate().
+# ---------------------------------------------------------------------------
+
+
+def test_the_owner_rotates_on_its_own_schedule(certpair, tmp_path):
+    """Nobody asks: the thread wakes by itself, more than once, on every worker.
+
+    Asserted as a ticket going stale rather than as a key name, because that is
+    the property that matters -- a client's ticket stops resuming because the
+    key it was sealed under left the ring, on all of the workers at once.
+    """
+    period = 0.5
+    method = "spawn" if sys.platform.startswith("linux") else "default"
+    proc, port, output = start_server(
+        certpair, 2, method, tmp_path, rotate_period_s=period
+    )
+    try:
+        ctx = tls_context()
+        session, reused, _body = request_over_new_connection(port, ctx)
+        assert not reused
+        assert session is not None and session.ticket_lifetime_hint > 0
+
+        # Still inside the ring's window: no rotation has had time to happen.
+        assert resume_many(port, ctx, session) == RECONNECTS, (
+            "a ticket stopped resuming before any rotation was due"
+        )
+
+        # Wait for strictly more rotations than the ring holds, without
+        # touching /rotate. Generous: a sleeping CI box must not fail this.
+        ring = _freastal.TICKET_RING_SLOTS
+        time.sleep(period * (ring + 2))
+
+        hits = resume_many(port, ctx, session)
+        assert hits == 0, (
+            f"{hits}/{RECONNECTS} reconnects still resumed after "
+            f"{ring + 2} rotation periods elapsed with nobody asking: the "
+            f"owner's timer is not rotating on its own, so in production the "
+            f"ring would stop rotating an hour in and nothing would say so"
+            f"\n--- server output ---\n{output()[-2000:]}"
+        )
+
+        # And the server is still healthy afterwards -- rotation that ends in a
+        # dead thread or an unusable ring is not rotation.
+        fresh, reused_fresh, _b = request_over_new_connection(port, ctx)
+        assert not reused_fresh
+        assert fresh is not None and fresh.ticket_lifetime_hint > 0
+        assert resume_many(port, ctx, fresh) == RECONNECTS, (
+            "tickets minted after several self-driven rotations do not resume"
+        )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
