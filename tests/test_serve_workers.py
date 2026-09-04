@@ -32,6 +32,7 @@ Process and port hygiene, since every test here spawns servers:
     (grandchildren of pytest) can be checked for the same thing.
 """
 
+import asyncio
 import inspect
 import multiprocessing as mp
 import os
@@ -83,8 +84,21 @@ requires_load_balancing = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
+# Long enough that several requests are in flight at once, short enough not to
+# slow the suite: 60 requests at concurrency 8 costs about 0.2s in total.
+#
+# The overlap is the point. A request that completes instantly finds the worker
+# that served the previous one already back in accept(), so on a small machine
+# one worker can take every connection -- which is a true statement about macOS
+# accept() and a useless one about whether freastal distributes work. Holding
+# the request forces the other workers to accept, and asserting on that is
+# asserting on the server rather than on the runner's core count.
+_PID_HOLD_S = 0.025
+
+
 def _wsgi_pid_app(environ, start_response):
     body = str(os.getpid()).encode()
+    time.sleep(_PID_HOLD_S)
     start_response("200 OK", [("Content-Type", "text/plain")])
     return [body]
 
@@ -93,6 +107,7 @@ async def _asgi_pid_app(scope, receive, send):
     if scope["type"] != "http":
         return
     body = str(os.getpid()).encode()
+    await asyncio.sleep(_PID_HOLD_S)
     await send(
         {
             "type": "http.response.start",

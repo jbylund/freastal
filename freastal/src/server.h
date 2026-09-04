@@ -12,6 +12,9 @@
 #ifdef FREASTAL_TLS
 #  include <picotls.h>
 #  include <picotls/openssl.h>
+/* For the ticket ring's seqlock, which is read from N worker processes while
+ * the process that called serve() writes it.  See "The shared ring" below. */
+#  include <stdatomic.h>
 /* Ciphertext handed to picotls in one read.
  *
  * Sized to a whole maximal record rather than to read_buf.  A record picotls
@@ -155,9 +158,225 @@ _Static_assert(TLS_WBUF_SIZE >= TLS_MAX_RECORD_PLAINTEXT + 64,
                "a maximal TLS record must fit in one block, or the chain "
                "walk in tls_write_response_impl() cannot make progress");
 
+/*
+ * Session-ticket sealing keys.
+ *
+ * A ticket carries the session's resumption secret, sealed under a key this
+ * process holds, and hands it back to the client to keep.  Whoever holds the
+ * sealing key can open every ticket ever sealed under it, so the key's
+ * lifetime -- not the ticket's -- is what bounds the damage from a later
+ * compromise of the process.  A key minted once at startup and held for the
+ * process lifetime makes that bound the uptime: a month-old server hands an
+ * attacker a month of tickets.  So the key is rotated, and the retired ones
+ * are zeroized rather than kept "just in case".
+ *
+ * The ring is what makes rotation invisible to clients.  The newest key seals;
+ * every key still in the ring can unseal.  A ticket names its key (the 16-byte
+ * label in the clear at the front), so the lookup is by name, not by trial
+ * decryption, and rotation costs nothing on the resumption path.
+ *
+ * The three numbers below are one constraint, not three choices.  A key
+ * becomes current at t0 and stops sealing at t0+ROTATE; the last ticket it
+ * seals is accepted until t0+ROTATE+LIFETIME; the slot is reused -- and the
+ * key destroyed -- at t0+RING*ROTATE.  For no client to be told "resume with
+ * this" and then handed a full handshake for a ticket that has not expired:
+ *
+ *     LIFETIME <= (RING - 1) * ROTATE
+ *
+ * 2h/1h/3 satisfies that exactly.  LIFETIME is 2h because that is OpenSSL's
+ * own default session timeout and comfortably inside RFC 8446's 7-day ceiling,
+ * and because the workload resumption is for -- a user returning to a tab, a
+ * dropped connection reopened, a client that does not pool -- lives in minutes
+ * to a couple of hours, not in days.  The 24h the issue calls "typical" would
+ * buy a few percent more hits at the top of the tail and cost 12x the key
+ * exposure.
+ *
+ * Given LIFETIME, the constraint fixes the exposure: the oldest key in the
+ * ring is RING*ROTATE = LIFETIME*RING/(RING-1) old, so the window can never be
+ * shorter than LIFETIME itself and RING only picks the multiple -- 2x at
+ * RING=2, 1.5x at RING=3, 1.25x at RING=5.  RING=3 takes most of the drop
+ * for 243 bytes of key material and one timer an hour; going to RING=5 would
+ * halve the rotation period to shave the multiple by a further 0.25x.  So:
+ * worst case, an attacker who takes the process at time T can open tickets
+ * sealed as far back as T-3h, against "everything since boot" today.
+ *
+ * What that attacker gets is bounded further by require_dhe_on_psk (see
+ * tls_server_init): a resumed handshake still does a fresh ECDHE, so a
+ * recovered resumption secret does not decrypt recorded traffic.
+ *
+ * With workers > 1 the ring is not per-process any more; see "The shared
+ * ring" below for what that changes about the sentence above.
+ */
+#  define TLS_TICKET_NAME_LEN   16      /* picotls' TICKET_LABEL_SIZE, fixed by the format */
+#  define TLS_TICKET_AES_LEN    32      /* AES-256-CBC */
+#  define TLS_TICKET_HMAC_LEN   32      /* HMAC-SHA256 */
+#  define TLS_TICKET_RING       3
+#  define TLS_TICKET_ROTATE_MS  (60u * 60u * 1000u)   /* 1 hour */
+#  define TLS_TICKET_LIFETIME_S (2u * 60u * 60u)      /* 2 hours */
+_Static_assert((uint64_t)TLS_TICKET_LIFETIME_S * 1000u <=
+                   (uint64_t)(TLS_TICKET_RING - 1) * TLS_TICKET_ROTATE_MS,
+               "a ticket would outlive the key that can open it: clients would "
+               "be handed a surprise full handshake inside ticket_lifetime");
+
+typedef struct {
+    uint8_t name[TLS_TICKET_NAME_LEN];
+    uint8_t aes[TLS_TICKET_AES_LEN];
+    uint8_t hmac[TLS_TICKET_HMAC_LEN];
+    /* False for a slot that has never been filled and for one just zeroized.
+     * Load-bearing, not bookkeeping: a zeroized slot's name is sixteen zero
+     * bytes under an all-zero key, all of which an attacker knows, so matching
+     * one would let anybody forge a ticket. */
+    bool    live;
+} tls_ticket_key_t;
+
+/*
+ * ---------------------------------------------------------------------------
+ * The shared ring
+ * ---------------------------------------------------------------------------
+ *
+ * With workers > 1, a ring per worker means a ticket sealed by worker A is
+ * undecryptable to worker B, and SO_REUSEPORT hands a reconnecting client a
+ * worker at random -- so resumption succeeds about 1/N of the time and the
+ * failures are invisible, because a declined ticket is indistinguishable from
+ * a first-time client.  The fix is one ring for the whole server, in shared
+ * memory: the process that called serve() creates it, mints into it and
+ * rotates it, and each worker maps it READ-ONLY and only ever reads.
+ *
+ * What that buys, and what it costs, stated plainly:
+ *
+ *   * It is strictly worse for blast radius, and unavoidably so.  Before,
+ *     taking one worker of N got you the ~1/N of live tickets that worker had
+ *     sealed.  Now it gets you all of them, because "every worker can open
+ *     every ticket" IS the feature.  The 3h window above is unchanged; what
+ *     changed is its width in tickets, from 1/N of them to all of them.
+ *   * It is also worse in that the parent now holds key material at all.
+ *     Before this it held none: it bound a socket and waited in join().
+ *   * It is better in that a worker cannot mint or replace a key.  Workers
+ *     take the network input, so a worker is the process most likely to be
+ *     compromised, and a worker that could write here could plant a chosen
+ *     sealing key that every *other* worker then sealed under.  The read-only
+ *     mapping is enforced by the descriptor: children are handed an O_RDONLY
+ *     one, and mmap(PROT_WRITE, MAP_SHARED) on it fails with EACCES.  That is
+ *     a wall against a worker bug, not against arbitrary code execution in a
+ *     worker on a box where it can reopen the parent's descriptor through
+ *     /proc (see tls_ticket_ring_create() in tls.c for what is and is not
+ *     reachable).
+ *   * Destruction still works, and works better than it looks like it should:
+ *     the mapping is MAP_SHARED, so every worker's view is the same physical
+ *     page.  When the owner zeroizes a retired slot, it is zero in all N
+ *     mappings at once -- there is no per-process copy to go stale.  MAP_
+ *     PRIVATE would silently break exactly that, so it is asserted below.
+ *
+ * Rotation must be lockstep or the whole thing is pointless: rings that drift
+ * apart stop agreeing within one rotation period, which is a failure that
+ * appears an hour after deployment and passes every test that does not
+ * rotate.  Lockstep is why the owner is the only writer.  Publication is a
+ * seqlock -- `seq` odd means a rotation is mid-publish, and a reader that saw
+ * an odd seq, or a seq that moved under it, retries -- so a worker can never
+ * read a slot mid-write and pair one key's name with another key's bytes.
+ *
+ * The owner's rotation timer is now in a different process from the keys, and
+ * that is a new way for the exposure bound to become false: kill -9 the
+ * parent and the workers are orphaned with a ring nobody will ever rotate,
+ * i.e. exactly the "a month-old server hands an attacker a month of tickets"
+ * case the ring exists to prevent.  So the owner publishes a deadline with
+ * every rotation and a worker refuses to seal or unseal with a ring that has
+ * blown through it -- resumption degrades to the pre-#29 behaviour, which is
+ * safe, rather than the key lifetime degrading to unbounded, which is not.
+ */
+#  define TLS_TICKET_RING_MAGIC 0x6672746Bu   /* "frtk" */
+/* Bumped whenever the layout below changes.  A worker refuses a region whose
+ * shape it does not recognise rather than reading key material out of the
+ * wrong offsets: the descriptor comes from our own parent today, but "the
+ * caller passed the wrong fd" must not be a memory-safety question. */
+#  define TLS_TICKET_RING_ABI   1u
+/* How late the owner may be with a rotation before a worker stops using the
+ * ring.  One full period: the owner's timer is a thread waking on a plain
+ * sleep, so being milliseconds late is normal and being an hour late means it
+ * is not coming.  Worst-case key retention becomes RING*ROTATE + GRACE. */
+#  define TLS_TICKET_STALE_GRACE_MS TLS_TICKET_ROTATE_MS
+/* Seqlock retry budget.  The writer holds the lock for two ~81-byte copies
+ * (the mint itself happens outside it), so one retry is already unusual and
+ * 64 means the owner was descheduled mid-publish.  Bounded rather than a
+ * spin-until-clear because this runs on a worker's event loop thread: giving
+ * up costs one full handshake, spinning costs every connection on the loop. */
+#  define TLS_TICKET_SEQ_RETRIES 64
+
+/*
+ * The exposure bound the comment above states -- an attacker who takes a
+ * process at time T can open tickets sealed as far back as T-RING*ROTATE --
+ * held for free while the rotation timer lived in the same process as the
+ * keys: if the process was alive to be compromised, its timer was alive to
+ * rotate.  Sharing the ring separates them, so the bound now needs a guard,
+ * and the guard needs its own arithmetic pinned here.  Worst-case retention
+ * is RING*ROTATE + GRACE, and GRACE <= ROTATE keeps that inside one extra
+ * period rather than a number nobody wrote down.
+ *
+ * Note that this is a *different* constraint from the one above it, not a
+ * restatement.  That one bounds the promise made to clients from below (a
+ * ticket must not outlive its key); this one bounds the exposure of key
+ * material from above (a key must not outlive its rotation).  Sharing the
+ * ring did not change the first -- ring arithmetic is ring arithmetic, and a
+ * worker that joins mid-epoch inherits a key whose destruction time was fixed
+ * when it was minted -- which is why the assert above is untouched.
+ */
+_Static_assert((uint64_t)TLS_TICKET_STALE_GRACE_MS <= (uint64_t)TLS_TICKET_ROTATE_MS,
+               "a stalled rotator could hold a key for longer than the extra "
+               "period the exposure bound in this comment allows for");
+
+typedef struct {
+    /* Written once, before any worker exists, and never again.  A worker
+     * checks all five before it trusts a byte of the rest. */
+    uint32_t magic;
+    uint32_t abi;
+    uint32_t ring_slots;
+    uint32_t key_stride;
+    uint32_t rotate_ms;
+    uint32_t grace_ms;
+    int32_t  owner_pid;      /* who to ask for an early rotation */
+    int32_t  _pad0;
+
+    /* Seqlock.  Odd = the owner is publishing a rotation.  Everything below
+     * is valid only when this is even and unchanged across the whole read.
+     * Starts at 0 and is 2 by the time create() returns, so 0 also means
+     * "not initialised" and a worker refuses to start on it. */
+    _Atomic uint32_t seq;
+    uint32_t _pad1;
+
+    /* Guarded by seq. */
+    int32_t  cur;            /* the slot that seals; the rest only unseal */
+    uint32_t _pad2;
+    uint64_t rotate_due_ms;  /* CLOCK_MONOTONIC ms by which the owner
+                              * promises the next rotation */
+    tls_ticket_key_t keys[TLS_TICKET_RING];
+} tls_ticket_ring_t;
+
+/*
+ * A seqlock across address spaces is only a seqlock if the sequence counter is
+ * a real atomic instruction.  Where the compiler cannot do it in hardware it
+ * lowers _Atomic to a libatomic call that takes a lock in *this process's*
+ * address space -- which synchronises nothing at all with the other processes
+ * mapping this page, and would leave torn key reads that no test would show.
+ * 2 is "always lock-free".
+ */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "uint32_t atomics are not lock-free here, so the ticket ring's "
+               "seqlock would not synchronise across processes at all");
+
 typedef struct {
     ptls_context_t               ctx;
     ptls_openssl_sign_certificate_t sign_cert;
+    ptls_encrypt_ticket_t        ticket_cb;   /* ctx.encrypt_ticket points here */
+    /* The process-local ring.  Used when this process owns its keys, which is
+     * workers=1 -- the common case, and it pays for none of the sharing. */
+    tls_ticket_key_t             ticket_keys[TLS_TICKET_RING];
+    int                          ticket_cur;  /* the slot that seals; the rest only unseal */
+    uv_timer_t                   ticket_timer;
+    /* Non-NULL in a worker: the shared ring, mapped read-only, rotated by the
+     * process that called serve().  When this is set the three fields above
+     * are unused and the rotation timer is never started. */
+    const tls_ticket_ring_t     *ticket_shared;
+    size_t                       ticket_shared_len;
 } tls_server_t;
 #endif
 
@@ -518,10 +737,14 @@ static inline int write_uint(char *dst, int remaining, Py_ssize_t n) {
 
 /* Server lifecycle */
 /* listen_fd < 0 binds host:port here; otherwise it is an already-bound
- * listening socket the caller owns and server_init dup()s. */
+ * listening socket the caller owns and server_init dup()s.
+ * ticket_ring_fd < 0 gives this process a session-ticket ring of its own;
+ * otherwise it is a read-only descriptor for the shared ring the process that
+ * called serve() owns, which this one maps.  Also the caller's to close. */
 int  server_reuseport_supported(void);
 int  server_init(PyObject *app, const char *host, int port, bool reuse_port,
-                 const char *certfile, const char *keyfile, int listen_fd);
+                 const char *certfile, const char *keyfile, int listen_fd,
+                 int ticket_ring_fd);
 void server_run(void);
 
 /* Client pool */

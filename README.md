@@ -143,6 +143,11 @@ Two things follow from that:
 Solaris. macOS accepts the option and then delivers every connection to a
 single socket in the group, which is why libuv refuses `UV_TCP_REUSEPORT`
 there and why `reuse_port=True` is an error rather than a no-op.
+**Session resumption.** Session tickets are on: a returning client skips the certificate signature, the most expensive part of the handshake. Tickets are good for 2 hours, and the key that seals them is rotated hourly and kept for three rotations, so a compromise of the server process exposes at most the last 3 hours of tickets rather than every ticket since boot. Resumption always re-runs (EC)DHE, so a stolen ticket key does not decrypt recorded traffic.
+
+0-RTT early data is deliberately **not** enabled and is not configurable: early data is replayable by design, and a general-purpose WSGI/ASGI server cannot know whether an application's handlers are idempotent.
+
+The ticket key is per worker process. With `workers > 1` behind `SO_REUSEPORT` the kernel picks the worker, so a resuming client hits the one that issued its ticket roughly `1/workers` of the time and otherwise falls back to a full handshake — the same handshake it would have done anyway. Sharing one key across workers needs an operator-supplied key rotated out of band; freastal has no interface for that yet.
 
 ## Architecture
 
