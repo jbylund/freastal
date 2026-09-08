@@ -659,8 +659,9 @@ void asgi_dispatch(client_t *c) {
     if (!scope) { PyErr_Clear(); send_500_asgi(c); return; }
 
     /* Request body bytes */
-    const char *bp   = c->read_buf + c->headers_end;
-    Py_ssize_t  blen = (Py_ssize_t)c->read_len - c->headers_end;
+    const char *bp = c->read_buf + c->read_off + c->headers_end;
+    Py_ssize_t blen =
+        (Py_ssize_t)(c->read_len - c->read_off) - c->headers_end;
     if (blen < 0) blen = 0;
     if ((size_t)blen > c->content_length) blen = (Py_ssize_t)c->content_length;
     PyObject *body = PyBytes_FromStringAndSize(bp, blen);

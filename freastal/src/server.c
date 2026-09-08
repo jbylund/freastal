@@ -74,20 +74,38 @@ static void client_clear_conn_cache(client_t *c) {
     Py_CLEAR(c->asgi_capsule);
 }
 
+static inline int client_buffered(const client_t *c) {
+    return c->read_len - c->read_off;
+}
+
+/*
+ * Reclaim the consumed prefix only when more tail room is needed.  Completed
+ * requests in an already-buffered pipeline advance read_off without copying,
+ * so a batch is drained in place instead of moving its shrinking tail after
+ * every response.
+ */
+static void client_compact(client_t *c) {
+    if (c->read_off == 0) return;
+    int buffered = client_buffered(c);
+    if (buffered > 0)
+        memmove(c->read_buf, c->read_buf + c->read_off, (size_t)buffered);
+    c->read_off = 0;
+    c->read_len = buffered;
+}
+
 void client_reset(client_t *c) {
     /*
-     * A read may have delivered more than one request.  Everything past the
-     * request we just answered belongs to the next one, so slide it to the
-     * front of the buffer rather than dropping it.  consumed == 0 means no
-     * request was ever parsed, in which case there is nothing to keep.
+     * A read may have delivered more than one request.  Advance over the one
+     * just answered and leave the rest in place.  Compacting every time makes
+     * a batch copy n-1, n-2, ... request tails; alloc_cb() and the TLS flow
+     * compact once only when the unused prefix is actually needed.
      */
     int consumed = c->headers_end + (int)c->content_length;
-    int leftover = (consumed > 0 && c->read_len > consumed)
-                       ? c->read_len - consumed : 0;
-    if (leftover > 0)
-        memmove(c->read_buf, c->read_buf + consumed, (size_t)leftover);
-
-    c->read_len = leftover;
+    int buffered = client_buffered(c);
+    if (consumed > 0 && consumed < buffered)
+        c->read_off += consumed;
+    else
+        c->read_off = c->read_len = 0;
     c->last_len = 0;
     c->method = NULL;
     c->method_len = 0;
@@ -142,6 +160,8 @@ static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
         return;
     }
 #endif
+    if (unlikely(!c->in_flight && c->read_off > 0))
+        client_compact(c);
     int remaining = READ_BUF_SIZE - c->read_len;
     if (remaining <= 0) {
         buf->base = NULL;
@@ -153,9 +173,11 @@ static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
 }
 
 int http_dispatch(client_t *c, uv_stream_t *stream) {
+    const char *request = c->read_buf + c->read_off;
+    int buffered = client_buffered(c);
     c->num_headers = MAX_HEADERS;
     int pret = phr_parse_request(
-        c->read_buf, (size_t)c->read_len,
+        request, (size_t)buffered,
         &c->method,  &c->method_len,
         &c->path,    &c->path_len,
         &c->minor_version,
@@ -163,7 +185,7 @@ int http_dispatch(client_t *c, uv_stream_t *stream) {
         (size_t)c->last_len
     );
 
-    if (pret == -2) { c->last_len = c->read_len; return 0; }
+    if (pret == -2) { c->last_len = buffered; return 0; }
 
     if (pret < 0) {
         static const char bad_req[] =
@@ -221,7 +243,7 @@ int http_dispatch(client_t *c, uv_stream_t *stream) {
         }
     }
 
-    size_t body_received = (size_t)(c->read_len - pret);
+    size_t body_received = (size_t)(buffered - pret);
     if (body_received < c->content_length) return 0;
 
     /*
@@ -304,7 +326,7 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
      * only the in-flight response can make room.  alloc_cb answers a full
      * buffer with a zero-length uv_buf_t, which libuv reports as UV_ENOBUFS
      * and which would kill a connection that is merely pipelining hard.
-     * on_write re-arms once client_reset() has slid the leftover down.
+     * on_write re-arms once the consumed prefix can be reclaimed.
      *
      * A full buffer with nothing in flight is a different thing -- a request
      * whose headers exceed READ_BUF_SIZE -- and still ends in UV_ENOBUFS and
@@ -394,14 +416,14 @@ static void on_write(uv_write_t *req, int status) {
     c->in_flight = false;
 
 #ifdef FREASTAL_TLS
-    /* client_reset() has just slid read_buf down, so anything a read could not
-     * fit into it goes back in now -- before the parse below, which is what
-     * makes the request it belongs to complete. */
+    /* Make room for anything a read could not fit, then put it back before
+     * parsing the request it completes. */
     if (c->tls) tls_spill_drain(c);
 #endif
 
     /* A pipelined request may already be buffered.  Dispatch it directly. */
-    if (c->read_len > 0 && http_dispatch(c, (uv_stream_t *)&c->handle) < 0)
+    if (client_buffered(c) > 0 &&
+        http_dispatch(c, (uv_stream_t *)&c->handle) < 0)
         return;
 
 #ifdef FREASTAL_TLS
@@ -786,7 +808,7 @@ static void tls_hs_send(client_t *c, ptls_buffer_t *outbuf) {
  * alloc_cb cannot bound a TLS read by the free space in read_buf, so a read
  * can decrypt to more plaintext than read_buf has room for.  This used to end
  * the connection; it now keeps the surplus here and folds it back in from
- * on_write, once client_reset() has slid read_buf down.  The two requests that
+ * on_write, once client_reset() has consumed a request.  The two requests that
  * overlap in read_buf are then dispatched in order exactly as they are on the
  * plaintext path, where the same situation just means the socket backs up for
  * a moment.
@@ -815,6 +837,7 @@ static int tls_spill_stash(client_t *c, const uint8_t *src, size_t len) {
 
 static void tls_spill_drain(client_t *c) {
     if (likely(c->tls_spill_len == 0)) return;
+    if (c->read_off > 0) client_compact(c);
     size_t room = (size_t)(READ_BUF_SIZE - c->read_len);
     if (room == 0) return;
     size_t take = (size_t)c->tls_spill_len < room ? (size_t)c->tls_spill_len : room;
@@ -865,6 +888,8 @@ static void tls_read_failed(client_t *c, uv_stream_t *stream) {
 static void tls_read_flow(client_t *c, uv_stream_t *stream) {
     if (unlikely(uv_is_closing((uv_handle_t *)&c->handle))) return;
 
+    if (!c->in_flight && c->read_off > 0)
+        client_compact(c);
     if (unlikely(c->read_len >= READ_BUF_SIZE && !c->in_flight)) {
         /*
          * read_buf is full, no complete request came out of it, and no
@@ -936,6 +961,8 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
         }
         return;
     }
+    if (!c->in_flight && c->read_off > 0)
+        client_compact(c);
     /*
      * Decrypt straight into read_buf's free tail.
      *
@@ -950,7 +977,7 @@ static void tls_on_read_data(client_t *c, uv_stream_t *stream,
      * decrypts every record in place at base + off and only advances off for
      * application data, so a KeyUpdate or an encrypted alert is decrypted into
      * read_buf's tail and then left there as scratch.  That is harmless --
-     * read_len is what bounds the request, and client_reset() slides only
+     * read_len is what bounds the request, and client_reset() advances only
      * within it -- and it is not a new exposure either: the request body has
      * always been left in read_buf, which client_alloc() deliberately does not
      * clear.  What is gone is the *second* copy the old staging buffer made,
