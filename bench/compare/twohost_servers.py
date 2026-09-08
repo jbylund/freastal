@@ -7,59 +7,33 @@ orchestrator does not have to know each server's own flags.
 import os
 import sys
 
-KIND = sys.argv[1]
-PORT = int(os.environ["BENCH_PORT"])
-WORKERS = int(os.environ.get("BENCH_WORKERS", "1"))
-BODY = b"x" * int(os.environ.get("BENCH_BODY", "500"))
-CL = str(len(BODY))
+COMPARE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(COMPARE_DIR))
+for path in (COMPARE_DIR, REPO_ROOT):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
-if KIND == "freastal-wsgi":
-    import freastal
+from apps import asgi_app, wsgi_app  # noqa: E402
 
-    def app(environ, start_response):
-        start_response(
-            "200 OK", [("Content-Type", "text/plain"), ("Content-Length", CL)]
-        )
-        return [BODY]
 
-    if __name__ == "__main__":
-        freastal.serve(app, host="0.0.0.0", port=PORT, workers=WORKERS)
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: twohost_servers.py SERVER_KIND")
+    kind = sys.argv[1]
+    port = int(os.environ.get("BENCH_PORT", "9200"))
+    workers = int(os.environ.get("BENCH_WORKERS", "1"))
 
-elif KIND == "freastal-asgi":
-    import freastal
+    if kind == "freastal-wsgi":
+        import freastal
 
-    async def app(scope, receive, send):
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [
-                    [b"content-type", b"text/plain"],
-                    [b"content-length", CL.encode()],
-                ],
-            }
-        )
-        await send({"type": "http.response.body", "body": BODY})
+        freastal.serve(wsgi_app, host="0.0.0.0", port=port, workers=workers)
 
-    if __name__ == "__main__":
-        freastal.serve_asgi(app, host="0.0.0.0", port=PORT, workers=WORKERS)
+    elif kind == "freastal-asgi":
+        import freastal
 
-elif KIND == "gunicorn-uvicorn":
+        freastal.serve_asgi(asgi_app, host="0.0.0.0", port=port, workers=workers)
 
-    async def app(scope, receive, send):
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [
-                    [b"content-type", b"text/plain"],
-                    [b"content-length", CL.encode()],
-                ],
-            }
-        )
-        await send({"type": "http.response.body", "body": BODY})
-
-    if __name__ == "__main__":
+    elif kind == "gunicorn-uvicorn":
         import gunicorn.app.base
 
         # uvicorn_worker is the maintained worker class; the one bundled in
@@ -81,29 +55,26 @@ elif KIND == "gunicorn-uvicorn":
 
         class App(gunicorn.app.base.BaseApplication):
             def load_config(self):
-                self.cfg.set("bind", f"0.0.0.0:{PORT}")
-                self.cfg.set("workers", WORKERS)
+                self.cfg.set("bind", f"0.0.0.0:{port}")
+                self.cfg.set("workers", workers)
                 self.cfg.set("worker_class", WORKER)
                 # access_log defaults to on and costs real throughput; error
                 # level filters those records before they are formatted.
                 self.cfg.set("loglevel", "error")
 
             def load(self):
-                return app
+                return asgi_app
 
         App().run()
 
-elif KIND == "bjoern":
-    import bjoern
+    elif kind == "bjoern":
+        import bjoern
 
-    def app(environ, start_response):
-        start_response(
-            "200 OK", [("Content-Type", "text/plain"), ("Content-Length", CL)]
-        )
-        return [BODY]
+        bjoern.run(wsgi_app, "0.0.0.0", port)
 
-    if __name__ == "__main__":
-        bjoern.run(app, "0.0.0.0", PORT)
+    else:
+        raise SystemExit(f"unknown server kind: {kind}")
 
-else:
-    raise SystemExit(f"unknown server kind: {KIND}")
+
+if __name__ == "__main__":
+    main()

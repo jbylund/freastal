@@ -8,6 +8,7 @@ cannot pipeline, a saturation guard that lets a client-bound row through.
 
 import json
 import os
+import pickle
 import sys
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ sys.path.insert(0, BENCH)
 
 twohost = pytest.importorskip("twohost")
 runner = pytest.importorskip("runner")
+twohost_servers = pytest.importorskip("twohost_servers")
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +90,12 @@ def test_ssh_runner_builds_a_batch_mode_command():
     cmd = s._ssh("true")
     assert "BatchMode=yes" in cmd
     assert "example.invalid" in cmd
+
+
+def test_server_apps_are_importable_across_spawned_workers():
+    """Workers must be able to unpickle apps without re-running the CLI."""
+    for app in (twohost_servers.wsgi_app, twohost_servers.asgi_app):
+        assert pickle.loads(pickle.dumps(app)) is app
 
 
 # ---------------------------------------------------------------------------
