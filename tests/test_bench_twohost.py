@@ -9,6 +9,7 @@ cannot pipeline, a saturation guard that lets a client-bound row through.
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -123,6 +124,51 @@ def test_everything_that_can_pipeline_is_swept():
 def test_saturation_uses_workers_not_process_tree_size():
     """Masters and multiprocessing helpers are not extra worker capacity."""
     assert twohost.server_saturation_pct(4.02, workers=4) == pytest.approx(100.5)
+
+
+def test_wrk_sample_records_tail_latency_when_clean():
+    out = SimpleNamespace(
+        returncode=0,
+        stderr="",
+        stdout="""
+Latency Distribution
+   50%    1.10ms
+   75%    1.40ms
+   90%    2.00ms
+   99%    4.20ms
+Requests/sec:  12345.67
+""",
+    )
+    metrics, error = twohost.parse_wrk_output(out)
+    assert error is None
+    assert metrics["rps"] == pytest.approx(12345.67)
+    assert metrics["latency"]["99"] == "4.20ms"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Socket errors: connect 0, read 2, write 0, timeout 0",
+        "Non-2xx or 3xx responses: 3",
+    ],
+)
+def test_wrk_sample_with_transport_or_http_errors_is_rejected(line):
+    out = SimpleNamespace(
+        returncode=0,
+        stderr="",
+        stdout=f"Requests/sec: 123.0\n{line}\n",
+    )
+    metrics, error = twohost.parse_wrk_output(out)
+    assert metrics is None
+    assert "errors" in error
+
+
+def test_endpoint_check_rejects_the_wrong_body_size():
+    class Client:
+        def run(self, argv, timeout):
+            return SimpleNamespace(returncode=0, stdout="200 499", stderr="")
+
+    assert "expected '200 500'" in twohost.check_response(Client(), "http://host/", 500)
 
 
 # ---------------------------------------------------------------------------

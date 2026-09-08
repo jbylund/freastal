@@ -245,12 +245,92 @@ def server_saturation_pct(cores, workers):
     return round(cores / max(1, workers) * 100, 1)
 
 
-def measure(client, server, handle, url, shape, warmup, duration, workers, args):
+def parse_wrk_output(out):
+    """Return usable wrk metrics, or an error that disqualifies the sample."""
+    raw = "\n".join(part for part in (out.stdout, out.stderr) if part).strip()
+    if out.returncode:
+        return None, f"wrk exited {out.returncode}: {raw[-1000:]}"
+
+    socket_errors = 0
+    match = re.search(
+        r"Socket errors:\s*connect\s+(\d+),\s*read\s+(\d+),"
+        r"\s*write\s+(\d+),\s*timeout\s+(\d+)",
+        raw,
+    )
+    if match:
+        socket_errors = sum(int(value) for value in match.groups())
+    http_match = re.search(r"Non-2xx or 3xx responses:\s*(\d+)", raw)
+    http_errors = int(http_match.group(1)) if http_match else 0
+    if socket_errors or http_errors:
+        return (
+            None,
+            f"wrk reported {socket_errors} socket errors and {http_errors} HTTP errors",
+        )
+
+    rps_match = re.search(r"Requests/sec:\s+([\d.]+)", raw)
+    if not rps_match:
+        return None, f"wrk output has no Requests/sec: {raw[-1000:]}"
+    latency = {
+        percentile: value
+        for percentile, value in re.findall(
+            r"^\s*(50|75|90|99)%\s+(\S+)\s*$", raw, flags=re.MULTILINE
+        )
+    }
+    return {
+        "rps": float(rps_match.group(1)),
+        "socket_errors": socket_errors,
+        "http_errors": http_errors,
+        "latency": latency,
+    }, None
+
+
+def check_response(client, url, expected_body):
+    out = client.run(
+        [
+            "curl",
+            "-sf",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code} %{size_download}",
+            url,
+        ],
+        timeout=15,
+    )
+    expected = f"200 {expected_body}"
+    if out.returncode or out.stdout.strip() != expected:
+        detail = (out.stderr or out.stdout or "no curl output").strip()
+        return f"endpoint expected {expected!r}, got {out.stdout.strip()!r}: {detail}"
+    return None
+
+
+def measure(
+    client,
+    server,
+    handle,
+    url,
+    shape,
+    warmup,
+    duration,
+    workers,
+    expected_body,
+    args,
+):
     threads, conns, depth = shape
     tail = [str(depth)] if depth > 1 else []
-    base = ["wrk", "-t", str(threads), "-c", str(conns)]
+    base = ["wrk", "--latency", "-t", str(threads), "-c", str(conns)]
+    sample = {
+        "threads": threads,
+        "connections": conns,
+        "depth": depth,
+        "warmup_s": warmup,
+        "duration_s": duration,
+    }
+    response_error = check_response(client, url, expected_body)
+    if response_error:
+        return {**sample, "error": response_error}
     if warmup:
-        client.run(
+        warmup_out = client.run(
             base
             + ["-d", f"{warmup}s"]
             + (["-s", args.remote_lua] if depth > 1 else [])
@@ -258,6 +338,9 @@ def measure(client, server, handle, url, shape, warmup, duration, workers, args)
             + (["--"] + tail if depth > 1 else []),
             timeout=warmup + 90,
         )
+        _, warmup_error = parse_wrk_output(warmup_out)
+        if warmup_error:
+            return {**sample, "error": f"warmup failed: {warmup_error}"}
     pids = server.descendants(handle)
     c0 = cpu_seconds(server, pids)
     out = client.run(
@@ -269,19 +352,15 @@ def measure(client, server, handle, url, shape, warmup, duration, workers, args)
         timeout=duration + 120,
     )
     c1 = cpu_seconds(server, pids)
-    m = re.search(r"Requests/sec:\s+([\d.]+)", out.stdout)
-    if not m:
-        return None
+    metrics, error = parse_wrk_output(out)
+    if error:
+        return {**sample, "error": error}
     cores = (c1 - c0) / duration
     return {
-        "rps": float(m.group(1)),
+        **sample,
+        **metrics,
         "server_cores": round(cores, 3),
         "server_sat_pct": server_saturation_pct(cores, workers),
-        "threads": threads,
-        "connections": conns,
-        "depth": depth,
-        "warmup_s": warmup,
-        "duration_s": duration,
     }
 
 
@@ -432,6 +511,7 @@ def main():
                         args.sweep_warmup,
                         args.sweep_duration,
                         cfg["workers"],
+                        cfg["body"],
                         args,
                     )
                     rec = res.add(cell, cfg, "sweep", rec)
@@ -472,6 +552,7 @@ def main():
                     args.final_warmup,
                     args.final_duration,
                     cfg["workers"],
+                    cfg["body"],
                     args,
                 )
                 row = res.add(cell, cfg, "final", rec)
@@ -517,6 +598,7 @@ def main():
                         args.sweep_warmup,
                         args.sweep_duration,
                         cfg["workers"],
+                        cfg["body"],
                         args,
                     )
                     row = res.add(cell, cfg, "diagnostic", rec)
