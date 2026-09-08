@@ -120,6 +120,11 @@ def test_everything_that_can_pipeline_is_swept():
     assert twohost.NO_PIPELINING == {"bjoern"}
 
 
+def test_saturation_uses_workers_not_process_tree_size():
+    """Masters and multiprocessing helpers are not extra worker capacity."""
+    assert twohost.server_saturation_pct(4.02, workers=4) == pytest.approx(100.5)
+
+
 # ---------------------------------------------------------------------------
 # results: append-only and resumable
 # ---------------------------------------------------------------------------

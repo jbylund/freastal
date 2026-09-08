@@ -185,7 +185,17 @@ def start_server(host, cfg, args):
 # --------------------------------------------------------------------------
 
 
-def measure(client, server, handle, url, shape, warmup, duration, args):
+def server_saturation_pct(cores, workers):
+    """Server CPU as a percentage of the configured worker budget.
+
+    Process trees also contain masters, resource trackers and fork servers.
+    Counting those pids as possible worker cores understates saturation for
+    exactly the multi-worker configurations this metric exists to validate.
+    """
+    return round(cores / max(1, workers) * 100, 1)
+
+
+def measure(client, server, handle, url, shape, warmup, duration, workers, args):
     threads, conns, depth = shape
     tail = [str(depth)] if depth > 1 else []
     base = ["wrk", "-t", str(threads), "-c", str(conns)]
@@ -216,9 +226,7 @@ def measure(client, server, handle, url, shape, warmup, duration, args):
     return {
         "rps": float(m.group(1)),
         "server_cores": round(cores, 3),
-        "server_sat_pct": round(cores / max(1, len(pids) - 1) * 100, 1)
-        if len(pids) > 1
-        else round(cores * 100, 1),
+        "server_sat_pct": server_saturation_pct(cores, workers),
         "threads": threads,
         "connections": conns,
         "depth": depth,
@@ -355,6 +363,7 @@ def main():
                         shape,
                         args.sweep_warmup,
                         args.sweep_duration,
+                        cfg["workers"],
                         args,
                     )
                     rec = res.add(cell, cfg, "sweep", rec)
@@ -394,6 +403,7 @@ def main():
                     shape,
                     args.final_warmup,
                     args.final_duration,
+                    cfg["workers"],
                     args,
                 )
                 row = res.add(cell, cfg, "final", rec)
@@ -438,6 +448,7 @@ def main():
                         dshape,
                         args.sweep_warmup,
                         args.sweep_duration,
+                        cfg["workers"],
                         args,
                     )
                     row = res.add(cell, cfg, "diagnostic", rec)
