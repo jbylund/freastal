@@ -169,7 +169,9 @@ def verify_server_source(host, server_script, expected):
     revision = host.run(["git", "-C", repo, "rev-parse", "HEAD"], timeout=15)
     if revision.returncode or not revision.stdout.strip():
         detail = (revision.stderr or revision.stdout or "no output").strip()
-        raise RuntimeError(f"cannot identify deployed server source in {repo}: {detail}")
+        raise RuntimeError(
+            f"cannot identify deployed server source in {repo}: {detail}"
+        )
     dirty = host.run(
         [
             "git",
@@ -391,7 +393,9 @@ def check_nofile(host, required):
 
 def prepare_pipeline_script(client, remote_path):
     """Install the versioned wrk script used by depth diagnostics."""
-    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline.lua")
+    local_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "pipeline.lua"
+    )
     destination = local_path if client.name == "local" else remote_path
     client.put_file(local_path, destination)
     out = client.run(["test", "-r", destination], timeout=15)
@@ -623,8 +627,7 @@ def main():
                     res.add(cell, cfg, "sweep", rec)
             except Exception as exc:  # noqa: BLE001 - one config must not end the run
                 print(
-                    f"  !! sweep {sweep_trial} {cfg['kind']} "
-                    f"w{cfg['workers']}: {exc}"
+                    f"  !! sweep {sweep_trial} {cfg['kind']} w{cfg['workers']}: {exc}"
                 )
             finally:
                 if handle:

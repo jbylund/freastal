@@ -161,10 +161,12 @@ class SshRunner:
         cmd = shlex.join(argv) if not isinstance(argv, str) else argv
         remote = (
             "log=/tmp/freastal-bench-$$.log; "
-            f"{envs} setsid nohup {cmd} >$log 2>&1 & echo \"$! $log\""
+            f'{envs} setsid nohup {cmd} >$log 2>&1 & echo "$! $log"'
         )
         out = self.run(remote, timeout=30)
-        started = out.stdout.strip().splitlines()[-1].split() if out.stdout.strip() else []
+        started = (
+            out.stdout.strip().splitlines()[-1].split() if out.stdout.strip() else []
+        )
         if len(started) != 2 or not started[0].isdigit():
             raise RuntimeError(f"could not start on {self.host}: {out.stderr[-400:]}")
         return {"kind": "ssh", "pid": int(started[0]), "log_file": started[1]}
@@ -195,9 +197,7 @@ class SshRunner:
         return out.returncode == 0
 
     def read_log(self, handle):
-        return self.run(
-            ["cat", handle["log_file"]], timeout=15, check=False
-        ).stdout
+        return self.run(["cat", handle["log_file"]], timeout=15, check=False).stdout
 
     def stop(self, handle):
         pid = handle["pid"]
