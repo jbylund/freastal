@@ -461,8 +461,9 @@ typedef struct client_s {
     struct client_s *next_free;               /* free-list link (valid only when pooled) */
 
     /* --- Read state --- */
-    int     read_len;                         /* bytes accumulated in read_buf */
-    int     last_len;                         /* read_len at previous parse attempt */
+    int     read_off;                         /* first unread byte in read_buf */
+    int     read_len;                         /* one past the last buffered byte */
+    int     last_len;                         /* buffered bytes at previous parse attempt */
 
     /* --- Parsed request (pointers into read_buf, valid until client_reset) --- */
     const char       *method;

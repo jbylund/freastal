@@ -103,3 +103,23 @@ def test_pipelined_requests_with_bodies(server_url):
     assert data.count(b"HTTP/1.1 200") == 2
     assert b"first" in data
     assert b"second" in data
+
+
+def test_nearly_full_pipeline_followed_by_a_split_request(server_url):
+    """Draining a buffered batch must leave a partial next request intact."""
+    parsed = urlparse(server_url)
+    request = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    count = (16 * 1024 // len(request)) - 2
+    final = b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\n\r\nsecond"
+    split = len(final) - 3
+
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.sendall(request * count + final[:split])
+        first = _read_until(sock, b"HTTP/1.1 200", count, timeout=5)
+        assert first.count(b"HTTP/1.1 200") == count
+
+        sock.sendall(final[split:])
+        last = _read_until(sock, b"HTTP/1.1 200", 1, timeout=5)
+
+    assert last.count(b"HTTP/1.1 200") == 1
+    assert b"second" in last

@@ -648,8 +648,9 @@ static PyObject *build_environ(client_t *c) {
             Py_DECREF(env); return NULL;
         }
     } else {
-        const char *body_ptr = c->read_buf + c->headers_end;
-        Py_ssize_t  body_len = (Py_ssize_t)c->read_len - c->headers_end;
+        const char *body_ptr = c->read_buf + c->read_off + c->headers_end;
+        Py_ssize_t  body_len =
+            (Py_ssize_t)(c->read_len - c->read_off) - c->headers_end;
         if (body_len < 0) body_len = 0;
         if ((size_t)body_len > c->content_length) body_len = (Py_ssize_t)c->content_length;
         PyObject *body_bytes = PyBytes_FromStringAndSize(body_ptr, body_len);
