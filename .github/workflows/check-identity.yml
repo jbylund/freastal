@@ -1,0 +1,37 @@
+name: Identity check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check-identity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve commit range
+        id: range
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ] || [ -z "${{ github.event.before }}" ]; then
+            # New branch / no prior history to diff against (e.g. a mirror
+            # restore): only the pushed tip commit can be checked here: a
+            # wholesale history rewrite still needs a manual audit.
+            echo "base=${{ github.sha }}~1" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: python3 .github/scripts/check_identity.py "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
