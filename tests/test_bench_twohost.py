@@ -249,6 +249,30 @@ def test_sweep_does_not_select_an_incomplete_shape():
     assert twohost.best_shape(rows, required_trials=2)[0] == (2, 64, 1)
 
 
+def test_deployed_source_must_match_recorded_revision():
+    class Host:
+        def __init__(self, dirty=""):
+            self.outputs = iter(
+                [
+                    SimpleNamespace(returncode=0, stdout="abc123\n", stderr=""),
+                    SimpleNamespace(returncode=0, stdout=dirty, stderr=""),
+                ]
+            )
+
+        def run(self, argv, timeout):
+            return next(self.outputs)
+
+    twohost.verify_server_source(
+        Host(), "/repo/bench/compare/twohost_servers.py", "abc123"
+    )
+    with pytest.raises(RuntimeError, match="abc123-dirty"):
+        twohost.verify_server_source(
+            Host(dirty=" M freastal/x.py\n"),
+            "/repo/bench/compare/twohost_servers.py",
+            "abc123",
+        )
+
+
 # ---------------------------------------------------------------------------
 # results: append-only and resumable
 # ---------------------------------------------------------------------------

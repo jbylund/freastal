@@ -144,13 +144,54 @@ def source_id():
         check=False,
     ).stdout.strip()
     diff = subprocess.run(
-        ["git", "-C", root, "diff", "--binary", "--", "bench/compare", "freastal"],
+        [
+            "git",
+            "-C",
+            root,
+            "diff",
+            "HEAD",
+            "--binary",
+            "--",
+            "bench/compare",
+            "freastal",
+        ],
         capture_output=True,
         check=False,
     ).stdout
     if diff:
         return f"{commit or 'unknown'}-dirty-{hashlib.sha256(diff).hexdigest()[:12]}"
     return commit or "unknown"
+
+
+def verify_server_source(host, server_script, expected):
+    """Require the deployed checkout to match the recorded local revision."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(server_script)))
+    revision = host.run(["git", "-C", repo, "rev-parse", "HEAD"], timeout=15)
+    if revision.returncode or not revision.stdout.strip():
+        detail = (revision.stderr or revision.stdout or "no output").strip()
+        raise RuntimeError(f"cannot identify deployed server source in {repo}: {detail}")
+    dirty = host.run(
+        [
+            "git",
+            "-C",
+            repo,
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            "bench/compare",
+            "freastal",
+        ],
+        timeout=15,
+    )
+    if dirty.returncode:
+        raise RuntimeError(f"cannot inspect deployed server source in {repo}")
+    actual = revision.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
+    if actual != expected:
+        raise RuntimeError(
+            f"deployed server source is {actual}, but this run records {expected}; "
+            "check out the same clean commit on both hosts"
+        )
 
 
 def run_fingerprint(args, source):
@@ -514,6 +555,7 @@ def main():
     server = host(args.server_host, "server")
     client = host(args.client_host, "client")
     source = source_id()
+    verify_server_source(server, args.server_script, source)
     run_id = run_fingerprint(args, source)
     print(f"  run: {run_id}  source: {source}")
     res = Results(args.out, run_id, source)
