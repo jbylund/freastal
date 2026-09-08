@@ -110,10 +110,7 @@ def test_nearly_full_pipeline_followed_by_a_split_request(server_url):
     parsed = urlparse(server_url)
     request = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n"
     count = (16 * 1024 // len(request)) - 2
-    final = (
-        b"POST /echo HTTP/1.1\r\nHost: localhost\r\n"
-        b"Content-Length: 6\r\n\r\nsecond"
-    )
+    final = b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\n\r\nsecond"
     split = len(final) - 3
 
     with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
