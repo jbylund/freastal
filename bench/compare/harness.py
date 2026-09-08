@@ -121,7 +121,7 @@ def provenance(args):
         "rounds": args.rounds,
         "loopback": True,
         "cpu_sample_interval_s": args.cpu_interval,
-        "cpu_saturated_pct": cpusample.SATURATED,
+        "cpu_saturated_pct": cpusample.HIGH_PCT,
         "cpu_machine_full_pct": cpusample.MACHINE_FULL,
     }
 
