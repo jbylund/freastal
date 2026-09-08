@@ -96,17 +96,13 @@ def test_ssh_runner_builds_a_batch_mode_command():
 
 
 def test_a_server_that_cannot_pipeline_is_never_swept():
-    """bjoern measured 9,823 rps at depth 1 and 21 at depth 4 -- it reads one
-    request per read and the rest of the batch waits for a timeout. Sweeping it
-    would spend the run measuring that timeout."""
+    """bjoern reads one request per read, so depth would measure a timeout."""
     assert twohost.depths_for("bjoern", [1, 8, 64]) == [1]
     assert twohost.depths_for("freastal-wsgi", [1, 8, 64]) == [1, 8, 64]
 
 
 def test_the_comparison_is_pinned_to_one_depth():
-    """Every server compared at the same depth, or the table ranks pipelining
-    support rather than throughput: freastal gains ~16%, uvicorn is flat, and
-    bjoern collapses."""
+    """Different depths would rank pipelining support, not just throughput."""
     assert twohost.COMPARE_DEPTH == 1
 
 
@@ -180,6 +176,27 @@ def test_file_descriptor_preflight_rejects_an_oversized_shape():
 
     with pytest.raises(RuntimeError, match="RLIMIT_NOFILE is 1024"):
         twohost.check_nofile(Host(), required=4352)
+
+
+def test_pipeline_script_is_copied_to_the_client():
+    class Client:
+        name = "ssh"
+        label = "client"
+
+        def __init__(self):
+            self.copy = None
+
+        def put_file(self, source, destination):
+            self.copy = (source, destination)
+
+        def run(self, argv, timeout):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    client = Client()
+    destination = twohost.prepare_pipeline_script(client, "/tmp/pipeline.lua")
+    assert destination == "/tmp/pipeline.lua"
+    assert client.copy[0].endswith("/bench/compare/pipeline.lua")
+    assert client.copy[1] == destination
 
 
 # ---------------------------------------------------------------------------

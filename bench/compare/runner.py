@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import shlex
 import signal
+import shutil
 import subprocess
 
 
@@ -37,6 +38,10 @@ class LocalRunner:
             start_new_session=True,
         )
         return {"kind": "local", "pid": p.pid, "proc": p}
+
+    def put_file(self, source, destination):
+        if os.path.abspath(source) != os.path.abspath(destination):
+            shutil.copyfile(source, destination)
 
     def stop(self, handle):
         """TERM the group, then KILL what is left.
@@ -132,6 +137,27 @@ class SshRunner:
         if not pid.isdigit():
             raise RuntimeError(f"could not start on {self.host}: {out.stderr[-400:]}")
         return {"kind": "ssh", "pid": int(pid)}
+
+    def put_file(self, source, destination):
+        out = subprocess.run(
+            [
+                "scp",
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                source,
+                f"{self.host}:{destination}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if out.returncode:
+            raise RuntimeError(
+                f"could not copy {source} to {self.host}:{destination}: {out.stderr}"
+            )
 
     def stop(self, handle):
         pid = handle["pid"]

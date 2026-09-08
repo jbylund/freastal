@@ -49,11 +49,9 @@ except ImportError:  # pragma: no cover - standalone use
 # The comparison runs every server at the same depth, and that depth is 1.
 #
 # Pipelining is not a throughput knob that each server happens to tune
-# differently -- it is a capability they either have or do not, measured here:
-# freastal gains ~16%, gunicorn+uvicorn is flat across depths 1-16, and bjoern
-# collapses 470x because it reads one request per read. Letting each server run
-# at its own best depth would therefore rank pipelining support and print it in
-# the shape of a throughput number.
+# differently -- it is a protocol capability. Letting each server run at its
+# own best depth would rank that capability and print it in the shape of a
+# throughput number.
 #
 # So depth is fixed for the comparison, and the depth sweep survives as a
 # separate diagnostic over everything that can pipeline, reported apart from
@@ -73,16 +71,9 @@ DIAGNOSTIC_KINDS = {"freastal-wsgi", "freastal-asgi", "gunicorn-uvicorn"}
 
 # Servers that cannot be asked for pipelined requests.
 #
-# Measured, not assumed: bjoern serves 9,823 rps at depth 1 and 21 rps at depth
-# 4 -- a 470x collapse, because it reads one request per read and the rest of
-# the batch sits until a timeout. Sweeping depth for it would spend most of the
-# run measuring that timeout, and any depth>1 row would report "bjoern does not
-# implement pipelining" in the shape of a throughput number.
-#
-# For the record, the other two are not worth sweeping for the same reason in
-# reverse: gunicorn+uvicorn measured flat across depths 1-16, and only freastal
-# gains from it (+16%). Which is why a pipelined row belongs in a diagnostic
-# rather than in a comparison table.
+# bjoern reads one request per socket read, so the rest of a pipelined batch
+# waits for another read event. Sweeping depth for it would measure that
+# limitation rather than throughput.
 NO_PIPELINING = {"bjoern"}
 
 
@@ -326,6 +317,20 @@ def check_nofile(host, required):
         )
 
 
+def prepare_pipeline_script(client, remote_path):
+    """Install the versioned wrk script used by depth diagnostics."""
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline.lua")
+    destination = local_path if client.name == "local" else remote_path
+    client.put_file(local_path, destination)
+    out = client.run(["test", "-r", destination], timeout=15)
+    if out.returncode:
+        raise RuntimeError(
+            f"pipelining diagnostic script is not readable on {client.label}: "
+            f"{destination}"
+        )
+    return destination
+
+
 def measure(
     client,
     server,
@@ -488,6 +493,8 @@ def main():
     )
     base_shapes = [tuple(int(x) for x in s.split("x")) for s in args.shapes.split(",")]
     all_depths = [int(d) for d in args.depths.split(",")]
+    if args.diagnostic and any(depth > 1 for depth in all_depths):
+        args.remote_lua = prepare_pipeline_script(client, args.remote_lua)
     required_nofile = max(connections for _, connections in base_shapes) + 256
     check_nofile(client, required_nofile)
     check_nofile(server, required_nofile)
@@ -599,11 +606,8 @@ def main():
     # Shape and depth are swept together rather than fixing shape at the
     # comparison's argmax. They interact: the concurrency that suits depth 1
     # is not the one that suits depth 64, because pipelining moves the
-    # bottleneck off the round trip. Measured over WiFi, -c512 d1 gave 55,904
-    # rps while -c512 d64 gave 145,390 -- and a diagnostic pinned to the depth-1
-    # shape would have reported whichever depth happened to suit it. This is
-    # freastal-only, so the cross product is affordable here in a way it is not
-    # for the comparison.
+    # bottleneck off the round trip. This is diagnostic-only, so the cross
+    # product is affordable here in a way it is not for the comparison.
     for cfg in diag_cfgs:
         handle = None
         try:
