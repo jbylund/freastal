@@ -101,6 +101,30 @@ def configs(bodies, worker_counts, only=None):
     return out
 
 
+def rotated(items, offset):
+    """Deterministically rotate an order so drift is shared across trials."""
+    if not items:
+        return []
+    offset %= len(items)
+    return items[offset:] + items[:offset]
+
+
+def best_shape(rows, required_trials):
+    """Pick the highest median shape, excluding incomplete sweep samples."""
+    samples = {}
+    for row in rows:
+        if not row.get("rps"):
+            continue
+        shape = (row["threads"], row["connections"], row["depth"])
+        samples.setdefault(shape, []).append(row["rps"])
+    eligible = {
+        shape: statistics.median(values)
+        for shape, values in samples.items()
+        if len(values) >= required_trials
+    }
+    return max(eligible.items(), key=lambda item: item[1]) if eligible else None
+
+
 def cell_id(cfg, phase, shape=None, trial=None):
     s = f"-t{shape[0]}c{shape[1]}d{shape[2]}" if shape else ""
     t = f"-r{trial}" if trial is not None else ""
@@ -143,6 +167,7 @@ def run_fingerprint(args, source):
         "only",
         "shapes",
         "depths",
+        "sweep_trials",
         "sweep_warmup",
         "sweep_duration",
         "final_warmup",
@@ -461,6 +486,7 @@ def main():
     p.add_argument("--only", default="")
     p.add_argument("--shapes", default="2x32,4x64,4x128")
     p.add_argument("--depths", default="1")
+    p.add_argument("--sweep-trials", type=int, default=3)
     p.add_argument("--sweep-warmup", type=int, default=2)
     p.add_argument("--sweep-duration", type=int, default=5)
     p.add_argument("--final-warmup", type=int, default=5)
@@ -512,7 +538,7 @@ def main():
         if args.diagnostic
         else []
     )
-    total = sum(len(shapes_for(c)) for c in cfgs)
+    total = sum(len(shapes_for(c)) for c in cfgs) * args.sweep_trials
     print(
         f"  comparison: every server at depth {COMPARE_DEPTH} "
         f"({len(cfgs)} configs, {total} shape measurements, {args.trials} trials)"
@@ -525,15 +551,15 @@ def main():
 
     # ---- phase 1: per-config shape sweep -------------------------------
     best = {}
-    for cfg in cfgs:
-        handle = url = None
-        try:
-            handle, url = start_server(server, cfg, args)
-            for shape in shapes_for(cfg):
-                cell = cell_id(cfg, "sweep", shape)
-                if res.has(cell):
-                    rec = res.get(cell)
-                else:
+    for sweep_trial in range(args.sweep_trials):
+        for cfg_index, cfg in enumerate(rotated(cfgs, sweep_trial)):
+            handle = url = None
+            try:
+                handle, url = start_server(server, cfg, args)
+                for shape in rotated(shapes_for(cfg), sweep_trial + cfg_index):
+                    cell = cell_id(cfg, "sweep", shape, trial=sweep_trial)
+                    if res.has(cell):
+                        continue
                     rec = measure(
                         client,
                         server,
@@ -546,16 +572,26 @@ def main():
                         cfg["body"],
                         args,
                     )
-                    rec = res.add(cell, cfg, "sweep", rec)
-                if rec.get("rps") and (
-                    cfg["port"] not in best or rec["rps"] > best[cfg["port"]][0]
-                ):
-                    best[cfg["port"]] = (rec["rps"], shape)
-        except Exception as exc:  # noqa: BLE001 - one config must not end the run
-            print(f"  !! {cfg['kind']} w{cfg['workers']}: {exc}")
-        finally:
-            if handle:
-                server.stop(handle)
+                    res.add(cell, cfg, "sweep", rec)
+            except Exception as exc:  # noqa: BLE001 - one config must not end the run
+                print(
+                    f"  !! sweep {sweep_trial} {cfg['kind']} "
+                    f"w{cfg['workers']}: {exc}"
+                )
+            finally:
+                if handle:
+                    server.stop(handle)
+
+    for cfg in cfgs:
+        rows = [
+            row
+            for row in res.done.values()
+            if row.get("phase") == "sweep" and row.get("port") == cfg["port"]
+        ]
+        selected = best_shape(rows, args.sweep_trials)
+        if selected:
+            shape, median_rps = selected
+            best[cfg["port"]] = (median_rps, shape)
         if cfg["port"] in best:
             r, sh = best[cfg["port"]]
             print(
@@ -565,7 +601,7 @@ def main():
 
     # ---- phase 2: interleaved trials at each argmax ---------------------
     for trial in range(args.trials):
-        for cfg in cfgs:
+        for cfg in rotated(cfgs, trial):
             if cfg["port"] not in best:
                 continue
             shape = best[cfg["port"]][1]

@@ -199,6 +199,35 @@ def test_pipeline_script_is_copied_to_the_client():
     assert client.copy[1] == destination
 
 
+def test_trial_rotation_shares_first_and_last_positions():
+    configs = ["a", "b", "c", "d"]
+    orders = [twohost.rotated(configs, trial) for trial in range(4)]
+    assert [order[0] for order in orders] == configs
+    assert [order[-1] for order in orders] == ["d", "a", "b", "c"]
+
+
+def test_sweep_selects_the_best_replicated_median_not_the_lucky_maximum():
+    rows = [
+        {"threads": 1, "connections": 32, "depth": 1, "rps": value}
+        for value in (100, 101, 500)
+    ] + [
+        {"threads": 2, "connections": 64, "depth": 1, "rps": value}
+        for value in (110, 111, 112)
+    ]
+    shape, median_rps = twohost.best_shape(rows, required_trials=3)
+    assert shape == (2, 64, 1)
+    assert median_rps == 111
+
+
+def test_sweep_does_not_select_an_incomplete_shape():
+    rows = [
+        {"threads": 1, "connections": 32, "depth": 1, "rps": 999},
+        {"threads": 2, "connections": 64, "depth": 1, "rps": 100},
+        {"threads": 2, "connections": 64, "depth": 1, "rps": 101},
+    ]
+    assert twohost.best_shape(rows, required_trials=2)[0] == (2, 64, 1)
+
+
 # ---------------------------------------------------------------------------
 # results: append-only and resumable
 # ---------------------------------------------------------------------------
@@ -268,10 +297,11 @@ def test_cell_ids_separate_phases_and_trials():
     """Resume keys on the cell id, so a sweep and a final at the same shape
     must not collide -- that would silently skip the measurement that matters."""
     cfg = {"kind": "freastal-wsgi", "workers": 4, "body": 500, "port": 9000}
-    sweep = twohost.cell_id(cfg, "sweep", (4, 64, 1))
+    sweep0 = twohost.cell_id(cfg, "sweep", (4, 64, 1), trial=0)
+    sweep1 = twohost.cell_id(cfg, "sweep", (4, 64, 1), trial=1)
     final0 = twohost.cell_id(cfg, "final", (4, 64, 1), trial=0)
     final1 = twohost.cell_id(cfg, "final", (4, 64, 1), trial=1)
-    assert len({sweep, final0, final1}) == 3
+    assert len({sweep0, sweep1, final0, final1}) == 4
 
 
 def test_bjoern_gets_no_multi_worker_config():
