@@ -304,6 +304,28 @@ def check_response(client, url, expected_body):
     return None
 
 
+def check_nofile(host, required):
+    """Refuse shapes the host's per-process descriptor limit cannot sustain."""
+    out = host.run(["sh", "-c", "ulimit -n"], timeout=15)
+    value = out.stdout.strip()
+    if out.returncode or not value:
+        detail = (out.stderr or out.stdout or "no output").strip()
+        raise RuntimeError(f"cannot read {host.label} RLIMIT_NOFILE: {detail}")
+    if value == "unlimited":
+        return
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"cannot parse {host.label} RLIMIT_NOFILE value {value!r}"
+        ) from exc
+    if limit < required:
+        raise RuntimeError(
+            f"{host.label} RLIMIT_NOFILE is {limit}, but the largest client shape "
+            f"needs at least {required}; raise `ulimit -n` before benchmarking"
+        )
+
+
 def measure(
     client,
     server,
@@ -466,6 +488,9 @@ def main():
     )
     base_shapes = [tuple(int(x) for x in s.split("x")) for s in args.shapes.split(",")]
     all_depths = [int(d) for d in args.depths.split(",")]
+    required_nofile = max(connections for _, connections in base_shapes) + 256
+    check_nofile(client, required_nofile)
+    check_nofile(server, required_nofile)
 
     # The comparison sweeps SHAPE only, at a fixed depth, for every server.
     def shapes_for(cfg):

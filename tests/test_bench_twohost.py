@@ -171,6 +171,17 @@ def test_endpoint_check_rejects_the_wrong_body_size():
     assert "expected '200 500'" in twohost.check_response(Client(), "http://host/", 500)
 
 
+def test_file_descriptor_preflight_rejects_an_oversized_shape():
+    class Host:
+        label = "client"
+
+        def run(self, argv, timeout):
+            return SimpleNamespace(returncode=0, stdout="1024\n", stderr="")
+
+    with pytest.raises(RuntimeError, match="RLIMIT_NOFILE is 1024"):
+        twohost.check_nofile(Host(), required=4352)
+
+
 # ---------------------------------------------------------------------------
 # results: append-only and resumable
 # ---------------------------------------------------------------------------
