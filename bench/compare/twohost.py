@@ -20,10 +20,12 @@ run that dies at ninety minutes should cost ninety minutes of nothing.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import statistics
+import subprocess
 import sys
 import time
 
@@ -112,6 +114,54 @@ def cell_id(cfg, phase, shape=None, trial=None):
     s = f"-t{shape[0]}c{shape[1]}d{shape[2]}" if shape else ""
     t = f"-r{trial}" if trial is not None else ""
     return f"{cfg['kind']}-w{cfg['workers']}-b{cfg['body']}-{phase}{s}{t}"
+
+
+def source_id():
+    """Identify the source tree whose server is expected on the remote host."""
+    override = os.environ.get("BENCH_SOURCE_ID")
+    if override:
+        return override
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    commit = subprocess.run(
+        ["git", "-C", root, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    diff = subprocess.run(
+        ["git", "-C", root, "diff", "--binary", "--", "bench/compare", "freastal"],
+        capture_output=True,
+        check=False,
+    ).stdout
+    if diff:
+        return f"{commit or 'unknown'}-dirty-{hashlib.sha256(diff).hexdigest()[:12]}"
+    return commit or "unknown"
+
+
+def run_fingerprint(args, source):
+    """Stable identity for every input that can change a resumed result."""
+    fields = (
+        "server_host",
+        "client_host",
+        "server_addr",
+        "server_python",
+        "server_script",
+        "remote_lua",
+        "bodies",
+        "workers",
+        "only",
+        "shapes",
+        "depths",
+        "sweep_warmup",
+        "sweep_duration",
+        "final_warmup",
+        "final_duration",
+        "trials",
+        "diagnostic",
+    )
+    payload = {"source_id": source, **{name: getattr(args, name) for name in fields}}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:20]
 
 
 # --------------------------------------------------------------------------
@@ -241,8 +291,10 @@ def measure(client, server, handle, url, shape, warmup, duration, workers, args)
 class Results:
     """Append-only, flushed per measurement, and resumable."""
 
-    def __init__(self, path):
+    def __init__(self, path, run_id, source):
         self.path = path
+        self.run_id = run_id
+        self.source_id = source
         self.done = {}
         if os.path.exists(path):
             with open(path) as f:
@@ -254,7 +306,11 @@ class Results:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if "cell" in rec:
+                    if (
+                        rec.get("run_id") == run_id
+                        and rec.get("cell")
+                        and rec.get("rps")
+                    ):
                         self.done[rec["cell"]] = rec
             print(f"  resuming: {len(self.done)} measurements already recorded")
         # Deliberately long-lived and not a context manager: it is written
@@ -269,8 +325,17 @@ class Results:
         return self.done.get(cell)
 
     def add(self, cell, cfg, phase, rec):
-        row = {"cell": cell, "phase": phase, "ts": time.time(), **cfg, **(rec or {})}
-        self.done[cell] = row
+        row = {
+            "cell": cell,
+            "run_id": self.run_id,
+            "source_id": self.source_id,
+            "phase": phase,
+            "ts": time.time(),
+            **cfg,
+            **(rec or {}),
+        }
+        if row.get("rps"):
+            self.done[cell] = row
         self.fh.write(json.dumps(row) + "\n")
         self.fh.flush()
         os.fsync(self.fh.fileno())
@@ -310,7 +375,10 @@ def main():
 
     server = host(args.server_host, "server")
     client = host(args.client_host, "client")
-    res = Results(args.out)
+    source = source_id()
+    run_id = run_fingerprint(args, source)
+    print(f"  run: {run_id}  source: {source}")
+    res = Results(args.out, run_id, source)
 
     cfgs = configs(
         [int(b) for b in args.bodies.split(",")],

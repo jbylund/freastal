@@ -132,7 +132,7 @@ def test_saturation_uses_workers_not_process_tree_size():
 
 def test_results_are_durable_and_resumable(tmp_path):
     path = str(tmp_path / "r.ndjson")
-    res = twohost.Results(path)
+    res = twohost.Results(path, "run-a", "source-a")
     cfg = {"kind": "freastal-wsgi", "workers": 1, "body": 500, "port": 9000}
     res.add("cell-a", cfg, "sweep", {"rps": 123.0})
     assert res.has("cell-a")
@@ -140,17 +140,33 @@ def test_results_are_durable_and_resumable(tmp_path):
     # a second reader sees it without the first having closed: the file is
     # flushed and fsynced per measurement, because a two-hour run that dies at
     # ninety minutes should cost ninety minutes of nothing.
-    again = twohost.Results(path)
+    again = twohost.Results(path, "run-a", "source-a")
     assert again.has("cell-a")
     assert again.get("cell-a")["rps"] == 123.0
     assert not again.has("cell-b")
+
+
+def test_failed_and_stale_results_are_retried(tmp_path):
+    path = str(tmp_path / "r.ndjson")
+    cfg = {"kind": "freastal-wsgi", "workers": 1, "body": 500, "port": 9000}
+    first = twohost.Results(path, "run-a", "source-a")
+    first.add("failed", cfg, "diagnostic", None)
+    first.add("success", cfg, "sweep", {"rps": 123.0})
+    assert not first.has("failed")
+
+    resumed = twohost.Results(path, "run-a", "source-a")
+    assert not resumed.has("failed")
+    assert resumed.has("success")
+
+    changed_run = twohost.Results(path, "run-b", "source-b")
+    assert not changed_run.has("success")
 
 
 def test_every_record_carries_its_config(tmp_path):
     """A row that cannot say which server and shape produced it is not a
     result, and the ndjson is the only durable artefact."""
     path = str(tmp_path / "r.ndjson")
-    res = twohost.Results(path)
+    res = twohost.Results(path, "run-a", "source-a")
     cfg = {"kind": "bjoern", "workers": 1, "body": 500, "port": 9001}
     res.add(
         "c", cfg, "final", {"rps": 1.0, "threads": 4, "connections": 64, "depth": 1}
@@ -163,6 +179,8 @@ def test_every_record_carries_its_config(tmp_path):
         "body",
         "port",
         "phase",
+        "run_id",
+        "source_id",
         "threads",
         "connections",
         "depth",
