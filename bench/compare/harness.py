@@ -60,9 +60,12 @@ RPS_STDEV_RE = re.compile(
 
 
 def sh(*cmd):
-    return subprocess.run(
-        cmd, capture_output=True, text=True, check=False
-    ).stdout.strip()
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=False
+        ).stdout.strip()
+    except OSError:
+        return ""
 
 
 def _uvicorn_impl(preferred, fallback):

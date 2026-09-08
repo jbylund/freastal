@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import os
 import shlex
-import signal
 import shutil
+import signal
 import subprocess
 import tempfile
 
@@ -31,7 +31,7 @@ class LocalRunner:
     def start(self, argv, env=None):
         """Start a long-lived process; returns a handle usable with stop()."""
         e = dict(os.environ, **(env or {}))
-        log = tempfile.NamedTemporaryFile(
+        log = tempfile.NamedTemporaryFile(  # noqa: SIM115
             mode="w+", prefix="freastal-bench-", suffix=".log", delete=False
         )
         p = subprocess.Popen(
@@ -186,6 +186,7 @@ class SshRunner:
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         )
         if out.returncode:
             raise RuntimeError(

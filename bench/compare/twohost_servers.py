@@ -13,7 +13,7 @@ for path in (COMPARE_DIR, REPO_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from apps import asgi_app, wsgi_app  # noqa: E402
+from apps import asgi_app, wsgi_app
 
 
 def main():
