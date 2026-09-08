@@ -92,6 +92,19 @@ def test_ssh_runner_builds_a_batch_mode_command():
     assert "example.invalid" in cmd
 
 
+def test_local_runner_preserves_early_process_failure_output():
+    r = runner.LocalRunner()
+    handle = r.start(
+        [sys.executable, "-c", "import sys; print('startup failed'); sys.exit(3)"]
+    )
+    handle["proc"].wait(timeout=10)
+    try:
+        assert not r.is_alive(handle)
+        assert "startup failed" in r.read_log(handle)
+    finally:
+        r.stop(handle)
+
+
 def test_server_apps_are_importable_across_spawned_workers():
     """Workers must be able to unpickle apps without re-running the CLI."""
     for app in (twohost_servers.wsgi_app, twohost_servers.asgi_app):

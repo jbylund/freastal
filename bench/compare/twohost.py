@@ -227,6 +227,8 @@ def start_server(host, cfg, args):
     handle = host.start(argv, env=env)
     url = f"http://{args.server_addr}:{cfg['port']}/"
     for _ in range(int(args.start_timeout / 0.25)):
+        if not host.is_alive(handle):
+            break
         r = host.run(
             [
                 "curl",
@@ -242,8 +244,12 @@ def start_server(host, cfg, args):
         if r.stdout.strip() == "200":
             return handle, url
         time.sleep(0.25)
+    log = host.read_log(handle).strip()
     host.stop(handle)
-    raise RuntimeError(f"{cfg['kind']} w{cfg['workers']} b{cfg['body']} never answered")
+    detail = f"\nserver output:\n{log[-4000:]}" if log else ""
+    raise RuntimeError(
+        f"{cfg['kind']} w{cfg['workers']} b{cfg['body']} never answered{detail}"
+    )
 
 
 # --------------------------------------------------------------------------
