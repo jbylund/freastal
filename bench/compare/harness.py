@@ -60,9 +60,12 @@ RPS_STDEV_RE = re.compile(
 
 
 def sh(*cmd):
-    return subprocess.run(
-        cmd, capture_output=True, text=True, check=False
-    ).stdout.strip()
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=False
+        ).stdout.strip()
+    except OSError:
+        return ""
 
 
 def _uvicorn_impl(preferred, fallback):
@@ -121,7 +124,7 @@ def provenance(args):
         "rounds": args.rounds,
         "loopback": True,
         "cpu_sample_interval_s": args.cpu_interval,
-        "cpu_saturated_pct": cpusample.SATURATED,
+        "cpu_saturated_pct": cpusample.HIGH_PCT,
         "cpu_machine_full_pct": cpusample.MACHINE_FULL,
     }
 

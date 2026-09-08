@@ -1,6 +1,6 @@
 # Open issues (snapshot)
 
-Snapshot of `jbylund/freastal`'s open issues, taken before deleting and recreating the repo to purge stale nonalloweddomain-identity objects. Re-create each of these in the new repo, then delete this directory.
+Snapshot of `jbylund/freastal`'s open issues, taken before deleting and recreating the repo to purge stale klaviyo-identity objects. Re-create each of these in the new repo, then delete this directory.
 
 - [#61: bench: run the load generator on a separate host, and size it from the bandwidth the table actually needs](./61-bench-run-the-load-generator-on-a-separate-host-and-size-it-.md)
 - [#53: TLS should be the default, and a missing OpenSSL should fail the build rather than silently disabling it](./53-tls-should-be-the-default-and-a-missing-openssl-should-fail-.md)

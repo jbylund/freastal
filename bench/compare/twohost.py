@@ -20,10 +20,12 @@ run that dies at ninety minutes should cost ninety minutes of nothing.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import statistics
+import subprocess
 import sys
 import time
 
@@ -47,11 +49,9 @@ except ImportError:  # pragma: no cover - standalone use
 # The comparison runs every server at the same depth, and that depth is 1.
 #
 # Pipelining is not a throughput knob that each server happens to tune
-# differently -- it is a capability they either have or do not, measured here:
-# freastal gains ~16%, gunicorn+uvicorn is flat across depths 1-16, and bjoern
-# collapses 470x because it reads one request per read. Letting each server run
-# at its own best depth would therefore rank pipelining support and print it in
-# the shape of a throughput number.
+# differently -- it is a protocol capability. Letting each server run at its
+# own best depth would rank that capability and print it in the shape of a
+# throughput number.
 #
 # So depth is fixed for the comparison, and the depth sweep survives as a
 # separate diagnostic over everything that can pipeline, reported apart from
@@ -71,16 +71,9 @@ DIAGNOSTIC_KINDS = {"freastal-wsgi", "freastal-asgi", "gunicorn-uvicorn"}
 
 # Servers that cannot be asked for pipelined requests.
 #
-# Measured, not assumed: bjoern serves 9,823 rps at depth 1 and 21 rps at depth
-# 4 -- a 470x collapse, because it reads one request per read and the rest of
-# the batch sits until a timeout. Sweeping depth for it would spend most of the
-# run measuring that timeout, and any depth>1 row would report "bjoern does not
-# implement pipelining" in the shape of a throughput number.
-#
-# For the record, the other two are not worth sweeping for the same reason in
-# reverse: gunicorn+uvicorn measured flat across depths 1-16, and only freastal
-# gains from it (+16%). Which is why a pipelined row belongs in a diagnostic
-# rather than in a comparison table.
+# bjoern reads one request per socket read, so the rest of a pipelined batch
+# waits for another read event. Sweeping depth for it would measure that
+# limitation rather than throughput.
 NO_PIPELINING = {"bjoern"}
 
 
@@ -108,10 +101,126 @@ def configs(bodies, worker_counts, only=None):
     return out
 
 
+def rotated(items, offset):
+    """Deterministically rotate an order so drift is shared across trials."""
+    if not items:
+        return []
+    offset %= len(items)
+    return items[offset:] + items[:offset]
+
+
+def best_shape(rows, required_trials):
+    """Pick the highest median shape, excluding incomplete sweep samples."""
+    samples = {}
+    for row in rows:
+        if not row.get("rps"):
+            continue
+        shape = (row["threads"], row["connections"], row["depth"])
+        samples.setdefault(shape, []).append(row["rps"])
+    eligible = {
+        shape: statistics.median(values)
+        for shape, values in samples.items()
+        if len(values) >= required_trials
+    }
+    return max(eligible.items(), key=lambda item: item[1]) if eligible else None
+
+
 def cell_id(cfg, phase, shape=None, trial=None):
     s = f"-t{shape[0]}c{shape[1]}d{shape[2]}" if shape else ""
     t = f"-r{trial}" if trial is not None else ""
     return f"{cfg['kind']}-w{cfg['workers']}-b{cfg['body']}-{phase}{s}{t}"
+
+
+def source_id():
+    """Identify the source tree whose server is expected on the remote host."""
+    override = os.environ.get("BENCH_SOURCE_ID")
+    if override:
+        return override
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    commit = subprocess.run(
+        ["git", "-C", root, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    diff = subprocess.run(
+        [
+            "git",
+            "-C",
+            root,
+            "diff",
+            "HEAD",
+            "--binary",
+            "--",
+            "bench/compare",
+            "freastal",
+        ],
+        capture_output=True,
+        check=False,
+    ).stdout
+    if diff:
+        return f"{commit or 'unknown'}-dirty-{hashlib.sha256(diff).hexdigest()[:12]}"
+    return commit or "unknown"
+
+
+def verify_server_source(host, server_script, expected):
+    """Require the deployed checkout to match the recorded local revision."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(server_script)))
+    revision = host.run(["git", "-C", repo, "rev-parse", "HEAD"], timeout=15)
+    if revision.returncode or not revision.stdout.strip():
+        detail = (revision.stderr or revision.stdout or "no output").strip()
+        raise RuntimeError(
+            f"cannot identify deployed server source in {repo}: {detail}"
+        )
+    dirty = host.run(
+        [
+            "git",
+            "-C",
+            repo,
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            "bench/compare",
+            "freastal",
+        ],
+        timeout=15,
+    )
+    if dirty.returncode:
+        raise RuntimeError(f"cannot inspect deployed server source in {repo}")
+    actual = revision.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
+    if actual != expected:
+        raise RuntimeError(
+            f"deployed server source is {actual}, but this run records {expected}; "
+            "check out the same clean commit on both hosts"
+        )
+
+
+def run_fingerprint(args, source):
+    """Stable identity for every input that can change a resumed result."""
+    fields = (
+        "server_host",
+        "client_host",
+        "server_addr",
+        "server_python",
+        "server_script",
+        "remote_lua",
+        "bodies",
+        "workers",
+        "only",
+        "shapes",
+        "depths",
+        "sweep_trials",
+        "sweep_warmup",
+        "sweep_duration",
+        "final_warmup",
+        "final_duration",
+        "trials",
+        "diagnostic",
+    )
+    payload = {"source_id": source, **{name: getattr(args, name) for name in fields}}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:20]
 
 
 # --------------------------------------------------------------------------
@@ -161,6 +270,8 @@ def start_server(host, cfg, args):
     handle = host.start(argv, env=env)
     url = f"http://{args.server_addr}:{cfg['port']}/"
     for _ in range(int(args.start_timeout / 0.25)):
+        if not host.is_alive(handle):
+            break
         r = host.run(
             [
                 "curl",
@@ -176,8 +287,12 @@ def start_server(host, cfg, args):
         if r.stdout.strip() == "200":
             return handle, url
         time.sleep(0.25)
+    log = host.read_log(handle).strip()
     host.stop(handle)
-    raise RuntimeError(f"{cfg['kind']} w{cfg['workers']} b{cfg['body']} never answered")
+    detail = f"\nserver output:\n{log[-4000:]}" if log else ""
+    raise RuntimeError(
+        f"{cfg['kind']} w{cfg['workers']} b{cfg['body']} never answered{detail}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -185,12 +300,140 @@ def start_server(host, cfg, args):
 # --------------------------------------------------------------------------
 
 
-def measure(client, server, handle, url, shape, warmup, duration, args):
+def server_saturation_pct(cores, workers):
+    """Server CPU as a percentage of the configured worker budget.
+
+    Process trees also contain masters, resource trackers and fork servers.
+    Counting those pids as possible worker cores understates saturation for
+    exactly the multi-worker configurations this metric exists to validate.
+    """
+    return round(cores / max(1, workers) * 100, 1)
+
+
+def parse_wrk_output(out):
+    """Return usable wrk metrics, or an error that disqualifies the sample."""
+    raw = "\n".join(part for part in (out.stdout, out.stderr) if part).strip()
+    if out.returncode:
+        return None, f"wrk exited {out.returncode}: {raw[-1000:]}"
+
+    socket_errors = 0
+    match = re.search(
+        r"Socket errors:\s*connect\s+(\d+),\s*read\s+(\d+),"
+        r"\s*write\s+(\d+),\s*timeout\s+(\d+)",
+        raw,
+    )
+    if match:
+        socket_errors = sum(int(value) for value in match.groups())
+    http_match = re.search(r"Non-2xx or 3xx responses:\s*(\d+)", raw)
+    http_errors = int(http_match.group(1)) if http_match else 0
+    if socket_errors or http_errors:
+        return (
+            None,
+            f"wrk reported {socket_errors} socket errors and {http_errors} HTTP errors",
+        )
+
+    rps_match = re.search(r"Requests/sec:\s+([\d.]+)", raw)
+    if not rps_match:
+        return None, f"wrk output has no Requests/sec: {raw[-1000:]}"
+    latency = {
+        percentile: value
+        for percentile, value in re.findall(
+            r"^\s*(50|75|90|99)%\s+(\S+)\s*$", raw, flags=re.MULTILINE
+        )
+    }
+    return {
+        "rps": float(rps_match.group(1)),
+        "socket_errors": socket_errors,
+        "http_errors": http_errors,
+        "latency": latency,
+    }, None
+
+
+def check_response(client, url, expected_body):
+    out = client.run(
+        [
+            "curl",
+            "-sf",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code} %{size_download}",
+            url,
+        ],
+        timeout=15,
+    )
+    expected = f"200 {expected_body}"
+    if out.returncode or out.stdout.strip() != expected:
+        detail = (out.stderr or out.stdout or "no curl output").strip()
+        return f"endpoint expected {expected!r}, got {out.stdout.strip()!r}: {detail}"
+    return None
+
+
+def check_nofile(host, required):
+    """Refuse shapes the host's per-process descriptor limit cannot sustain."""
+    out = host.run(["sh", "-c", "ulimit -n"], timeout=15)
+    value = out.stdout.strip()
+    if out.returncode or not value:
+        detail = (out.stderr or out.stdout or "no output").strip()
+        raise RuntimeError(f"cannot read {host.label} RLIMIT_NOFILE: {detail}")
+    if value == "unlimited":
+        return
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"cannot parse {host.label} RLIMIT_NOFILE value {value!r}"
+        ) from exc
+    if limit < required:
+        raise RuntimeError(
+            f"{host.label} RLIMIT_NOFILE is {limit}, but the largest client shape "
+            f"needs at least {required}; raise `ulimit -n` before benchmarking"
+        )
+
+
+def prepare_pipeline_script(client, remote_path):
+    """Install the versioned wrk script used by depth diagnostics."""
+    local_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "pipeline.lua"
+    )
+    destination = local_path if client.name == "local" else remote_path
+    client.put_file(local_path, destination)
+    out = client.run(["test", "-r", destination], timeout=15)
+    if out.returncode:
+        raise RuntimeError(
+            f"pipelining diagnostic script is not readable on {client.label}: "
+            f"{destination}"
+        )
+    return destination
+
+
+def measure(
+    client,
+    server,
+    handle,
+    url,
+    shape,
+    warmup,
+    duration,
+    workers,
+    expected_body,
+    args,
+):
     threads, conns, depth = shape
     tail = [str(depth)] if depth > 1 else []
-    base = ["wrk", "-t", str(threads), "-c", str(conns)]
+    base = ["wrk", "--latency", "-t", str(threads), "-c", str(conns)]
+    sample = {
+        "threads": threads,
+        "connections": conns,
+        "depth": depth,
+        "warmup_s": warmup,
+        "duration_s": duration,
+    }
+    response_error = check_response(client, url, expected_body)
+    if response_error:
+        return {**sample, "error": response_error}
     if warmup:
-        client.run(
+        warmup_out = client.run(
             base
             + ["-d", f"{warmup}s"]
             + (["-s", args.remote_lua] if depth > 1 else [])
@@ -198,6 +441,9 @@ def measure(client, server, handle, url, shape, warmup, duration, args):
             + (["--"] + tail if depth > 1 else []),
             timeout=warmup + 90,
         )
+        _, warmup_error = parse_wrk_output(warmup_out)
+        if warmup_error:
+            return {**sample, "error": f"warmup failed: {warmup_error}"}
     pids = server.descendants(handle)
     c0 = cpu_seconds(server, pids)
     out = client.run(
@@ -209,21 +455,15 @@ def measure(client, server, handle, url, shape, warmup, duration, args):
         timeout=duration + 120,
     )
     c1 = cpu_seconds(server, pids)
-    m = re.search(r"Requests/sec:\s+([\d.]+)", out.stdout)
-    if not m:
-        return None
+    metrics, error = parse_wrk_output(out)
+    if error:
+        return {**sample, "error": error}
     cores = (c1 - c0) / duration
     return {
-        "rps": float(m.group(1)),
+        **sample,
+        **metrics,
         "server_cores": round(cores, 3),
-        "server_sat_pct": round(cores / max(1, len(pids) - 1) * 100, 1)
-        if len(pids) > 1
-        else round(cores * 100, 1),
-        "threads": threads,
-        "connections": conns,
-        "depth": depth,
-        "warmup_s": warmup,
-        "duration_s": duration,
+        "server_sat_pct": server_saturation_pct(cores, workers),
     }
 
 
@@ -233,8 +473,10 @@ def measure(client, server, handle, url, shape, warmup, duration, args):
 class Results:
     """Append-only, flushed per measurement, and resumable."""
 
-    def __init__(self, path):
+    def __init__(self, path, run_id, source):
         self.path = path
+        self.run_id = run_id
+        self.source_id = source
         self.done = {}
         if os.path.exists(path):
             with open(path) as f:
@@ -246,7 +488,11 @@ class Results:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if "cell" in rec:
+                    if (
+                        rec.get("run_id") == run_id
+                        and rec.get("cell")
+                        and rec.get("rps")
+                    ):
                         self.done[rec["cell"]] = rec
             print(f"  resuming: {len(self.done)} measurements already recorded")
         # Deliberately long-lived and not a context manager: it is written
@@ -261,8 +507,17 @@ class Results:
         return self.done.get(cell)
 
     def add(self, cell, cfg, phase, rec):
-        row = {"cell": cell, "phase": phase, "ts": time.time(), **cfg, **(rec or {})}
-        self.done[cell] = row
+        row = {
+            "cell": cell,
+            "run_id": self.run_id,
+            "source_id": self.source_id,
+            "phase": phase,
+            "ts": time.time(),
+            **cfg,
+            **(rec or {}),
+        }
+        if row.get("rps"):
+            self.done[cell] = row
         self.fh.write(json.dumps(row) + "\n")
         self.fh.flush()
         os.fsync(self.fh.fileno())
@@ -282,6 +537,7 @@ def main():
     p.add_argument("--only", default="")
     p.add_argument("--shapes", default="2x32,4x64,4x128")
     p.add_argument("--depths", default="1")
+    p.add_argument("--sweep-trials", type=int, default=3)
     p.add_argument("--sweep-warmup", type=int, default=2)
     p.add_argument("--sweep-duration", type=int, default=5)
     p.add_argument("--final-warmup", type=int, default=5)
@@ -302,7 +558,11 @@ def main():
 
     server = host(args.server_host, "server")
     client = host(args.client_host, "client")
-    res = Results(args.out)
+    source = source_id()
+    verify_server_source(server, args.server_script, source)
+    run_id = run_fingerprint(args, source)
+    print(f"  run: {run_id}  source: {source}")
+    res = Results(args.out, run_id, source)
 
     cfgs = configs(
         [int(b) for b in args.bodies.split(",")],
@@ -311,6 +571,11 @@ def main():
     )
     base_shapes = [tuple(int(x) for x in s.split("x")) for s in args.shapes.split(",")]
     all_depths = [int(d) for d in args.depths.split(",")]
+    if args.diagnostic and any(depth > 1 for depth in all_depths):
+        args.remote_lua = prepare_pipeline_script(client, args.remote_lua)
+    required_nofile = max(connections for _, connections in base_shapes) + 256
+    check_nofile(client, required_nofile)
+    check_nofile(server, required_nofile)
 
     # The comparison sweeps SHAPE only, at a fixed depth, for every server.
     def shapes_for(cfg):
@@ -325,7 +590,7 @@ def main():
         if args.diagnostic
         else []
     )
-    total = sum(len(shapes_for(c)) for c in cfgs)
+    total = sum(len(shapes_for(c)) for c in cfgs) * args.sweep_trials
     print(
         f"  comparison: every server at depth {COMPARE_DEPTH} "
         f"({len(cfgs)} configs, {total} shape measurements, {args.trials} trials)"
@@ -338,15 +603,15 @@ def main():
 
     # ---- phase 1: per-config shape sweep -------------------------------
     best = {}
-    for cfg in cfgs:
-        handle = url = None
-        try:
-            handle, url = start_server(server, cfg, args)
-            for shape in shapes_for(cfg):
-                cell = cell_id(cfg, "sweep", shape)
-                if res.has(cell):
-                    rec = res.get(cell)
-                else:
+    for sweep_trial in range(args.sweep_trials):
+        for cfg_index, cfg in enumerate(rotated(cfgs, sweep_trial)):
+            handle = url = None
+            try:
+                handle, url = start_server(server, cfg, args)
+                for shape in rotated(shapes_for(cfg), sweep_trial + cfg_index):
+                    cell = cell_id(cfg, "sweep", shape, trial=sweep_trial)
+                    if res.has(cell):
+                        continue
                     rec = measure(
                         client,
                         server,
@@ -355,18 +620,29 @@ def main():
                         shape,
                         args.sweep_warmup,
                         args.sweep_duration,
+                        cfg["workers"],
+                        cfg["body"],
                         args,
                     )
-                    rec = res.add(cell, cfg, "sweep", rec)
-                if rec.get("rps") and (
-                    cfg["port"] not in best or rec["rps"] > best[cfg["port"]][0]
-                ):
-                    best[cfg["port"]] = (rec["rps"], shape)
-        except Exception as exc:  # noqa: BLE001 - one config must not end the run
-            print(f"  !! {cfg['kind']} w{cfg['workers']}: {exc}")
-        finally:
-            if handle:
-                server.stop(handle)
+                    res.add(cell, cfg, "sweep", rec)
+            except Exception as exc:  # noqa: BLE001 - one config must not end the run
+                print(
+                    f"  !! sweep {sweep_trial} {cfg['kind']} w{cfg['workers']}: {exc}"
+                )
+            finally:
+                if handle:
+                    server.stop(handle)
+
+    for cfg in cfgs:
+        rows = [
+            row
+            for row in res.done.values()
+            if row.get("phase") == "sweep" and row.get("port") == cfg["port"]
+        ]
+        selected = best_shape(rows, args.sweep_trials)
+        if selected:
+            shape, median_rps = selected
+            best[cfg["port"]] = (median_rps, shape)
         if cfg["port"] in best:
             r, sh = best[cfg["port"]]
             print(
@@ -376,7 +652,7 @@ def main():
 
     # ---- phase 2: interleaved trials at each argmax ---------------------
     for trial in range(args.trials):
-        for cfg in cfgs:
+        for cfg in rotated(cfgs, trial):
             if cfg["port"] not in best:
                 continue
             shape = best[cfg["port"]][1]
@@ -394,6 +670,8 @@ def main():
                     shape,
                     args.final_warmup,
                     args.final_duration,
+                    cfg["workers"],
+                    cfg["body"],
                     args,
                 )
                 row = res.add(cell, cfg, "final", rec)
@@ -415,11 +693,8 @@ def main():
     # Shape and depth are swept together rather than fixing shape at the
     # comparison's argmax. They interact: the concurrency that suits depth 1
     # is not the one that suits depth 64, because pipelining moves the
-    # bottleneck off the round trip. Measured over WiFi, -c512 d1 gave 55,904
-    # rps while -c512 d64 gave 145,390 -- and a diagnostic pinned to the depth-1
-    # shape would have reported whichever depth happened to suit it. This is
-    # freastal-only, so the cross product is affordable here in a way it is not
-    # for the comparison.
+    # bottleneck off the round trip. This is diagnostic-only, so the cross
+    # product is affordable here in a way it is not for the comparison.
     for cfg in diag_cfgs:
         handle = None
         try:
@@ -438,6 +713,8 @@ def main():
                         dshape,
                         args.sweep_warmup,
                         args.sweep_duration,
+                        cfg["workers"],
+                        cfg["body"],
                         args,
                     )
                     row = res.add(cell, cfg, "diagnostic", rec)

@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -306,6 +307,18 @@ def test_fmt_pct_never_prints_nan_in_the_table(harness):
     assert harness.fmt_pct(None) == "n/a"
     assert harness.fmt_pct(float("nan")) == "n/a"
     assert harness.fmt_pct(83.4) == "83%"
+
+
+def test_provenance_uses_the_sampler_saturation_threshold(harness, cs):
+    args = SimpleNamespace(
+        worker_counts="1",
+        duration=1,
+        threads=1,
+        connections=1,
+        rounds=0,
+        cpu_interval=0,
+    )
+    assert harness.provenance(args)["cpu_saturated_pct"] == cs.HIGH_PCT
 
 
 # ---------------------------------------------------------------------------

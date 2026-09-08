@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import signal
 import subprocess
+import tempfile
 
 
 class LocalRunner:
@@ -29,14 +31,43 @@ class LocalRunner:
     def start(self, argv, env=None):
         """Start a long-lived process; returns a handle usable with stop()."""
         e = dict(os.environ, **(env or {}))
+        log = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w+", prefix="freastal-bench-", suffix=".log", delete=False
+        )
         p = subprocess.Popen(
             argv,
             env=e,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        return {"kind": "local", "pid": p.pid, "proc": p}
+        return {
+            "kind": "local",
+            "pid": p.pid,
+            "proc": p,
+            "log_file": log.name,
+            "log_stream": log,
+        }
+
+    def put_file(self, source, destination):
+        if os.path.abspath(source) != os.path.abspath(destination):
+            shutil.copyfile(source, destination)
+
+    def is_alive(self, handle):
+        return handle["proc"].poll() is None
+
+    def read_log(self, handle):
+        stream = handle["log_stream"]
+        stream.flush()
+        with open(handle["log_file"]) as log:
+            return log.read()
+
+    def _remove_log(self, handle):
+        handle["log_stream"].close()
+        try:
+            os.unlink(handle["log_file"])
+        except FileNotFoundError:
+            pass
 
     def stop(self, handle):
         """TERM the group, then KILL what is left.
@@ -56,6 +87,7 @@ class LocalRunner:
             pass
         try:
             p.wait(timeout=10)
+            self._remove_log(handle)
             return
         except subprocess.TimeoutExpired:
             pass
@@ -72,6 +104,7 @@ class LocalRunner:
                 f"server pid {p.pid} survived SIGKILL; the next measurement "
                 f"would run against a stale process on a reused port"
             ) from None
+        self._remove_log(handle)
 
     def descendants(self, handle):
         """Every pid under the handle, so CPU covers workers not just the parent."""
@@ -126,12 +159,46 @@ class SshRunner:
         """
         envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in (env or {}).items())
         cmd = shlex.join(argv) if not isinstance(argv, str) else argv
-        remote = f"{envs} setsid nohup {cmd} >/dev/null 2>&1 & echo $!"
+        remote = (
+            "log=/tmp/freastal-bench-$$.log; "
+            f'{envs} setsid nohup {cmd} >$log 2>&1 & echo "$! $log"'
+        )
         out = self.run(remote, timeout=30)
-        pid = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
-        if not pid.isdigit():
+        started = (
+            out.stdout.strip().splitlines()[-1].split() if out.stdout.strip() else []
+        )
+        if len(started) != 2 or not started[0].isdigit():
             raise RuntimeError(f"could not start on {self.host}: {out.stderr[-400:]}")
-        return {"kind": "ssh", "pid": int(pid)}
+        return {"kind": "ssh", "pid": int(started[0]), "log_file": started[1]}
+
+    def put_file(self, source, destination):
+        out = subprocess.run(
+            [
+                "scp",
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                source,
+                f"{self.host}:{destination}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if out.returncode:
+            raise RuntimeError(
+                f"could not copy {source} to {self.host}:{destination}: {out.stderr}"
+            )
+
+    def is_alive(self, handle):
+        out = self.run(f"kill -0 {handle['pid']} 2>/dev/null", timeout=10)
+        return out.returncode == 0
+
+    def read_log(self, handle):
+        return self.run(["cat", handle["log_file"]], timeout=15, check=False).stdout
 
     def stop(self, handle):
         pid = handle["pid"]
@@ -139,6 +206,7 @@ class SshRunner:
             f"kill -TERM -{pid} 2>/dev/null; sleep 1; kill -KILL -{pid} 2>/dev/null; true",
             timeout=30,
         )
+        self.run(["rm", "-f", handle["log_file"]], timeout=15)
 
     def descendants(self, handle):
         pid = handle["pid"]

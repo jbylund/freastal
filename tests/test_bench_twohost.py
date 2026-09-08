@@ -8,7 +8,9 @@ cannot pipeline, a saturation guard that lets a client-bound row through.
 
 import json
 import os
+import pickle
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +21,7 @@ sys.path.insert(0, BENCH)
 
 twohost = pytest.importorskip("twohost")
 runner = pytest.importorskip("runner")
+twohost_servers = pytest.importorskip("twohost_servers")
 
 
 # ---------------------------------------------------------------------------
@@ -89,23 +92,38 @@ def test_ssh_runner_builds_a_batch_mode_command():
     assert "example.invalid" in cmd
 
 
+def test_local_runner_preserves_early_process_failure_output():
+    r = runner.LocalRunner()
+    handle = r.start(
+        [sys.executable, "-c", "import sys; print('startup failed'); sys.exit(3)"]
+    )
+    handle["proc"].wait(timeout=10)
+    try:
+        assert not r.is_alive(handle)
+        assert "startup failed" in r.read_log(handle)
+    finally:
+        r.stop(handle)
+
+
+def test_server_apps_are_importable_across_spawned_workers():
+    """Workers must be able to unpickle apps without re-running the CLI."""
+    for app in (twohost_servers.wsgi_app, twohost_servers.asgi_app):
+        assert pickle.loads(pickle.dumps(app)) is app
+
+
 # ---------------------------------------------------------------------------
 # the pipelining policy
 # ---------------------------------------------------------------------------
 
 
 def test_a_server_that_cannot_pipeline_is_never_swept():
-    """bjoern measured 9,823 rps at depth 1 and 21 at depth 4 -- it reads one
-    request per read and the rest of the batch waits for a timeout. Sweeping it
-    would spend the run measuring that timeout."""
+    """bjoern reads one request per read, so depth would measure a timeout."""
     assert twohost.depths_for("bjoern", [1, 8, 64]) == [1]
     assert twohost.depths_for("freastal-wsgi", [1, 8, 64]) == [1, 8, 64]
 
 
 def test_the_comparison_is_pinned_to_one_depth():
-    """Every server compared at the same depth, or the table ranks pipelining
-    support rather than throughput: freastal gains ~16%, uvicorn is flat, and
-    bjoern collapses."""
+    """Different depths would rank pipelining support, not just throughput."""
     assert twohost.COMPARE_DEPTH == 1
 
 
@@ -120,6 +138,141 @@ def test_everything_that_can_pipeline_is_swept():
     assert twohost.NO_PIPELINING == {"bjoern"}
 
 
+def test_saturation_uses_workers_not_process_tree_size():
+    """Masters and multiprocessing helpers are not extra worker capacity."""
+    assert twohost.server_saturation_pct(4.02, workers=4) == pytest.approx(100.5)
+
+
+def test_wrk_sample_records_tail_latency_when_clean():
+    out = SimpleNamespace(
+        returncode=0,
+        stderr="",
+        stdout="""
+Latency Distribution
+   50%    1.10ms
+   75%    1.40ms
+   90%    2.00ms
+   99%    4.20ms
+Requests/sec:  12345.67
+""",
+    )
+    metrics, error = twohost.parse_wrk_output(out)
+    assert error is None
+    assert metrics["rps"] == pytest.approx(12345.67)
+    assert metrics["latency"]["99"] == "4.20ms"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Socket errors: connect 0, read 2, write 0, timeout 0",
+        "Non-2xx or 3xx responses: 3",
+    ],
+)
+def test_wrk_sample_with_transport_or_http_errors_is_rejected(line):
+    out = SimpleNamespace(
+        returncode=0,
+        stderr="",
+        stdout=f"Requests/sec: 123.0\n{line}\n",
+    )
+    metrics, error = twohost.parse_wrk_output(out)
+    assert metrics is None
+    assert "errors" in error
+
+
+def test_endpoint_check_rejects_the_wrong_body_size():
+    class Client:
+        def run(self, argv, timeout):
+            return SimpleNamespace(returncode=0, stdout="200 499", stderr="")
+
+    assert "expected '200 500'" in twohost.check_response(Client(), "http://host/", 500)
+
+
+def test_file_descriptor_preflight_rejects_an_oversized_shape():
+    class Host:
+        label = "client"
+
+        def run(self, argv, timeout):
+            return SimpleNamespace(returncode=0, stdout="1024\n", stderr="")
+
+    with pytest.raises(RuntimeError, match="RLIMIT_NOFILE is 1024"):
+        twohost.check_nofile(Host(), required=4352)
+
+
+def test_pipeline_script_is_copied_to_the_client():
+    class Client:
+        name = "ssh"
+        label = "client"
+
+        def __init__(self):
+            self.copy = None
+
+        def put_file(self, source, destination):
+            self.copy = (source, destination)
+
+        def run(self, argv, timeout):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    client = Client()
+    destination = twohost.prepare_pipeline_script(client, "/tmp/pipeline.lua")
+    assert destination == "/tmp/pipeline.lua"
+    assert client.copy[0].endswith("/bench/compare/pipeline.lua")
+    assert client.copy[1] == destination
+
+
+def test_trial_rotation_shares_first_and_last_positions():
+    configs = ["a", "b", "c", "d"]
+    orders = [twohost.rotated(configs, trial) for trial in range(4)]
+    assert [order[0] for order in orders] == configs
+    assert [order[-1] for order in orders] == ["d", "a", "b", "c"]
+
+
+def test_sweep_selects_the_best_replicated_median_not_the_lucky_maximum():
+    rows = [
+        {"threads": 1, "connections": 32, "depth": 1, "rps": value}
+        for value in (100, 101, 500)
+    ] + [
+        {"threads": 2, "connections": 64, "depth": 1, "rps": value}
+        for value in (110, 111, 112)
+    ]
+    shape, median_rps = twohost.best_shape(rows, required_trials=3)
+    assert shape == (2, 64, 1)
+    assert median_rps == 111
+
+
+def test_sweep_does_not_select_an_incomplete_shape():
+    rows = [
+        {"threads": 1, "connections": 32, "depth": 1, "rps": 999},
+        {"threads": 2, "connections": 64, "depth": 1, "rps": 100},
+        {"threads": 2, "connections": 64, "depth": 1, "rps": 101},
+    ]
+    assert twohost.best_shape(rows, required_trials=2)[0] == (2, 64, 1)
+
+
+def test_deployed_source_must_match_recorded_revision():
+    class Host:
+        def __init__(self, dirty=""):
+            self.outputs = iter(
+                [
+                    SimpleNamespace(returncode=0, stdout="abc123\n", stderr=""),
+                    SimpleNamespace(returncode=0, stdout=dirty, stderr=""),
+                ]
+            )
+
+        def run(self, argv, timeout):
+            return next(self.outputs)
+
+    twohost.verify_server_source(
+        Host(), "/repo/bench/compare/twohost_servers.py", "abc123"
+    )
+    with pytest.raises(RuntimeError, match="abc123-dirty"):
+        twohost.verify_server_source(
+            Host(dirty=" M freastal/x.py\n"),
+            "/repo/bench/compare/twohost_servers.py",
+            "abc123",
+        )
+
+
 # ---------------------------------------------------------------------------
 # results: append-only and resumable
 # ---------------------------------------------------------------------------
@@ -127,7 +280,7 @@ def test_everything_that_can_pipeline_is_swept():
 
 def test_results_are_durable_and_resumable(tmp_path):
     path = str(tmp_path / "r.ndjson")
-    res = twohost.Results(path)
+    res = twohost.Results(path, "run-a", "source-a")
     cfg = {"kind": "freastal-wsgi", "workers": 1, "body": 500, "port": 9000}
     res.add("cell-a", cfg, "sweep", {"rps": 123.0})
     assert res.has("cell-a")
@@ -135,17 +288,33 @@ def test_results_are_durable_and_resumable(tmp_path):
     # a second reader sees it without the first having closed: the file is
     # flushed and fsynced per measurement, because a two-hour run that dies at
     # ninety minutes should cost ninety minutes of nothing.
-    again = twohost.Results(path)
+    again = twohost.Results(path, "run-a", "source-a")
     assert again.has("cell-a")
     assert again.get("cell-a")["rps"] == 123.0
     assert not again.has("cell-b")
+
+
+def test_failed_and_stale_results_are_retried(tmp_path):
+    path = str(tmp_path / "r.ndjson")
+    cfg = {"kind": "freastal-wsgi", "workers": 1, "body": 500, "port": 9000}
+    first = twohost.Results(path, "run-a", "source-a")
+    first.add("failed", cfg, "diagnostic", None)
+    first.add("success", cfg, "sweep", {"rps": 123.0})
+    assert not first.has("failed")
+
+    resumed = twohost.Results(path, "run-a", "source-a")
+    assert not resumed.has("failed")
+    assert resumed.has("success")
+
+    changed_run = twohost.Results(path, "run-b", "source-b")
+    assert not changed_run.has("success")
 
 
 def test_every_record_carries_its_config(tmp_path):
     """A row that cannot say which server and shape produced it is not a
     result, and the ndjson is the only durable artefact."""
     path = str(tmp_path / "r.ndjson")
-    res = twohost.Results(path)
+    res = twohost.Results(path, "run-a", "source-a")
     cfg = {"kind": "bjoern", "workers": 1, "body": 500, "port": 9001}
     res.add(
         "c", cfg, "final", {"rps": 1.0, "threads": 4, "connections": 64, "depth": 1}
@@ -158,6 +327,8 @@ def test_every_record_carries_its_config(tmp_path):
         "body",
         "port",
         "phase",
+        "run_id",
+        "source_id",
         "threads",
         "connections",
         "depth",
@@ -171,10 +342,11 @@ def test_cell_ids_separate_phases_and_trials():
     """Resume keys on the cell id, so a sweep and a final at the same shape
     must not collide -- that would silently skip the measurement that matters."""
     cfg = {"kind": "freastal-wsgi", "workers": 4, "body": 500, "port": 9000}
-    sweep = twohost.cell_id(cfg, "sweep", (4, 64, 1))
+    sweep0 = twohost.cell_id(cfg, "sweep", (4, 64, 1), trial=0)
+    sweep1 = twohost.cell_id(cfg, "sweep", (4, 64, 1), trial=1)
     final0 = twohost.cell_id(cfg, "final", (4, 64, 1), trial=0)
     final1 = twohost.cell_id(cfg, "final", (4, 64, 1), trial=1)
-    assert len({sweep, final0, final1}) == 3
+    assert len({sweep0, sweep1, final0, final1}) == 4
 
 
 def test_bjoern_gets_no_multi_worker_config():
