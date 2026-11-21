@@ -153,6 +153,7 @@ has_uv_reuseport = probe_symbol(
     extra_include_dirs=include_dirs,
 )
 
+
 def _project_version():
     """The version in pyproject.toml, which is the only place it is written."""
     import re
