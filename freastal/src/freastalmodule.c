@@ -337,7 +337,8 @@ PyMODINIT_FUNC PyInit__freastal(void) {
     PyModule_AddIntConstant(m, "HAS_REUSE_PORT", 0);
 #endif
 
-    PyModule_AddStringConstant(m, "__version__", "0.0.1");
+    /* Injected by setup.py from pyproject.toml so the two cannot drift. */
+    PyModule_AddStringConstant(m, "__version__", FREASTAL_VERSION);
 
 #ifdef FREASTAL_TLS
     /* The ring's three numbers, so freastal/__init__.py can time the owner's
