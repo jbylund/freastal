@@ -27,12 +27,14 @@ RUN apt-get -qq update \
  && rm -rf /var/lib/apt/lists/*
 
 # libuv from source at a pinned tag, so the number is not at the mercy of
-# whatever the distro happens to ship.
+# whatever the distro happens to ship.  PIC is required: the static libuv.a is
+# linked into freastal's shared extension, and without -fPIC that link fails
+# ("relocation R_X86_64_PC32 ... recompile with -fPIC") on current toolchains.
 RUN cd /tmp \
  && curl -sSL "https://github.com/libuv/libuv/archive/refs/tags/v${LIBUV_VERSION}.tar.gz" -o uv.tgz \
  && tar xzf uv.tgz && cd "libuv-${LIBUV_VERSION}" \
  && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-      -DCMAKE_INSTALL_PREFIX=/usr/local >/dev/null \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_INSTALL_PREFIX=/usr/local >/dev/null \
  && cmake --build build -j"$(nproc)" --target install >/dev/null \
  && ldconfig \
  && rm -rf /tmp/uv.tgz "/tmp/libuv-${LIBUV_VERSION}"
