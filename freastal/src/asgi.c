@@ -11,6 +11,7 @@ static PyObject *s_popleft   = NULL;  /* deque.popleft */
 static PyObject *s_run       = NULL;  /* Handle._run */
 static PyObject *s_cancelled = NULL;  /* Handle._cancelled */
 static PyObject *s_when      = NULL;  /* TimerHandle._when */
+static PyObject *s_stopping  = NULL;  /* BaseEventLoop._stopping */
 
 /* Returned to Python in place of a yielded value when the app's coroutine has
  * returned; see asgi_coro_step_c(). */
@@ -30,13 +31,39 @@ static inline Py_ssize_t asgi_pending(PyObject *obj) {
     return n;
 }
 
-/* One non-blocking step of the asyncio loop.  Callers must hold the GIL and
- * must only call this when the loop has work that is due now, so that
- * _run_once() computes a zero select() timeout and never blocks libuv. */
+/* One non-blocking step of the asyncio loop.  Callers must hold the GIL.
+ *
+ * "Non-blocking" has to be enforced here rather than left to the caller's
+ * judgement.  _run_once() derives its select() timeout from loop state it
+ * recomputes itself: it first drops cancelled TimerHandles off the head of
+ * _scheduled, and only then looks at _ready and _scheduled.  A caller that
+ * armed a wakeup for a handle which was cancelled in the meantime (psycopg's
+ * pool cancels timers constantly) therefore finds _ready empty and _scheduled
+ * empty, gets timeout=None, and parks in epoll_wait() forever -- on the one
+ * thread that is also running libuv, so the whole server stops answering.
+ *
+ * _run_once() takes timeout=0 whenever loop._stopping is set, and still does
+ * everything else (prune cancelled timers, promote due ones, run _ready), so
+ * raise the flag for the duration of the call.  The loop is never driven by
+ * run_forever(), so nothing else reads it; the previous value is restored
+ * regardless. */
 static void asgi_run_once(void) {
+    PyObject *loop = g_server.asgi_loop;
+    PyObject *prev = PyObject_GetAttr(loop, s_stopping);
+    if (unlikely(!prev)) PyErr_Clear();
+    else if (unlikely(PyObject_SetAttr(loop, s_stopping, Py_True) < 0)) {
+        PyErr_Clear();
+        Py_CLEAR(prev);
+    }
+
     PyObject *ret = PyObject_CallNoArgs(g_server.asgi_run_once);
     Py_XDECREF(ret);
     if (unlikely(PyErr_Occurred())) PyErr_Clear();
+
+    if (prev) {
+        if (unlikely(PyObject_SetAttr(loop, s_stopping, prev) < 0)) PyErr_Clear();
+        Py_DECREF(prev);
+    }
 }
 
 /*
@@ -744,7 +771,8 @@ int asgi_server_init(PyObject *loop) {
     s_run       = PyUnicode_InternFromString("_run");
     s_cancelled = PyUnicode_InternFromString("_cancelled");
     s_when      = PyUnicode_InternFromString("_when");
-    if (!s_popleft || !s_run || !s_cancelled || !s_when) return -1;
+    s_stopping  = PyUnicode_InternFromString("_stopping");
+    if (!s_popleft || !s_run || !s_cancelled || !s_when || !s_stopping) return -1;
 
     /*
      * Make `loop` the running loop for this thread, once, permanently.
