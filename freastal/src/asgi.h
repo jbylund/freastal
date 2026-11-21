@@ -12,8 +12,13 @@
 
 typedef struct client_s client_t;
 
-/* Call between server_init() and server_run(). */
-int        asgi_server_init(PyObject *loop);
+/* Call between server_init() and server_run().
+ *
+ * `state` is the lifespan state dict (or NULL/None for none); each request
+ * scope receives a shallow copy.  With `graceful` set, SIGINT and SIGTERM stop
+ * the event loop, so server_run() returns and Python can run lifespan.shutdown;
+ * without it the signals keep whatever disposition the process had. */
+int        asgi_server_init(PyObject *loop, PyObject *state, int graceful);
 
 /* Called from http_dispatch() when g_server.asgi_mode is true.
  * GIL must be held by caller. */

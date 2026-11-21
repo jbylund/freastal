@@ -3,6 +3,7 @@
 #include "hdrcache.h"
 #include "hdrvalid.h"
 #include <arpa/inet.h>
+#include <signal.h>
 #include <string.h>
 
 /* Interned attribute names used to drive the loop's callback queue.  Private
@@ -244,6 +245,20 @@ static void asgi_poll_cb(uv_poll_t *handle, int status, int events) {
     GIL_UNLOCK();
 }
 
+/*
+ * asgi_signal_cb - SIGINT/SIGTERM while a lifespan is active.
+ *
+ * Ends uv_run().  The handlers are libuv's, installed at the C level, which is
+ * what makes this work at all: a Python signal handler cannot run while
+ * server_run() sits in uv_run() with the GIL released, so an idle server would
+ * not notice the signal until its next request.  server_run() returning hands
+ * control back to Python, which then delivers lifespan.shutdown.
+ */
+static void asgi_signal_cb(uv_signal_t *handle, int signum) {
+    (void)handle; (void)signum;
+    uv_stop(g_server.loop);
+}
+
 /* ---- Driving the app's coroutine ---- */
 
 /*
@@ -402,6 +417,18 @@ static PyObject *build_asgi_scope(client_t *c) {
         int rc = PyDict_SetItem(scope, k->headers, hlist);
         Py_DECREF(hlist);
         if (rc < 0) { Py_DECREF(scope); return NULL; }
+    }
+
+    /* lifespan state: a fresh shallow copy per request, so one request's
+     * writes to scope["state"] cannot reach another's.  Skipped entirely for
+     * apps whose lifespan left it empty, which is all of them that do not use
+     * the feature, so they pay nothing. */
+    if (unlikely(g_server.asgi_state != NULL)) {
+        PyObject *st = PyDict_Copy(g_server.asgi_state);
+        if (unlikely(!st)) { Py_DECREF(scope); return NULL; }
+        int rc = PyDict_SetItemString(scope, "state", st);
+        Py_DECREF(st);
+        if (unlikely(rc < 0)) { Py_DECREF(scope); return NULL; }
     }
 
 #undef SS
@@ -751,7 +778,19 @@ void asgi_dispatch(client_t *c) {
 
 /* ---- Server init ---- */
 
-int asgi_server_init(PyObject *loop) {
+int asgi_server_init(PyObject *loop, PyObject *state, int graceful) {
+    /* Only a non-empty dict is kept; None and {} both mean "no state". */
+    if (state && state != Py_None) {
+        if (!PyDict_Check(state)) {
+            PyErr_SetString(PyExc_TypeError, "state must be a dict or None");
+            return -1;
+        }
+        if (PyDict_GET_SIZE(state) > 0) {
+            Py_INCREF(state);
+            g_server.asgi_state = state;
+        }
+    }
+
     Py_INCREF(loop);
     g_server.asgi_loop = loop;
 
@@ -936,6 +975,21 @@ int asgi_server_init(PyObject *loop) {
     } else {
         PyErr_Clear();
     }
+
+    if (graceful) {
+        uv_signal_init(g_server.loop, &g_server.asgi_sigint);
+        uv_signal_start(&g_server.asgi_sigint, asgi_signal_cb, SIGINT);
+        uv_unref((uv_handle_t *)&g_server.asgi_sigint);
+        uv_signal_init(g_server.loop, &g_server.asgi_sigterm);
+        uv_signal_start(&g_server.asgi_sigterm, asgi_signal_cb, SIGTERM);
+        uv_unref((uv_handle_t *)&g_server.asgi_sigterm);
+    }
+
+    /* The loop may already have work: a lifespan.startup that spawned tasks or
+     * scheduled timers left them on _ready/_scheduled, and nothing else arms
+     * libuv for them until the first request or I/O event.  Without this an
+     * idle server would never run them. */
+    asgi_arm_wakeups();
 
     g_server.asgi_mode = true;
     fprintf(stderr, "[freastal] ASGI mode enabled (asyncio%s)\n",
