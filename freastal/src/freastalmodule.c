@@ -69,10 +69,12 @@ static PyObject *py_serve_asgi(PyObject *self, PyObject *args, PyObject *kwargs)
     (void)self;
     static const char *kwlist[] = {
         "app", "loop", "host", "port", "reuse_port", "certfile", "keyfile",
-        "fd", "ticket_ring_fd", NULL
+        "fd", "ticket_ring_fd", "state", "graceful", NULL
     };
     PyObject   *app      = NULL;
     PyObject   *loop     = NULL;
+    PyObject   *state    = NULL;
+    int         graceful = 0;
     const char *host     = "0.0.0.0";
     int         port     = 8000;
     int         reuse_p  = 0;
@@ -81,9 +83,9 @@ static PyObject *py_serve_asgi(PyObject *self, PyObject *args, PyObject *kwargs)
     int         fd       = -1;
     int         ring_fd  = -1;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|sipzzii",
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|sipzziiOp",
             (char **)kwlist, &app, &loop, &host, &port, &reuse_p,
-            &certfile, &keyfile, &fd, &ring_fd))
+            &certfile, &keyfile, &fd, &ring_fd, &state, &graceful))
         return NULL;
 
     if (!PyCallable_Check(app)) {
@@ -94,7 +96,7 @@ static PyObject *py_serve_asgi(PyObject *self, PyObject *args, PyObject *kwargs)
     if (serve_init(app, host, port, reuse_p, certfile, keyfile, fd, ring_fd) < 0)
         return NULL;
 
-    if (asgi_server_init(loop) < 0) {
+    if (asgi_server_init(loop, state, graceful) < 0) {
         if (!PyErr_Occurred())
             PyErr_SetString(PyExc_RuntimeError, "freastal: asgi_server_init failed");
         return NULL;

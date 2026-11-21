@@ -679,6 +679,16 @@ typedef struct {
     PyObject  *asgi_scope_template_https;
 #endif
     asgi_keys_t asgi_keys;
+
+    /* The ASGI lifespan "state" dict, or NULL when the app has none.  Each
+     * request's scope gets a shallow copy as scope["state"], per the spec. */
+    PyObject  *asgi_state;
+
+    /* Graceful stop.  Only armed when a lifespan is active (see
+     * asgi_server_init): SIGINT/SIGTERM then end uv_run() so that Python gets
+     * control back to deliver lifespan.shutdown. */
+    uv_signal_t asgi_sigint;
+    uv_signal_t asgi_sigterm;
 } server_t;
 
 extern server_t g_server;
@@ -762,7 +772,7 @@ void write_response(client_t *c);
  *         -1 if the connection was closed. */
 int http_dispatch(client_t *c, uv_stream_t *stream);
 
-int       asgi_server_init(PyObject *loop);
+int       asgi_server_init(PyObject *loop, PyObject *state, int graceful);
 void      asgi_dispatch(client_t *c);
 PyObject *asgi_send_response_c(PyObject *self, PyObject *args);
 

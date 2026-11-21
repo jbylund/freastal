@@ -112,6 +112,28 @@ async def app(scope, receive, send):
 freastal.serve_asgi(app, host="0.0.0.0", port=8000, workers=4)
 ```
 
+#### Lifespan
+
+The ASGI [lifespan](https://asgi.readthedocs.io/en/latest/specs/lifespan.html)
+protocol is supported, so frameworks' startup and shutdown hooks run.
+`lifespan.startup` completes **before** the server accepts connections, and
+`SIGINT`/`SIGTERM` then deliver `lifespan.shutdown` before the process exits
+(the app has 10 seconds to answer it). With `workers > 1`, every worker runs its
+own lifespan. Values the app stores in `scope["state"]` during startup are
+copied into each request's `scope["state"]`.
+
+`serve_asgi(..., lifespan="auto" | "on" | "off")` follows uvicorn:
+
+- `"auto"` (default): use lifespan if the app supports it. An app that raises
+  before asking for its first event is treated as not supporting it, and the
+  server carries on. An app that took part and then failed (including
+  `lifespan.startup.failed`) stops the server with an error.
+- `"on"`: lifespan is required; anything but a completed startup is an error.
+- `"off"`: never send a lifespan scope.
+
+Graceful shutdown on `SIGINT`/`SIGTERM` only applies when the app takes part in
+lifespan. Requests still in flight when the signal arrives are not drained.
+
 ### TLS 1.3
 
 ```python

@@ -7,8 +7,9 @@ import signal
 import socket
 import sys
 import threading
+import time
 
-from . import _freastal
+from . import _freastal, _lifespan
 from ._freastal import __version__
 from ._freastal import has_tls as _has_tls_int
 from ._freastal import serve as _serve_single
@@ -292,7 +293,51 @@ def _wsgi_worker(worker_id, sock, app, host, port, certfile, keyfile, ring=None)
         pass
 
 
-def _asgi_worker(worker_id, sock, app, host, port, certfile, keyfile, ring=None):
+def _run_asgi(app, loop, lifespan="auto", **serve_kwargs):
+    """Serve `app` on `loop`, wrapped in the ASGI lifespan protocol.
+
+    Startup runs here, before the server is bound and accepting, so a request
+    can never reach an app that has not finished starting.  The lifespan task
+    stays parked on the loop while the server runs.
+
+    Shutdown needs the server to give control back.  When lifespan is active the
+    C side turns SIGINT/SIGTERM into "stop the event loop" (a Python handler
+    could not run while the loop owns the thread), so serve returns, and the
+    shutdown message is delivered here.  Without lifespan the signals are left
+    alone and nothing changes.
+    """
+    ls = _lifespan.Lifespan(app, lifespan)
+    active = loop.run_until_complete(ls.startup())
+    if not active:
+        _serve_asgi_single(app, loop, **serve_kwargs)
+        return
+
+    # libuv replaces the process's handlers for these while it serves; put
+    # Python's back afterwards.  Only the main thread may do so, and a serve
+    # started elsewhere never reached the point of needing it.
+    saved = {}
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            saved[sig] = signal.getsignal(sig)
+    except ValueError:
+        pass
+    try:
+        _serve_asgi_single(app, loop, state=ls.state, graceful=True, **serve_kwargs)
+    finally:
+        # The C side made `loop` the running loop for good; run_until_complete
+        # refuses to start while another loop is "running" on this thread.
+        asyncio._set_running_loop(None)
+        for sig, handler in saved.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError, TypeError):
+                pass
+        loop.run_until_complete(ls.shutdown())
+
+
+def _asgi_worker(
+    worker_id, sock, app, host, port, certfile, keyfile, ring=None, lifespan="auto"
+):
     """As _wsgi_worker, with a fresh event loop per worker."""
     # A worker has to die when the supervisor terminates it.  Under fork it
     # inherits the supervisor's Python-level SIGTERM handler, and a Python
@@ -311,9 +356,10 @@ def _asgi_worker(worker_id, sock, app, host, port, certfile, keyfile, ring=None)
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        _serve_asgi_single(
+        _run_asgi(
             app,
             loop,
+            lifespan,
             host=host,
             port=port,
             certfile=certfile,
@@ -325,7 +371,17 @@ def _asgi_worker(worker_id, sock, app, host, port, certfile, keyfile, ring=None)
         pass
 
 
-def _run_workers(worker, app, host, port, workers, reuse_port, certfile, keyfile):
+def _run_workers(
+    worker,
+    app,
+    host,
+    port,
+    workers,
+    reuse_port,
+    certfile,
+    keyfile,
+    worker_kwargs=None,
+):
     """Bind here, then run `workers` copies of `worker` on the result.
 
     Two shapes, one code path:
@@ -359,8 +415,15 @@ def _run_workers(worker, app, host, port, workers, reuse_port, certfile, keyfile
     def _shutdown(sig, frame):
         for p in processes:
             p.terminate()
+        # A worker running lifespan.shutdown gets as long as that is allowed to
+        # take, plus a little; one that is stuck is killed rather than left to
+        # hang the parent's exit.
+        deadline = time.monotonic() + _lifespan.SHUTDOWN_TIMEOUT + 5
         for p in processes:
-            p.join(timeout=5)
+            p.join(timeout=max(0.0, deadline - time.monotonic()))
+        for p in processes:
+            if p.is_alive():
+                p.kill()
         sys.exit(0)
 
     # Pre-existing, and hit for real by anything that calls serve() off the
@@ -404,6 +467,7 @@ def _run_workers(worker, app, host, port, workers, reuse_port, certfile, keyfile
                     keyfile,
                     ring,
                 ),
+                kwargs=worker_kwargs or {},
                 daemon=True,
             )
             p.start()
@@ -508,6 +572,7 @@ def serve_asgi(
     reuse_port=None,
     certfile=None,
     keyfile=None,
+    lifespan="auto",
 ):
     """Start freastal in ASGI mode.
 
@@ -517,15 +582,25 @@ def serve_asgi(
     and the picklability requirement on app.
 
     Pass certfile and keyfile (PEM paths) to enable TLS 1.3 (requires picotls).
+
+    lifespan selects the ASGI lifespan protocol: "auto" (default) runs it when
+    the app supports it, "on" requires it and "off" never sends it.  Startup
+    completes before the server accepts connections, and SIGINT/SIGTERM then
+    deliver lifespan.shutdown before the process exits.  Each worker runs its
+    own lifespan.  Only the first lifespan.shutdown.* message counts, and the
+    app has _lifespan.SHUTDOWN_TIMEOUT seconds to answer it.
     """
+    if lifespan not in _lifespan.MODES:
+        raise ValueError(f"lifespan must be one of {_lifespan.MODES}, not {lifespan!r}")
     reuse_port = _resolve_reuse_port(reuse_port, workers)
 
     if workers <= 1:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        _serve_asgi_single(
+        _run_asgi(
             app,
             loop,
+            lifespan,
             host=host,
             port=port,
             reuse_port=reuse_port,
@@ -534,4 +609,14 @@ def serve_asgi(
         )
         return
 
-    _run_workers(_asgi_worker, app, host, port, workers, reuse_port, certfile, keyfile)
+    _run_workers(
+        _asgi_worker,
+        app,
+        host,
+        port,
+        workers,
+        reuse_port,
+        certfile,
+        keyfile,
+        worker_kwargs={"lifespan": lifespan},
+    )
