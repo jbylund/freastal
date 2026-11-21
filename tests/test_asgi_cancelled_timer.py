@@ -45,7 +45,9 @@ def addr():
 
 def _fetch(addr, target):
     with socket.create_connection(addr, timeout=3) as s:
-        s.sendall(f"GET {target} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n".encode())
+        s.sendall(
+            f"GET {target} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n".encode()
+        )
         chunks = []
         while True:
             b = s.recv(65536)
