@@ -153,7 +153,18 @@ has_uv_reuseport = probe_symbol(
     extra_include_dirs=include_dirs,
 )
 
-define_macros = []
+def _project_version():
+    """The version in pyproject.toml, which is the only place it is written."""
+    import re
+
+    with open(os.path.join(HERE, "pyproject.toml")) as f:
+        m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+    if not m:
+        raise RuntimeError("no version found in pyproject.toml")
+    return m.group(1)
+
+
+define_macros = [("FREASTAL_VERSION", '"%s"' % _project_version())]
 if has_uv_reuseport:
     define_macros.append(("FREASTAL_REUSEPORT", "1"))
     print("freastal: libuv has UV_TCP_REUSEPORT (workers may bind their own sockets)")
